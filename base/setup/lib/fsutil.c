@@ -23,6 +23,7 @@
 
 #include <fslib/vfatlib.h>
 #include <fslib/btrfslib.h>
+#include <fslib/udflib.h>
 // #include <fslib/ext2lib.h>
 // #include <fslib/ntfslib.h>
 
@@ -167,6 +168,7 @@ static FILE_SYSTEM RegisteredFileSystems[] =
     { L"NTFS" , NtfsFormat, NtfsChkdsk },
 #endif
     { L"BTRFS", BtrfsFormat, BtrfsChkdsk },
+    { L"UDF"  , UdfFormat, NULL },
 #if 0
     { L"EXT2" , Ext2Format, Ext2Chkdsk },
     { L"EXT3" , Ext2Format, Ext2Chkdsk },
