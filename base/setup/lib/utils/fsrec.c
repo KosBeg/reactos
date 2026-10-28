@@ -249,9 +249,13 @@ InferFileSystemWorker(
     }
     else if (PartitionType == PARTITION_IFS)
     {
-        // WARNING: See the warning above.
-        /* Could also be HPFS */
-        Status = RtlStringCbCopyW(FileSystemName, FileSystemNameSize, L"NTFS");
+        /* 0x07 is shared by NTFS, HPFS and this Setup's UDF partitions.
+         * A failed filesystem query is not evidence for choosing NTFS.
+         * Leave the name empty and preserve the original query failure;
+         * successfully mounted NTFS/UDF volumes were recognized above. */
+        DPRINT1("Ambiguous IFS partition type: filesystem remains unknown\n");
+        if (NT_SUCCESS(Status))
+            Status = STATUS_UNRECOGNIZED_VOLUME;
     }
 
 Quit:
@@ -385,7 +389,8 @@ FileSystemToMBRPartitionType(
             }
         }
     }
-    else if (_wcsicmp(FileSystem, L"NTFS") == 0)
+    else if (_wcsicmp(FileSystem, L"NTFS") == 0 ||
+             _wcsicmp(FileSystem, L"UDF") == 0)
     {
         return PARTITION_IFS;
     }
