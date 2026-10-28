@@ -489,6 +489,7 @@ UDFMountVolume(
         InitializeListHead(&VolDo->OverflowQueue);
 
         VolDo->PostedRequestCount = 0;
+        VolDo->FspPostingClosed = FALSE;
         KeInitializeSpinLock(&VolDo->OverflowQueueSpinLock);
 
         // device object field in the VPB to point to our new volume device
@@ -539,8 +540,11 @@ UDFMountVolume(
         Vcb->MountPhErrorCount = 0;
 
         UDFAcquireResourceExclusive(&(Vcb->BitMapResource1),TRUE);
-        RC = UDFGetDiskInfoAndVerify(IrpContext, DeviceObjectWeTalkTo,Vcb);
-        UDFReleaseResource(&(Vcb->BitMapResource1));
+        _SEH2_TRY {
+            RC = UDFGetDiskInfoAndVerify(IrpContext, DeviceObjectWeTalkTo,Vcb);
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&(Vcb->BitMapResource1));
+        } _SEH2_END;
 
         ASSERT(!Vcb->Modified);
 
@@ -553,8 +557,11 @@ UDFMountVolume(
 
             // Complete mount operations: create root FCB
             UDFAcquireResourceExclusive(&(Vcb->BitMapResource1),TRUE);
-            RC = UDFCompleteMount(IrpContext, Vcb);
-            UDFReleaseResource(&(Vcb->BitMapResource1));
+            _SEH2_TRY {
+                RC = UDFCompleteMount(IrpContext, Vcb);
+            } _SEH2_FINALLY {
+                UDFReleaseResource(&(Vcb->BitMapResource1));
+            } _SEH2_END;
             if (!NT_SUCCESS(RC)) {
                 // We must have Vcb->VcbReference = 1 for UDFBlankMount()
                 // Thus, we should not decrement it here
@@ -563,8 +570,9 @@ UDFMountVolume(
                 // will be decremented during cleanup. Thus anyway it must
                 // stay 1 unchanged here
                 //InterlockedDecrement((PLONG)&Vcb->VcbReference);
-                UDFCloseResidual(IrpContext, Vcb);
-                Vcb->VcbReference = 1;
+                /* Preserve retained owners and their counts on refusal. */
+                if (NT_SUCCESS(UDFCloseResidual(IrpContext, Vcb)))
+                    Vcb->VcbReference = 1;
 
                 try_return(RC);
             }
@@ -674,116 +682,189 @@ try_exit: NOTHING;
 
 } // end UDFMountVolume()
 
-VOID
+NTSTATUS
 UDFCloseResidual(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb
     )
 {
-    //  Deinitialize Non-alloc file
-    if (Vcb->VcbReference)
-        InterlockedDecrement((PLONG)&Vcb->VcbReference);
-    UDFPrint(("UDFCloseResidual: NonAllocFileInfo %x\n", Vcb->NonAllocFileInfo));
-    if (Vcb->NonAllocFileInfo) {
-        UDFCloseFile__(IrpContext, Vcb, Vcb->NonAllocFileInfo);
-        UDFCleanUpFile__(Vcb, Vcb->NonAllocFileInfo);
-        MyFreePool__(Vcb->NonAllocFileInfo);
-        Vcb->NonAllocFileInfo = NULL;
-    }
-    //  Deinitialize Unique ID Mapping
-    UDFPrint(("UDFCloseResidual: NonAllocFileInfo %x\n", Vcb->NonAllocFileInfo));
-    if (Vcb->UniqueIDMapFileInfo) {
-        UDFCloseFile__(IrpContext, Vcb, Vcb->UniqueIDMapFileInfo);
-        UDFCleanUpFile__(Vcb, Vcb->UniqueIDMapFileInfo);
-        MyFreePool__(Vcb->UniqueIDMapFileInfo);
-        Vcb->UniqueIDMapFileInfo = NULL;
-    }
-    //  Deinitialize VAT file
-    UDFPrint(("UDFCloseResidual: VatFileInfo %x\n", Vcb->VatFileInfo));
-    if (Vcb->VatFileInfo) {
-        UDFCloseFile__(IrpContext, Vcb,Vcb->VatFileInfo);
-        UDFCleanUpFile__(Vcb, Vcb->VatFileInfo);
-        MyFreePool__(Vcb->VatFileInfo);
-        Vcb->VatFileInfo = NULL;
-    }
-    UDFReleaseMetadata(IrpContext, Vcb);
-    //  System StreamDir
-    UDFPrint(("UDFCloseResidual: SysSDirFileInfo %x\n", Vcb->SysSDirFileInfo));
-    if (Vcb->SysSDirFileInfo) {
-        UDFCloseFile__(IrpContext, Vcb, Vcb->SysSDirFileInfo);
-        UDFCleanUpFile__(Vcb, Vcb->SysSDirFileInfo);
-        MyFreePool__(Vcb->SysSDirFileInfo);
-        Vcb->SysSDirFileInfo = NULL;
-    }
-/*    //  Deinitialize root dir fcb
-    if (Vcb->RootDirFCB) {
-        UDFCloseFile__(Vcb,Vcb->RootDirFCB->FileInfo);
-        UDFCleanUpFile__(Vcb, Vcb->RootDirFCB->FileInfo);
-        MyFreePool__(Vcb->RootDirFCB->FileInfo);
-        UDFCleanUpFCB(Vcb->RootDirFCB);
-        //  Remove root FCB reference in vcb
-        if (Vcb->VcbReference) Vcb->VcbReference--;
-    }
+    NTSTATUS Status = STATUS_SUCCESS, Current;
+    PFCB RootFcb;
+    BOOLEAN RemovedFcb = FALSE;
+    PUDF_FILE_INFO* Files[2] = {
+        &Vcb->NonAllocFileInfo, &Vcb->UniqueIDMapFileInfo
+    };
+    ULONG i;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    Status = UDFAllocationFailureStatus(Vcb);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (InterlockedCompareExchange(&Vcb->ActiveAllocationLeaseCount, 0, 0))
+        return STATUS_DEVICE_BUSY;
+    if (InterlockedCompareExchange(&Vcb->RetainedOpenCount, 0, 0))
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (InterlockedCompareExchange(&Vcb->AbortedOpenCount, 0, 0))
+        return STATUS_DEVICE_BUSY;
 
-    // Deinitialize Non-alloc file
-    if (Vcb->VcbReference) Vcb->VcbReference--;
-    if (Vcb->NonAllocFileInfo) {
-        UDFCloseFile__(Vcb,Vcb->NonAllocFileInfo);
-        // We must release VCB here !!!!
-//        UDFCleanUpFcbChain(Vcb, Vcb->NonAllocFileInfo, 1);
-        Vcb->NonAllocFileInfo = NULL;
-    }
-    // Deinitialize VAT file
-    if (Vcb->VatFileInfo) {
-        UDFCloseFile__(Vcb,Vcb->VatFileInfo);
-        // We must release VCB here !!!!
-//        UDFCleanUpFcbChain(Vcb, Vcb->VatFileInfo, 1);
-        Vcb->VatFileInfo = NULL;
-    }*/
-
-    // Deinitialize root dir fcb
-    UDFPrint(("UDFCloseResidual: RootDirFCB %x\n", Vcb->RootIndexFcb));
-    if (Vcb->RootIndexFcb) {
-        UDFCloseFile__(IrpContext, Vcb, Vcb->RootIndexFcb->FileInfo);
-        if (Vcb->RootIndexFcb->FcbCleanup)
-            Vcb->RootIndexFcb->FcbCleanup--;
-        {
-            BOOLEAN RemovedFcb = FALSE;
-            UDFAcquireFcbExclusive(IrpContext, Vcb->RootIndexFcb, FALSE);
-            // LCB-based teardown: walks ParentLcbQueue to find and remove LCBs
-            UDFTeardownStructures(IrpContext, Vcb->RootIndexFcb, FALSE, &RemovedFcb);
-            if (!RemovedFcb) {
-                UDFReleaseFcb(IrpContext, Vcb->RootIndexFcb);
-            }
+    /* Preserve checkpoint access before dropping the named open's parent
+     * hold. Keeping that named FI instead would prevent root/SysSDir GC. */
+    if (!Vcb->ResidualRetirementStarted) {
+        Status = UDFHoldResidualNonAlloc(Vcb);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        /* The new checkpoint hold deliberately keeps the Dloc alive.
+         * Flush through the still-valid named context before its close:
+         * a dirty Dloc must not strand that FI in the parent's index. */
+        if (Vcb->NonAllocFileInfo &&
+            !(Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY)) {
+            Status = UDFFlushFile__(IrpContext, Vcb, Vcb->NonAllocFileInfo, 0);
+            if (!NT_SUCCESS(Status))
+                return Status;
         }
-        // Remove root FCB reference in vcb
+    }
+    if (!Vcb->ResidualCloseStarted) {
+        Vcb->ResidualCloseStarted = TRUE;
         if (Vcb->VcbReference)
             InterlockedDecrement((PLONG)&Vcb->VcbReference);
-        Vcb->RootIndexFcb = NULL;
     }
-} // end UDFCloseResidual()
+    for (i = 0; i < 2; i++) {
+        Current = UDFReleaseInternalFile(IrpContext, Vcb, Files[i]);
+        if (NT_SUCCESS(Status)) Status = Current;
+    }
+    Current = UDFReleaseInternalFile(IrpContext, Vcb, &Vcb->SysSDirFileInfo);
+    if (NT_SUCCESS(Status)) Status = Current;
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = UDFReapFailedFileInfos(IrpContext, Vcb);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    RootFcb = Vcb->RootIndexFcb;
+    if (!RootFcb)
+        goto release_dasd;
+    if (!FlagOn(RootFcb->FcbState, FCB_STATE_IN_FCB_TABLE)) {
+        /* Incomplete mount: no table or LCB owner was ever published. */
+        if (RootFcb->FileInfo) {
+            RootFcb->FileInfo->Fcb = NULL;
+            if (RootFcb->FileInfo->Dloc && RootFcb->FileInfo->Dloc->CommonFcb == RootFcb)
+                RootFcb->FileInfo->Dloc->CommonFcb = NULL;
+        }
+        Status = UDFReleaseInternalFile(IrpContext, Vcb, &RootFcb->FileInfo);
+        if (!RootFcb->FileInfo)
+            UDFDeleteFcb(IrpContext, RootFcb);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        goto release_dasd;
+    }
+
+    UDFAcquireFcbExclusive(IrpContext, RootFcb, FALSE);
+    _SEH2_TRY {
+        if (!RootFcb->SystemOpenReleased) {
+            if (!RootFcb->FcbCleanup || !RootFcb->FcbReference) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            /* Reference consumption and fallible writeback are different
+             * phases. Never claim the system open was released if the
+             * exact checked FI decrement refused the inconsistent owner. */
+            Status = UDFDereferenceFileChecked(Vcb, RootFcb->FileInfo);
+            if (!NT_SUCCESS(Status))
+                _SEH2_LEAVE;
+            RootFcb->SystemOpenReleased = TRUE;
+            RootFcb->FileInfo->InternalOpenReleased = TRUE;
+            UDFLockVcb(IrpContext, Vcb);
+            RootFcb->FcbCleanup--;
+            RootFcb->FcbReference--;
+            UDFUnlockVcb(IrpContext, Vcb);
+        }
+        /* A retry can repeat writeback, never the system-open decrement. */
+        Status = UDFCompleteFileClose(IrpContext, Vcb, RootFcb->FileInfo);
+        if (NT_SUCCESS(Status))
+            Status = UDFTeardownStructuresEx(IrpContext, RootFcb, FALSE, TRUE,
+                                              &RemovedFcb);
+    } _SEH2_FINALLY {
+        if (!RemovedFcb)
+            UDFReleaseFcb(IrpContext, RootFcb);
+    } _SEH2_END;
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (!RemovedFcb)
+        return STATUS_DEVICE_BUSY;
+    /* UDFDeleteFcb consumed the root's explicit VCB hold. */
+
+release_dasd:
+    /* Root GC may have released allocations after the caller's volume
+     * flush. Keep VAT, bad-block and metadata owners through this final
+     * checkpoint; UDFFlushVolume cannot be called with a retired root. */
+    Status = UDFCheckpointResidualFiles(IrpContext, Vcb);
+    if (Status != STATUS_SUCCESS)
+        return Status;
+    Status = UDFDeleteBitmapStream(IrpContext, Vcb, !Vcb->BitmapHeaderAccepted);
+    if (Status != STATUS_SUCCESS)
+        return Status;
+    /* No generic internal close here: it can reopen integrity and perform
+     * FE I/O after the bitmap cache has already been destroyed. */
+    Status = UDFRetireResidualFiles(Vcb);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    RootFcb = Vcb->VolumeDasdFcb;
+    if (RootFcb) {
+        BOOLEAN Acquired = RootFcb->Header.Resource != NULL;
+        if (Acquired)
+            UDFAcquireFcbExclusive(IrpContext, RootFcb, FALSE);
+        UDFLockVcb(IrpContext, Vcb);
+        if (!RootFcb->SystemOpenReleased) {
+            RootFcb->SystemOpenReleased = TRUE;
+            if (RootFcb->SystemReferenceHeld) {
+                ASSERT(RootFcb->FcbReference);
+                if (RootFcb->FcbReference) RootFcb->FcbReference--;
+            }
+            if (RootFcb->SystemUserReferenceHeld) {
+                ASSERT(RootFcb->FcbUserReference);
+                if (RootFcb->FcbUserReference) RootFcb->FcbUserReference--;
+            }
+        }
+        RemovedFcb = !RootFcb->FcbReference && !RootFcb->FcbCleanup;
+        UDFUnlockVcb(IrpContext, Vcb);
+        if (Acquired)
+            UDFReleaseFcb(IrpContext, RootFcb);
+        if (!RemovedFcb)
+            return STATUS_DEVICE_BUSY;
+        UDFDeleteFcb(IrpContext, RootFcb);
+    }
+    return Status;
+}
 
 VOID
 UDFCleanupVCB(
     IN PVCB Vcb
     )
 {
-    _SEH2_TRY {
-        UDFReleaseFileIdCache(Vcb);
-        UDFReleaseDeletePrefreeRecords(Vcb);
-        UDFReleaseDlocList(Vcb);
-    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
-        BrutePoint();
-    } _SEH2_END;
+    NT_ASSERT(!Vcb->FailedAllocations && !Vcb->FailedAllocationCount &&
+              !Vcb->ActiveAllocationLeases && !Vcb->ActiveAllocationLeaseCount &&
+              !Vcb->PendingExtentRetirements &&
+              NT_SUCCESS(UDFAllocationFailureStatus(Vcb)));
+    /* Cache lifetime was completed before final VPB/queue admission. This
+     * destructor performs memory disposal only, never new cache or device I/O. */
+    NT_ASSERT(!Vcb->BitmapFcb && !Vcb->BitmapStreamFileObject && !Vcb->BitmapBcb &&
+              Vcb->BitmapCacheState == UdfBitmapCacheAbsent && !Vcb->BitmapIoCount);
+    NT_ASSERT(!Vcb->NonAllocFileInfo && !Vcb->NonAllocCheckpointFileInfo &&
+              !Vcb->UniqueIDMapFileInfo && !Vcb->SysSDirFileInfo && !Vcb->VatFileInfo &&
+              !Vcb->MetadataFileInfo && !Vcb->MetadataMirrorFileInfo &&
+              !Vcb->MetadataBitmapFileInfo && !Vcb->PreallocCache);
+    UDFInstallMetadataView(Vcb, NULL); /* release only the publication owner */
+    UDFReleaseFileIdCache(Vcb);
+    UDFReleaseDeletePrefreeRecords(Vcb);
+    UDFReleaseDlocList(Vcb);
 
+    MyFreeMemoryAndPointer(Vcb->LoadedLvd);
+    Vcb->LoadedLvdLength = 0;
     MyFreeMemoryAndPointer(Vcb->Partitions);
     MyFreeMemoryAndPointer(Vcb->LVid);
     MyFreeMemoryAndPointer(Vcb->Vat);
     MyFreeMemoryAndPointer(Vcb->SparingTable);
 
-    // Teardown bitmap cache stream (per-page mode) or free NonPagedPool buffer (legacy)
-    UDFUnpinBitmapPage(Vcb);
-    UDFDeleteBitmapStream(Vcb);
+    // Cache stream has already retired; release only legacy RAM buffers.
     if (Vcb->FSBM_Bitmap) {
         DbgFreePool(Vcb->FSBM_Bitmap);
         Vcb->FSBM_Bitmap = NULL;
@@ -1630,6 +1711,7 @@ UDFGetRetrievalPointers(
     TYPE_OF_OPEN TypeOfOpen;
 
     PEXTENT_MAP SubMapping = NULL;
+    BOOLEAN ReleaseVolume = FALSE, ReleaseFile = FALSE;
     ULONG SubExtInfoSz;
     ULONG i;
     ULONG LBS;
@@ -1644,7 +1726,8 @@ UDFGetRetrievalPointers(
 
     TypeOfOpen = UDFDecodeFileObject(IrpSp->FileObject, &Fcb, &Ccb);
 
-    if ((TypeOfOpen != UserFileOpen) && (TypeOfOpen != UserDirectoryOpen)) {
+    if (((TypeOfOpen != UserFileOpen) && (TypeOfOpen != UserDirectoryOpen)) ||
+        !Fcb || !Ccb) {
 
         UDFCompleteRequest(IrpContext, Irp, STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
@@ -1678,6 +1761,8 @@ UDFGetRetrievalPointers(
     _SEH2_TRY {
 
         Irp->IoStatus.Information = 0;
+        if (!InputBuffer || !OutputBuffer)
+            try_return( RC = STATUS_INVALID_USER_BUFFER );
         //  Check for a minimum length on the input and ouput buffers.
         if ((InputBufferLength < sizeof(STARTING_VCN_INPUT_BUFFER)) ||
             (OutputBufferLength < sizeof(RETRIEVAL_POINTERS_BUFFER))) {
@@ -1688,7 +1773,7 @@ UDFGetRetrievalPointers(
         _SEH2_TRY {
 
             if (Irp->RequestorMode != KernelMode) {
-                ProbeForRead( IrpSp->Parameters.FileSystemControl.Type3InputBuffer,
+                ProbeForRead( InputBuffer,
                               InputBufferLength,
                               sizeof(UCHAR) );
                 ProbeForWrite( OutputBuffer, OutputBufferLength, sizeof(UCHAR) );
@@ -1703,7 +1788,12 @@ UDFGetRetrievalPointers(
             try_return(RC);
         } _SEH2_END;
 
-        FileInfo = Fcb->FileInfo;
+        UDFAcquireVcbShared(IrpContext, Vcb, FALSE);
+        ReleaseVolume = TRUE;
+        UDFAcquireFcbShared(IrpContext, Fcb, FALSE);
+        ReleaseFile = TRUE;
+        UDFVerifyFcbOperation(IrpContext, Fcb, Ccb);
+        FileInfo = Ccb->FileInfo;
 
         if (!FileInfo) {
             try_return( RC = STATUS_OBJECT_NAME_NOT_FOUND );
@@ -1714,8 +1804,12 @@ UDFGetRetrievalPointers(
         LBS   = Vcb->SectorSize;
         LBSh  = Vcb->SectorShift;
 
-        if (StartingVcn.HighPart ||
-            StartingVcn.LowPart >= (ULONG)(AllocationSize >> LBSh)) {
+        if (StartingVcn.QuadPart < 0 || AllocationSize < 0 ||
+            (uint64)StartingVcn.QuadPart > ((uint64)MAXLONGLONG >> LBSh)) {
+            try_return( RC = STATUS_INVALID_PARAMETER );
+        }
+        if ((uint64)StartingVcn.QuadPart >=
+            (((uint64)AllocationSize + LBS - 1) >> LBSh)) {
 
             try_return( RC = STATUS_END_OF_FILE );
         }
@@ -1724,30 +1818,22 @@ UDFGetRetrievalPointers(
         // re-use AllocationSize as NextVcn
         RC = UDFReadFileLocation__(Vcb, FileInfo, StartingVcn.QuadPart << LBSh,
                                    &SubMapping, &SubExtInfoSz, &AllocationSize);
-        if (!NT_SUCCESS(RC))
+        if (!NT_SUCCESS(RC) && RC != STATUS_BUFFER_OVERFLOW)
             try_return(RC);
 
         OutputBuffer->ExtentCount = SubExtInfoSz;
         OutputBuffer->StartingVcn = StartingVcn;
         for(i=0; i<SubExtInfoSz; i++) {
-            // assume, that
-            // for not-allocated extents we have start Lba = -1
-            // for not-recorded extents start Lba.LowPart contains real Lba, Lba.HighPart = 0x80000000
-            // for recorded extents Lba.LowPart contains real Lba, Lba.HighPart = 0
-            if (SubMapping[i].extLocation == LBA_NOT_ALLOCATED) {
+            /* Both recorded and unrecorded allocated runs have real LCNs.
+             * Only a hole uses -1; no physical address bit is a type flag. */
+            if ((SubMapping[i].extLength >> 30) == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
                 OutputBuffer->Extents[i].Lcn.QuadPart = (int64)(-1);
-            } else
-            if (SubMapping[i].extLocation & 0x80000000) {
-                /* extLocation is already a sector LBA, not a byte offset. */
-                OutputBuffer->Extents[i].Lcn.LowPart = SubMapping[i].extLocation & 0x7fffffff;
-                OutputBuffer->Extents[i].Lcn.HighPart = 0x80000000;
             } else {
-                OutputBuffer->Extents[i].Lcn.LowPart = SubMapping[i].extLocation;
-                OutputBuffer->Extents[i].Lcn.HighPart = 0;
+                OutputBuffer->Extents[i].Lcn.QuadPart = (uint64)SubMapping[i].extLocation;
             }
             // alignment for last sector
-            SubMapping[i].extLength += LBS-1;
-            StartingVcn.QuadPart += SubMapping[i].extLength   >> LBSh;
+            StartingVcn.QuadPart +=
+                (((uint64)(SubMapping[i].extLength & UDF_EXTENT_LENGTH_MASK)) + LBS - 1) >> LBSh;
             OutputBuffer->Extents[i].NextVcn = StartingVcn;
         }
 
@@ -1758,6 +1844,10 @@ try_exit:   NOTHING;
 
         if (SubMapping)
             MyFreePool__(SubMapping);
+        if (ReleaseFile)
+            UDFReleaseFcb(IrpContext, Fcb);
+        if (ReleaseVolume)
+            UDFReleaseVcb(IrpContext, Vcb);
     } _SEH2_END;
 
     UDFCompleteRequest(IrpContext, Irp, RC);

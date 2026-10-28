@@ -19,7 +19,10 @@
 
 #define         UDF_BUG_CHECK_ID                UDF_FILE_UDF_INFO_REMAP
 
-BOOLEAN
+/* A read probe is not a defect-repair transaction. Report its exact failure;
+ * do not silently accept allocation failure or mutate the allocation bitmap.
+ * The caller either commits a verified extent or rolls back its own claim. */
+NTSTATUS
 __fastcall
 UDFCheckArea(
     PIRP_CONTEXT IrpContext,
@@ -28,295 +31,218 @@ UDFCheckArea(
     IN uint32 BCount
     )
 {
-    uint8* buff;
-    NTSTATUS RC;
-    uint32 i, d;
-    BOOLEAN ext_ok = TRUE;
-    EXTENT_MAP Map[2];
-    uint32 PS = Vcb->SparingBlockSize ? Vcb->SparingBlockSize : 1;
-
-    buff = (uint8*)DbgAllocatePoolWithTag(NonPagedPool, PS << Vcb->SectorShift, 'bNWD' );
-    if (buff) {
-        for(i=0; i<BCount; i+=d) {
-            if (!((LBA+i) & (PS-1)) &&
-               (i+PS <= BCount)) {
-                d = PS;
-            } else {
-                d = 1;
+    uint8* Buffer;
+    uint32 Capacity, Done = 0;
+    NTSTATUS Status = STATUS_SUCCESS;
+    if (!BCount)
+        return STATUS_SUCCESS;
+    if (!Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift) ||
+        LBA > Vcb->SessionEndLba ||
+        BCount > (uint64)Vcb->SessionEndLba - LBA + 1)
+        return STATUS_INVALID_PARAMETER;
+    if (Vcb->SectorSize > 0x10000)
+        return STATUS_NOT_SUPPORTED;
+    Capacity = min(BCount, 0x10000UL >> Vcb->SectorShift);
+    Buffer = (uint8*)DbgAllocatePoolWithTag(NonPagedPool,
+                                            Capacity << Vcb->SectorShift, 'bNWD');
+    if (!Buffer)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    _SEH2_TRY {
+        while (Done < BCount) {
+            uint32 Blocks = min(BCount - Done, Capacity);
+            Status = UDFReadWriteSectors(IrpContext, Vcb,
+                ((LONGLONG)LBA + Done) << Vcb->SectorShift,
+                Blocks << Vcb->SectorShift, TRUE, Buffer, FALSE);
+            if (Status != STATUS_SUCCESS) {
+                if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+                _SEH2_LEAVE;
             }
-            RC = UDFReadWriteSectors(IrpContext,
-                           Vcb,
-                           ((LONGLONG)(LBA + i)) << Vcb->SectorShift,
-                           d << Vcb->SectorShift,
-                           TRUE, buff, FALSE);
-
-            if (RC != STATUS_SUCCESS) {
-                Map[0].extLocation = LBA+i;
-                Map[0].extLength = d << Vcb->SectorShift;
-                UDFMarkSpaceAsXXXNoProtect(Vcb, 0, &(Map[0]), AS_DISCARDED | AS_BAD); // free
-                ext_ok = FALSE;
-            }
+            Done += Blocks;
         }
-        DbgFreePool(buff);
-    }
-    return ext_ok;
+    } _SEH2_FINALLY {
+        DbgFreePool(Buffer);
+    } _SEH2_END;
+    return Status;
 } // end UDFCheckArea()
 
 /*
     This routine remaps sectors from bad packet
  */
 NTSTATUS
-UDFRemapPacket(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 Lba,
-    IN BOOLEAN RemapSpared
-    )
+UDFRemapPacket(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+                IN uint32 Lba, IN BOOLEAN RemapSpared)
 {
-    uint32 i, max, BS, orig;
-    PSPARING_MAP Map;
-    BOOLEAN verified = FALSE;
-
-    if (Vcb->SparingTable) {
-
-        max = Vcb->SparingCount;
-        BS = Vcb->SparingBlockSize;
-
-        // use sparing table for relocation
-        if (Vcb->SparingCountFree == (ULONG)-1) {
-            UDFPrint(("calculate free spare areas\n"));
-re_check:
-            UDFPrint(("verify spare area\n"));
-            Vcb->SparingCountFree = 0;
-            Map = Vcb->SparingTable;
-            for(i=0;i<max;i++,Map++) {
-                if (Map->origLocation == SPARING_LOC_AVAILABLE) {
-                    if (UDFCheckArea(IrpContext, Vcb, Map->mappedLocation, BS)) {
-                        Vcb->SparingCountFree++;
-                    } else {
-                        UDFPrint(("initial check: bad spare block @ %x\n", Map->mappedLocation));
-                        Map->origLocation = SPARING_LOC_CORRUPTED;
-                        Vcb->SparingTableModified = TRUE;
-                    }
-                }
-            }
-        }
-        if (!Vcb->SparingCountFree) {
-            UDFPrint(("sparing table full\n"));
-            return STATUS_DISK_FULL;
-        }
-
-        Map = Vcb->SparingTable;
-        Lba &= ~(BS-1);
-        for(i=0;i<max;i++,Map++) {
-            orig = Map->origLocation;
-            if (Lba == (orig & ~(BS-1)) ) {
-                // already remapped
-
-                UDFPrint(("remap remapped: bad spare block @ %x\n", Map->mappedLocation));
-                if (!verified) {
-                    verified = TRUE;
-                    goto re_check;
-                }
-
-                if (!RemapSpared) {
-                    return STATUS_SHARING_VIOLATION;
-                } else {
-                    // look for another remap area
-                    Map->origLocation = SPARING_LOC_CORRUPTED;
-                    Vcb->SparingTableModified = TRUE;
-                    Vcb->SparingCountFree--;
-                    break;
-                }
-            }
-        }
-        Map = Vcb->SparingTable;
-        for(i=0;i<max;i++,Map++) {
-            if (Map->origLocation == SPARING_LOC_AVAILABLE) {
-                UDFPrint(("remap %x -> %x\n", Lba, Map->mappedLocation));
-                Map->origLocation = Lba;
-                Vcb->SparingTableModified = TRUE;
-                Vcb->SparingCountFree--;
-                return STATUS_SUCCESS;
-            }
-        }
-        UDFPrint(("sparing table full\n"));
-        return STATUS_DISK_FULL;
-    }
-    return STATUS_UNSUCCESSFUL;
+    UNREFERENCED_PARAMETER(IrpContext);
+    UNREFERENCED_PARAMETER(Vcb);
+    UNREFERENCED_PARAMETER(Lba);
+    UNREFERENCED_PARAMETER(RemapSpared);
+    /* The old path changed a mapping without copying the complete packet
+     * or committing its replicas. Existing loaded maps remain usable; new
+     * automatic defect replacement requires that separate complete backend. */
+    return STATUS_NOT_SUPPORTED;
 } // end UDFRemapPacket()
 
-/*
-    This routine releases sector mapping when entire packet is marked as free
- */
-NTSTATUS
-__fastcall
-UDFUnmapRange(
-    IN PVCB Vcb,
-    IN uint32 Lba,
-    IN uint32 BCount
-    )
+/* Input is already a volume physical sector. Only persistent device-defect
+ * and fixed-packet media boundaries remain below typed partition mapping. */
+static NTSTATUS
+UDFMapVolumeSectorRun(PVCB Vcb, uint32 Lba, uint32 Limit,
+                       uint32* Physical, uint32* Blocks)
 {
-    uint32 i, max, BS, orig;
-    PSPARING_MAP Map;
-
+    uint32 i, Length = Limit, Target = Lba, DiskStart;
+    NTSTATUS Status;
     if (Vcb->SparingTable) {
-        // use sparing table for relocation
-
-        max = Vcb->SparingCount;
-        BS = Vcb->SparingBlockSize;
-        Map = Vcb->SparingTable;
-        for(i=0;i<max;i++,Map++) {
-            orig = Map->origLocation;
-            switch(orig) {
-            case SPARING_LOC_AVAILABLE:
-            case SPARING_LOC_CORRUPTED:
+        uint32 Packet = Vcb->SparingBlockSize;
+        BOOLEAN Found = FALSE;
+        if (!InterlockedCompareExchange(&Vcb->SparingReady, 0, 0) || !Packet ||
+            Vcb->SparingCount > Vcb->SparingCapacity || Vcb->SparingCapacity > MAXUSHORT)
+            return STATUS_FILE_CORRUPT_ERROR;
+        for (i = 0; i < Vcb->SparingCount; i++) {
+            uint32 Original = Vcb->SparingTable[i].origLocation;
+            uint32 Replacement = Vcb->SparingTable[i].mappedLocation;
+            if (Original >= SPARING_LOC_CORRUPTED)
                 continue;
-            }
-            if (orig >= Lba &&
-              (orig+BS) <= (Lba+BCount)) {
-                // unmap
-                UDFPrint(("unmap %x -> %x\n", orig, Map->mappedLocation));
-                Map->origLocation = SPARING_LOC_AVAILABLE;
-                Vcb->SparingTableModified = TRUE;
-                Vcb->SparingCountFree++;
+            if ((uint64)Original + Packet > (uint64)MAXULONG + 1)
+                return STATUS_FILE_CORRUPT_ERROR;
+            if (Lba >= Original && Lba - Original < Packet) {
+                uint32 Delta = Lba - Original;
+                if (Found || (uint64)Replacement + Delta > MAXULONG)
+                    return STATUS_FILE_CORRUPT_ERROR;
+                Found = TRUE;
+                Target = Replacement + Delta;
+                Length = min(Length, Packet - Delta);
+            } else if (Original > Lba) {
+                Length = min(Length, Original - Lba);
             }
         }
     }
+    Status = UDFGetFixedPacketRun(Vcb, Target, Length, &DiskStart, &Length);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (!Length || Target > Vcb->SessionEndLba ||
+        Length > (uint64)Vcb->SessionEndLba - Target + 1)
+        return STATUS_FILE_CORRUPT_ERROR;
+    *Physical = Target;
+    *Blocks = Length;
     return STATUS_SUCCESS;
-} // end UDFUnmapRange()
+}
 
-/*
-    This routine returns physical address for relocated sector
- */
-uint32
-__fastcall
-UDFRelocateSector(
-    IN PVCB Vcb,
-    IN uint32 Lba
-    )
+/* Status and allocation ownership are separate. A nonidentity result is
+ * one owned, terminated map; identity uses UDF_NO_EXTENT_MAP. Validate the
+ * full request before publishing either result, never Lba+BlockCount+1.
+ * Requires a live VCB. Sparing originals are published once after partition
+ * binding and remain immutable until final VCB disposal; readers never walk
+ * the staged relative array. VAT is resolved earlier by partition identity. */
+NTSTATUS
+UDFMapVolumeSectorSpan(PVCB Vcb, uint32 Lba, uint32 BlockCount, PEXTENT_MAP* Result)
 {
-    uint32 i, max, BS, orig;
-
-    if (Vcb->SparingTable) {
-        // use sparing table for relocation
-        uint32 _Lba;
-        PSPARING_MAP Map = Vcb->SparingTable;
-
-        max = Vcb->SparingCount;
-        BS = Vcb->SparingBlockSize;
-        _Lba = Lba & ~(BS-1);
-        for(i=0;i<max;i++,Map++) {
-            orig = Map->origLocation;
-            if (_Lba == (orig & ~(BS-1)) ) {
-            //if ( (Lba >= (orig = Map->origLocation)) && (Lba < orig + BS) ) {
-                return Map->mappedLocation + Lba - orig;
+    PEXTENT_MAP Extent = NULL;
+    uint32 MaxRun, Pass, Count = 0, Capacity = 0;
+    NTSTATUS Status = STATUS_SUCCESS;
+    *Result = NULL;
+    if (!BlockCount) {
+        *Result = UDF_NO_EXTENT_MAP;
+        return STATUS_SUCCESS;
+    }
+    if (!Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift) ||
+        (uint64)Lba + BlockCount > (uint64)MAXULONG + 1 ||
+        BlockCount > (MAXULONG >> Vcb->SectorShift))
+        return STATUS_INVALID_PARAMETER;
+    /* A table is staged before the partition descriptor supplies its root.
+     * Only mount's physical descriptor reads exist then. No namespace/cache
+     * user may consume a partially converted relative/physical array. */
+    if (Vcb->SparingTable && !InterlockedCompareExchange(&Vcb->SparingReady, 0, 0)) {
+        if (Vcb->RootIndexFcb || Vcb->VcbCondition == VcbMounted ||
+            FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP))
+            return STATUS_INVALID_DEVICE_STATE;
+        if (Lba > Vcb->SessionEndLba ||
+            BlockCount > (uint64)Vcb->SessionEndLba - Lba + 1)
+            return STATUS_FILE_CORRUPT_ERROR;
+        *Result = UDF_NO_EXTENT_MAP;
+        return STATUS_SUCCESS;
+    }
+    /* Plain HDD I/O retains a constant-time no-allocation path. */
+    if (!Vcb->SparingTable &&
+        !FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP)) {
+        if (Lba > Vcb->SessionEndLba ||
+            BlockCount > (uint64)Vcb->SessionEndLba - Lba + 1)
+            return STATUS_FILE_CORRUPT_ERROR;
+        *Result = UDF_NO_EXTENT_MAP;
+        return STATUS_SUCCESS;
+    }
+    MaxRun = UDF_EXTENT_LENGTH_MASK >> Vcb->SectorShift;
+    _SEH2_TRY {
+        for (Pass = 0; Pass < 2; Pass++) {
+            uint64 Cursor = Lba;
+            uint32 Remaining = BlockCount, Last = 0, LastBlocks = 0;
+            BOOLEAN Identity = TRUE;
+            Count = 0;
+            while (Remaining) {
+                uint32 Physical, Blocks;
+                Status = UDFMapVolumeSectorRun(Vcb, (uint32)Cursor,
+                    min(Remaining, MaxRun), &Physical, &Blocks);
+                if (!NT_SUCCESS(Status))
+                    _SEH2_LEAVE;
+                if (!Blocks || Blocks > Remaining || Blocks > MaxRun) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+                if (Physical != Cursor)
+                    Identity = FALSE;
+                if (Count && !FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP) &&
+                    (uint64)Last + LastBlocks == Physical &&
+                    Blocks <= MaxRun - LastBlocks) {
+                    LastBlocks += Blocks;
+                    if (Pass)
+                        Extent[Count - 1].extLength = LastBlocks << Vcb->SectorShift;
+                } else {
+                    if (Pass) {
+                        if (Count >= Capacity) {
+                            Status = STATUS_FILE_CORRUPT_ERROR;
+                            _SEH2_LEAVE;
+                        }
+                        Extent[Count].extLocation = Physical;
+                        Extent[Count].extLength = Blocks << Vcb->SectorShift;
+                    }
+                    Last = Physical;
+                    LastBlocks = Blocks;
+                    Count++;
+                }
+                Cursor += Blocks;
+                Remaining -= Blocks;
             }
-        }
-    } else if (Vcb->Vat) {
-        // use VAT for relocation
-        uint32* Map = Vcb->Vat;
-        uint32 root;
-        // check if given Lba lays in the partition covered by VAT
-        if (Lba >= Vcb->NWA)
-            return Vcb->NWA;
-        if (Lba < (root = Vcb->Partitions[Vcb->VatPartNdx].PartitionRoot))
-            return Lba;
-        Map = &(Vcb->Vat[(i = Lba - root)]);
-        if ((i < Vcb->VatCount) && (i=(*Map)) ) {
-            if (i != UDF_VAT_FREE_ENTRY) {
-                return i + root;
+            if (!Pass) {
+                if (FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP) && Count > 1)
+                    Identity = FALSE; /* preserve packet boundaries in the output */
+                if (Identity) {
+                    *Result = UDF_NO_EXTENT_MAP;
+                    _SEH2_LEAVE;
+                }
+                if (Count >= MAXULONG / sizeof(EXTENT_MAP)) {
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                    _SEH2_LEAVE;
+                }
+                Capacity = Count;
+                Extent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                    (Capacity + 1) * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+                if (!Extent) {
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                    _SEH2_LEAVE;
+                }
             } else {
-                return 0x7fffffff;
+                if (Count != Capacity) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+                Extent[Count].extLocation = Extent[Count].extLength = 0;
+                *Result = Extent;
+                Extent = NULL;
             }
         }
-    }
-    return Lba;
-} // end UDFRelocateSector()
-
-/*
-    This routine checks if the extent specified requires relocation
- */
-BOOLEAN
-__fastcall
-UDFAreSectorsRelocated(
-    IN PVCB Vcb,
-    IN uint32 Lba,
-    IN uint32 BlockCount
-    )
-{
-
-    if (Vcb->SparingTable) {
-        // use sparing table for relocation
-        uint32 i, BS, orig;
-        BS = Vcb->SparingBlockSize;
-        PSPARING_MAP Map;
-
-        Map = Vcb->SparingTable;
-        for(i=0;i<Vcb->SparingCount;i++,Map++) {
-            if ( ((Lba >= (orig = Map->origLocation)) && (Lba < orig + BS)) ||
-                ((Lba+BlockCount-1 >= orig) && (Lba+BlockCount-1 < orig + BS)) ||
-                ((orig >= Lba) && (orig < Lba+BlockCount)) ||
-                ((orig+BS >= Lba) && (orig+BS < Lba+BlockCount)) ) {
-                return TRUE;
-            }
-        }
-    } else if (Vcb->Vat) {
-        // use VAT for relocation
-        uint32 i, root, j;
-        uint32* Map;
-        if (Lba < (root = Vcb->Partitions[Vcb->VatPartNdx].PartitionRoot))
-            return FALSE;
-        if (Lba+BlockCount >= Vcb->NWA)
-            return TRUE;
-        Map = &(Vcb->Vat[Lba-root/*+i*/]);
-        for(i=0; i<BlockCount; i++, Map++) {
-            if ((j = (*Map)) &&
-               (j != Lba-root+i) &&
-               ((j != UDF_VAT_FREE_ENTRY) || ((Lba+i) < Vcb->SessionEndLba)))
-                return TRUE;
-        }
-    }
-    return FALSE;
-} // end UDFAreSectorsRelocated()
-
-/*
-    This routine builds mapping for relocated extent
-    If relocation is not required (-1) will be returned
- */
-PEXTENT_MAP
-__fastcall
-UDFRelocateSectors(
-    IN PVCB Vcb,
-    IN uint32 Lba,
-    IN uint32 BlockCount
-    )
-{
-    if (!UDFAreSectorsRelocated(Vcb, Lba, BlockCount)) return UDF_NO_EXTENT_MAP;
-
-    PEXTENT_MAP Extent=NULL, Extent2;
-    uint32 NewLba, LastLba, j, i;
-    EXTENT_AD locExt;
-
-    LastLba = UDFRelocateSector(Vcb, Lba);
-    for(i=0, j=1; i<BlockCount; i++, j++) {
-        // create new entry if the extent in not contigous
-        if ( ((NewLba = UDFRelocateSector(Vcb, Lba+i+1)) != (LastLba+1)) ||
-            (i==(BlockCount-1)) ) {
-            locExt.extLength = j << Vcb->SectorShift;
-            locExt.extLocation = LastLba-j+1;
-            Extent2 = UDFExtentToMapping(&locExt);
-            if (!Extent) {
-                Extent = Extent2;
-            } else {
-                Extent = UDFMergeMappings(Extent, Extent2);
-                MyFreePool__(Extent2);
-            }
-            if (!Extent) return NULL;
-            j = 0;
-        }
-        LastLba = NewLba;
-    }
-    return Extent;
-} // end UDFRelocateSectors()
+    } _SEH2_FINALLY {
+        if (Extent) MyFreePool__(Extent);
+    } _SEH2_END;
+    return Status;
+} // UDFMapVolumeSectorSpan()
 

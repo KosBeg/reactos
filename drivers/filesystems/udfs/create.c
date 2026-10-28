@@ -46,6 +46,7 @@ UDFCompleteFcbOpen(
     _In_ PIO_STACK_LOCATION IrpSp,
     _In_ PVCB Vcb,
     _Inout_ PFCB *CurrentFcb,
+    _In_opt_ PUDF_FILE_INFO OpenFileInfo,
     _In_ TYPE_OF_OPEN TypeOfOpen,
     _In_ ULONG UserCcbFlags,
     _In_ ULONG CreateDisposition,
@@ -60,6 +61,21 @@ UDFOpenObjectByFileId(
     _In_ PVCB Vcb,
     _Inout_ PFCB *CurrentFcb
     );
+
+/* These ICBs are internal allocation authorities, not ordinary files even
+ * if a user supplies their physical ID or a malformed named FID points at
+ * one. Only the internal loader/growth paths may mutate their mappings. */
+static BOOLEAN
+UDFIsReservedMetadataFile(PUDF_FILE_INFO FileInfo)
+{
+    UCHAR Type;
+    if (!FileInfo || !FileInfo->Dloc || !FileInfo->Dloc->FileEntry)
+        return TRUE;
+    Type = ((PFILE_ENTRY)FileInfo->Dloc->FileEntry)->icbTag.fileType;
+    return Type == UDF_FILE_TYPE_METADATA ||
+           Type == UDF_FILE_TYPE_METADATA_MIRROR ||
+           Type == UDF_FILE_TYPE_METADATA_BITMAP;
+}
 
 NTSTATUS
 UDFSupersedeOrOverwriteFile(
@@ -76,11 +92,26 @@ UDFSupersedeOrOverwriteFile(
     NTSTATUS RC;
     ULONG NewFileAttributes;
 
+    if (!NT_SUCCESS(FileInfo->Dloc->ZeroDataError))
+        return FileInfo->Dloc->ZeroDataError;
+
     /* Preserve the prior cached generation before truncating or replacing
      * its allocation. Cc must run before PagingIoResource is acquired. */
     RC = UDFDrainNewFileData(IrpContext, Vcb, FileInfo);
     if (!NT_SUCCESS(RC))
         return RC;
+
+    /* Dropping streams can flush the owning EFE. Keep it outside the base
+     * PagingIoResource, and refuse an undeletable stream before destroying
+     * the main payload. Recheck truncation under PagingIoResource below. */
+    if (!UDFIsAStream(FileInfo) && !UDFIsAStreamDir(FileInfo) &&
+        UDFHasAStreamDir(FileInfo)) {
+        if (!MmCanFileBeTruncated(&Fcb->FcbNonpaged->SegmentObject, &UdfData.UDFLargeZero))
+            return STATUS_USER_MAPPED_FILE;
+        RC = UDFDeleteAllStreams(IrpContext, Vcb, FileInfo);
+        if (!NT_SUCCESS(RC))
+            return RC;
+    }
 
     UDFAcquirePagingIoExclusive(IrpContext, Fcb);
 
@@ -123,18 +154,6 @@ UDFSupersedeOrOverwriteFile(
         // Update FCB cache
         Fcb->FileAttributes = NewFileAttributes;
 
-        // Recreating the main file drops its named streams. For a regular file
-        // (not itself a stream or stream directory) that has a stream directory,
-        // delete the streams here. Safe under the Vcb-exclusive overwrite path.
-        if (!UDFIsAStream(FileInfo) && !UDFIsAStreamDir(FileInfo) &&
-            UDFHasAStreamDir(FileInfo)) {
-
-            RC = UDFDeleteAllStreams(IrpContext, Vcb, FileInfo);
-            if (!NT_SUCCESS(RC)) {
-                AdPrint(("    Error dropping streams on overwrite\n"));
-                try_return(RC);
-            }
-        }
 
 try_exit: NOTHING;
 
@@ -165,6 +184,657 @@ try_exit: NOTHING;
 * Return Value: STATUS_SUCCESS/Error
 *
 *************************************************************************/
+/* A failed CREATE cannot depend on the I/O manager sending cleanup/close
+ * for the rejected FILE_OBJECT. Preserve the already acquired CCB/FI/LCB
+ * and handle-count owners before invoking a fallible cache callback. */
+static VOID
+UDFNoteCreateAbortError(PVCB Vcb, PCCB Ccb, NTSTATUS Status)
+{
+    if (Status == STATUS_SUCCESS || Status == STATUS_DEVICE_BUSY ||
+        Status == STATUS_INSUFFICIENT_RESOURCES) return;
+    if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+    if (NT_SUCCESS(Ccb->AbortFirstError)) Ccb->AbortFirstError = Status;
+    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+}
+
+/* Main exclusive; one bounded attempt, without waiting for Cache Manager.
+ * FALSE from CcUninitializeCacheMap is not an I/O error. The nonpaged event
+ * remains alive through asynchronous completion or an uncertain callback. */
+static NTSTATUS
+UDFResumeCreateAbort(PIRP_CONTEXT IrpContext, PCCB Ccb)
+{
+    PFCB Fcb = Ccb->Fcb;
+    PVCB Vcb = Fcb->Vcb;
+    PFILE_OBJECT FileObject = Ccb->FileObject;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    _SEH2_VOLATILE BOOLEAN Ready = FALSE;
+    ASSERT_EXCLUSIVE_FCB(Fcb);
+    if (!(Ccb->AbortFlags & UDF_CCB_ABORT_LINKED) ||
+        (!FileObject && !(Ccb->AbortFlags & UDF_CCB_ABORT_DETACHED)))
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Ccb->AbortFlags & UDF_CCB_ABORT_RUNNING) return STATUS_DEVICE_BUSY;
+    Ccb->AbortFlags |= UDF_CCB_ABORT_RUNNING;
+    _SEH2_TRY {
+        _SEH2_TRY {
+            Status = UDFDiscardDeleteOnClose(IrpContext, Ccb, FALSE);
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            if (!(Ccb->AbortFlags & UDF_CCB_ABORT_CACHE_DONE)) {
+                if (!(Ccb->AbortFlags & UDF_CCB_ABORT_CACHE_STARTED)) {
+                    if (FileObject->PrivateCacheMap) {
+                        /* A failed CREATE's I/O manager may invalidate its
+                         * device binding. A reference to the body does not
+                         * preserve that binding for a new cache invocation. */
+                        if (!FileObject->DeviceObject || !FileObject->SectionObjectPointer) {
+                            Status = STATUS_FILE_INVALID;
+                            _SEH2_LEAVE;
+                        }
+                        Ccb->AbortCacheEvent = MyAllocatePool__(NonPagedPool,
+                                                    sizeof(CACHE_UNINITIALIZE_EVENT));
+                        if (!Ccb->AbortCacheEvent) {
+                            Status = STATUS_INSUFFICIENT_RESOURCES;
+                            _SEH2_LEAVE;
+                        }
+                        Ccb->AbortCacheEvent->Next = NULL;
+                        KeInitializeEvent(&Ccb->AbortCacheEvent->Event, NotificationEvent, FALSE);
+                        Ccb->AbortFlags |= UDF_CCB_ABORT_CACHE_STARTED;
+                        /* Never repeat an uncertain invocation against the
+                         * same cache map, even if it raises before returning. */
+                        CcUninitializeCacheMap(FileObject, NULL, Ccb->AbortCacheEvent);
+                    } else Ccb->AbortFlags |= UDF_CCB_ABORT_CACHE_DONE;
+                }
+                if (Ccb->AbortFlags & UDF_CCB_ABORT_CACHE_STARTED) {
+                    if (!Ccb->AbortCacheEvent) {
+                        Status = STATUS_FILE_CORRUPT_ERROR;
+                        _SEH2_LEAVE;
+                    }
+                    if (!KeReadStateEvent(&Ccb->AbortCacheEvent->Event)) {
+                        Status = STATUS_DEVICE_BUSY;
+                        _SEH2_LEAVE;
+                    }
+                    if (FileObject->PrivateCacheMap) {
+                        Status = STATUS_PURGE_FAILED;
+                        _SEH2_LEAVE;
+                    }
+                    Ccb->AbortFlags |= UDF_CCB_ABORT_CACHE_DONE;
+                }
+            }
+            if (!(Ccb->AbortFlags & UDF_CCB_ABORT_COUNTS_DONE)) {
+                if (Ccb->AbortFlags & UDF_CCB_ABORT_COUNTS_STARTED) {
+                    Status = STATUS_FILE_CORRUPT_ERROR; /* ambiguous, never replay */
+                    _SEH2_LEAVE;
+                }
+                UDFLockVcb(IrpContext, Vcb);
+                _SEH2_TRY {
+                    if (!Fcb->FcbReference || !Fcb->FcbUserReference ||
+                        !Vcb->VcbReference || !Vcb->VcbUserReference ||
+                        (!FlagOn(Ccb->Flags, UDF_CCB_CLEANED) &&
+                         (!Fcb->FcbCleanup || !Vcb->VcbCleanup ||
+                          (Ccb->Lcb && !Ccb->Lcb->Reference) ||
+                          (FlagOn(Ccb->AbortFileObjectFlags, FO_CACHE_SUPPORTED) &&
+                           !Fcb->CachedOpenHandleCount)))) {
+                        Status = STATUS_FILE_CORRUPT_ERROR;
+                        _SEH2_LEAVE;
+                    }
+                    if (!FlagOn(Ccb->Flags, UDF_CCB_CLEANED)) {
+                        /* Retire the exact accepted counter receipt. A
+                         * rejected query may have used a temporary/dummy FO;
+                         * never retain that address or fabricate an object
+                         * for IoRemoveShareAccess after CREATE returned. */
+                        if (Fcb->ShareAccess.OpenCount < Ccb->OpenShareAccess.OpenCount ||
+                            Fcb->ShareAccess.Readers < Ccb->OpenShareAccess.Readers ||
+                            Fcb->ShareAccess.Writers < Ccb->OpenShareAccess.Writers ||
+                            Fcb->ShareAccess.Deleters < Ccb->OpenShareAccess.Deleters ||
+                            Fcb->ShareAccess.SharedRead < Ccb->OpenShareAccess.SharedRead ||
+                            Fcb->ShareAccess.SharedWrite < Ccb->OpenShareAccess.SharedWrite ||
+                            Fcb->ShareAccess.SharedDelete < Ccb->OpenShareAccess.SharedDelete) {
+                            Status = STATUS_FILE_CORRUPT_ERROR;
+                            _SEH2_LEAVE;
+                        }
+                        Ccb->AbortFlags |= UDF_CCB_ABORT_COUNTS_STARTED;
+                        Fcb->ShareAccess.OpenCount -= Ccb->OpenShareAccess.OpenCount;
+                        Fcb->ShareAccess.Readers -= Ccb->OpenShareAccess.Readers;
+                        Fcb->ShareAccess.Writers -= Ccb->OpenShareAccess.Writers;
+                        Fcb->ShareAccess.Deleters -= Ccb->OpenShareAccess.Deleters;
+                        Fcb->ShareAccess.SharedRead -= Ccb->OpenShareAccess.SharedRead;
+                        Fcb->ShareAccess.SharedWrite -= Ccb->OpenShareAccess.SharedWrite;
+                        Fcb->ShareAccess.SharedDelete -= Ccb->OpenShareAccess.SharedDelete;
+                        UDFDecrementCleanupCounts(IrpContext, Fcb);
+                        if (Ccb->Lcb) InterlockedDecrement((PLONG)&Ccb->Lcb->Reference);
+                        if (FlagOn(Ccb->AbortFileObjectFlags, FO_CACHE_SUPPORTED))
+                            Fcb->CachedOpenHandleCount--;
+                    }
+                    Ccb->AbortFlags |= UDF_CCB_ABORT_COUNTS_STARTED;
+                    Fcb->FcbReference--;
+                    Fcb->FcbUserReference--;
+                    Vcb->VcbReference--;
+                    Vcb->VcbUserReference--;
+                    Ccb->AbortFlags |= UDF_CCB_ABORT_COUNTS_DONE;
+                } _SEH2_FINALLY {
+                    UDFUnlockVcb(IrpContext, Vcb);
+                } _SEH2_END;
+                if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            }
+            if (!(Ccb->AbortFlags & UDF_CCB_ABORT_DETACHED)) {
+                PFCB BoundFcb;
+                PCCB BoundCcb;
+                UDFDecodeFileObject(FileObject, &BoundFcb, &BoundCcb);
+                if (BoundFcb != Fcb || BoundCcb != Ccb) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+                UDFSetFileObject(FileObject, UnopenedFileObject, NULL, NULL);
+                FileObject->SectionObjectPointer = NULL;
+                ClearFlag(FileObject->Flags, FO_CACHE_SUPPORTED);
+                Ccb->AbortFlags |= UDF_CCB_ABORT_DETACHED;
+            }
+            /* A refused decrement may transfer to R464's exact FI ledger.
+             * A NULL pointer is its receipt, even if the status is failure. */
+            Status = UDFReleaseCreateReference(IrpContext, Vcb, &Ccb->FileInfo, TRUE);
+            if (Ccb->FileInfo) _SEH2_LEAVE;
+            Ready = TRUE;
+        } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                      EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+            Status = _SEH2_GetExceptionCode();
+            if (Status == STATUS_CANT_WAIT) Status = STATUS_DEVICE_BUSY;
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        Ccb->AbortFlags &= ~UDF_CCB_ABORT_RUNNING;
+        if (_SEH2_AbnormalTermination())
+            UDFNoteCreateAbortError(Vcb, Ccb, STATUS_FILE_CORRUPT_ERROR);
+    } _SEH2_END;
+    if (Status != STATUS_SUCCESS && NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+    if (!Ready && Status == STATUS_SUCCESS) Status = STATUS_DEVICE_BUSY;
+    UDFNoteCreateAbortError(Vcb, Ccb, Status);
+    if (!Ready) return Status;
+
+    /* Every cache callback is complete, the FILE_OBJECT is detached, and
+     * the FI token was consumed/transferred. No fallible I/O follows. */
+    if (Ccb->AbortCacheEvent) {
+        MyFreePool__(Ccb->AbortCacheEvent);
+        Ccb->AbortCacheEvent = NULL;
+    }
+    UDFLockVcb(IrpContext, Vcb);
+    _SEH2_TRY {
+        RemoveEntryList(&Ccb->AbortLinks);
+        if (Ccb->AbortFlags & UDF_CCB_ABORT_COUNTED) {
+            if (Vcb->AbortedOpenCount > 0 && Vcb->AbortedOpenCount != MAXLONG)
+                InterlockedDecrement(&Vcb->AbortedOpenCount);
+            else {
+                InterlockedExchange(&Vcb->AbortedOpenCount, MAXLONG);
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                UDFNoteCreateAbortError(Vcb, Ccb, Status);
+            }
+        }
+        Ccb->AbortFlags &= ~(UDF_CCB_ABORT_LINKED | UDF_CCB_ABORT_COUNTED);
+    } _SEH2_FINALLY {
+        UDFUnlockVcb(IrpContext, Vcb);
+    } _SEH2_END;
+    Ccb->FileObject = NULL;
+    UDFDeleteCcb(Ccb);
+    if (!Fcb->FcbReference) UDFScheduleFcbTeardownRetry(IrpContext, Fcb);
+    if (FileObject) ObDereferenceObject(FileObject); /* cached abort's owned FO only */
+    return Status;
+}
+
+static NTSTATUS
+UDFUnwindCompletedOpen(PIRP_CONTEXT IrpContext, PFILE_OBJECT FileObject,
+                        PUDF_FILE_INFO* LocalOpenReference)
+{
+    PFCB Fcb;
+    PCCB Ccb;
+    TYPE_OF_OPEN Type;
+    if (!FileObject) return STATUS_SUCCESS;
+    Type = UDFDecodeFileObject(FileObject, &Fcb, &Ccb);
+    if (Type <= StreamFileOpen || !Fcb || !Ccb) return STATUS_SUCCESS;
+    ASSERT_EXCLUSIVE_FCB(Fcb);
+    if (!(Ccb->AbortFlags & UDF_CCB_ABORT_LINKED)) {
+        /* No allocation or callback before ownership is reachable. The
+         * existing open counts keep FCB/VCB alive; queue guards persist if
+         * a later phase has already consumed those counts. */
+        Ccb->AbortFileObjectFlags = FileObject->Flags;
+        if (FileObject->PrivateCacheMap) {
+            /* Cache Manager already requires a referenceable real object.
+             * Keep only this cache-bearing object's body for its completion
+             * event; do not extend the lifetime of ordinary dummy queries. */
+            ObReferenceObject(FileObject);
+        } else {
+            Ccb->AbortFlags |= UDF_CCB_ABORT_CACHE_DONE | UDF_CCB_ABORT_DETACHED;
+            UDFSetFileObject(FileObject, UnopenedFileObject, NULL, NULL);
+            FileObject->SectionObjectPointer = NULL;
+            ClearFlag(FileObject->Flags, FO_CACHE_SUPPORTED);
+            Ccb->FileObject = NULL; /* no address beyond this CREATE lifetime */
+        }
+        UDFLockVcb(IrpContext, Fcb->Vcb);
+        InsertTailList(&Fcb->AbortedOpenQueue, &Ccb->AbortLinks);
+        Ccb->AbortFlags |= UDF_CCB_ABORT_LINKED;
+        if (Fcb->Vcb->AbortedOpenCount >= 0 && Fcb->Vcb->AbortedOpenCount < MAXLONG) {
+            InterlockedIncrement(&Fcb->Vcb->AbortedOpenCount);
+            Ccb->AbortFlags |= UDF_CCB_ABORT_COUNTED;
+        } else {
+            InterlockedExchange(&Fcb->Vcb->AbortedOpenCount, MAXLONG);
+            UDFNoteCreateAbortError(Fcb->Vcb, Ccb, STATUS_FILE_CORRUPT_ERROR);
+        }
+        UDFUnlockVcb(IrpContext, Fcb->Vcb);
+    } else {
+        if (LocalOpenReference && *LocalOpenReference == Ccb->FileInfo)
+            *LocalOpenReference = NULL;
+        return NT_SUCCESS(Ccb->AbortFirstError) ? STATUS_DEVICE_BUSY : Ccb->AbortFirstError;
+    }
+    if (LocalOpenReference && *LocalOpenReference == Ccb->FileInfo)
+        *LocalOpenReference = NULL; /* same token now belongs to abort inventory */
+    return UDFResumeCreateAbort(IrpContext, Ccb);
+}
+
+/* One explicit volume-flush pass over a pinned FCB snapshot. No generic
+ * table restart pointer or table/VCB mutex is held across cache callbacks. */
+NTSTATUS
+UDFRetryVolumeCreateAborts(PIRP_CONTEXT IrpContext, PVCB Vcb)
+{
+    PFCB* Files;
+    PFCB Fcb;
+    PVOID Restart = NULL;
+    ULONG Capacity, Index;
+    _SEH2_VOLATILE ULONG Count = 0;
+    _SEH2_VOLATILE BOOLEAN TableLocked = FALSE, VcbLocked = FALSE;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    if (!InterlockedCompareExchange(&Vcb->AbortedOpenCount, 0, 0)) return STATUS_SUCCESS;
+    UDFLockFcbTable(IrpContext, Vcb);
+    Capacity = RtlNumberGenericTableElements(&Vcb->FcbTable);
+    UDFUnlockFcbTable(IrpContext, Vcb);
+    if (Capacity >= MAXULONG / sizeof(PFCB)) return STATUS_INSUFFICIENT_RESOURCES;
+    Capacity++; /* the volume DASD may not be indexed */
+    Files = MyAllocatePool__(NonPagedPool, Capacity * sizeof(PFCB));
+    if (!Files) return STATUS_INSUFFICIENT_RESOURCES;
+    _SEH2_TRY {
+        UDFLockFcbTable(IrpContext, Vcb); TableLocked = TRUE;
+        UDFLockVcb(IrpContext, Vcb); VcbLocked = TRUE;
+        Fcb = Vcb->VolumeDasdFcb;
+        for (;;) {
+            if (Fcb && !IsListEmpty(&Fcb->AbortedOpenQueue)) {
+                if (Count == Capacity || Fcb->TeardownInProgress ||
+                    Fcb->FcbReference == MAXULONG || Vcb->VcbReference == MAXULONG) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    break;
+                }
+                Fcb->FcbReference++; Vcb->VcbReference++;
+                Files[Count++] = Fcb;
+            }
+            do { Fcb = UDFGetNextFcb(IrpContext, Vcb, &Restart); }
+            while (Fcb && Fcb == Vcb->VolumeDasdFcb);
+            if (!Fcb) break;
+        }
+        VcbLocked = FALSE; UDFUnlockVcb(IrpContext, Vcb);
+        TableLocked = FALSE; UDFUnlockFcbTable(IrpContext, Vcb);
+        for (Index = 0; Status == STATUS_SUCCESS && Index < Count; Index++) {
+            Fcb = Files[Index];
+            if (!UDFAcquireFcbExclusive(IrpContext, Fcb, TRUE)) {
+                Status = STATUS_DEVICE_BUSY;
+                break;
+            }
+            _SEH2_TRY {
+                while (!IsListEmpty(&Fcb->AbortedOpenQueue)) {
+                    PCCB Ccb = CONTAINING_RECORD(Fcb->AbortedOpenQueue.Flink, struct CCB, AbortLinks);
+                    Status = UDFResumeCreateAbort(IrpContext, Ccb);
+                    if (Status != STATUS_SUCCESS) break;
+                }
+            } _SEH2_FINALLY {
+                UDFReleaseFcb(IrpContext, Fcb);
+            } _SEH2_END;
+        }
+    } _SEH2_FINALLY {
+        if (VcbLocked) UDFUnlockVcb(IrpContext, Vcb);
+        if (TableLocked) UDFUnlockFcbTable(IrpContext, Vcb);
+        UDFLockVcb(IrpContext, Vcb);
+        _SEH2_TRY {
+            for (Index = 0; Index < Count; Index++) {
+                Fcb = Files[Index];
+                ASSERT(Fcb->FcbReference && Vcb->VcbReference);
+                Fcb->FcbReference--; Vcb->VcbReference--;
+                if (!Fcb->FcbReference && FlagOn(Fcb->FcbState, FCB_STATE_IN_FCB_TABLE) &&
+                    !Fcb->TeardownRetryPending) {
+                    Fcb->TeardownRetryPending = TRUE;
+                    InterlockedIncrement(&Vcb->ClosedFcbRetryCount);
+                }
+            }
+        } _SEH2_FINALLY {
+            UDFUnlockVcb(IrpContext, Vcb);
+            MyFreePool__(Files);
+        } _SEH2_END;
+    } _SEH2_END;
+    if (Status == STATUS_SUCCESS && InterlockedCompareExchange(&Vcb->AbortedOpenCount, 0, 0))
+        Status = STATUS_DEVICE_BUSY;
+    return Status;
+}
+
+/* Coherence work is fallible admission, not a post-success open side
+ * effect. CREATE already holds VCB; a parent Main may be held too. Take
+ * child Main only without waiting or upgrading a borrowed shared hold. */
+static NTSTATUS
+UDFPrepareNoncachedOpen(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                        PFCB Fcb, PUDF_FILE_INFO FileInfo)
+{
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    BOOLEAN MainAcquired = FALSE;
+    if (!ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource)) {
+        if (ExIsResourceAcquiredSharedLite(&Fcb->FcbNonpaged->FcbResource) ||
+            !UDFAcquireFcbExclusive(IrpContext, Fcb, TRUE))
+            return STATUS_SHARING_VIOLATION;
+        MainAcquired = TRUE;
+    }
+    _SEH2_TRY {
+        _SEH2_TRY {
+            /* Recheck after acquisition. A new cached open is permitted,
+             * but it must not have a dirty generation purged beneath it. */
+            if (!Fcb->CachedOpenHandleCount &&
+                Fcb->FcbNonpaged->SegmentObject.DataSectionObject) {
+                IO_STATUS_BLOCK IoStatus;
+                IoStatus.Status = STATUS_SUCCESS;
+                IoStatus.Information = 0;
+                CcFlushCache(&Fcb->FcbNonpaged->SegmentObject, NULL, 0, &IoStatus);
+                Status = IoStatus.Status;
+                if (Status != STATUS_SUCCESS) {
+                    if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+                    UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, Status);
+                } else if (!CcPurgeCacheSection(&Fcb->FcbNonpaged->SegmentObject,
+                                                NULL, 0, FALSE)) {
+                    Status = STATUS_PURGE_FAILED;
+                }
+            }
+        } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                      EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+            Status = _SEH2_GetExceptionCode();
+            UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, Status);
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (MainAcquired) UDFReleaseFcb(IrpContext, Fcb);
+    } _SEH2_END;
+    return Status;
+}
+
+/* A failed fresh CREATE transfers a real ordinary FI hold to this Dloc
+ * owner. It does not re-use a CCB's accepted hold or infer creation from a
+ * successful open. Publication is non-I/O; retry belongs to a volume flush. */
+#define UDF_CREATE_ROLLBACK_NONE       0
+#define UDF_CREATE_ROLLBACK_READY      1
+#define UDF_CREATE_ROLLBACK_UNLINK     2
+#define UDF_CREATE_ROLLBACK_COMMITTED  3
+#define UDF_CREATE_ROLLBACK_RELEASE    4
+#define UDF_CREATE_ROLLBACK_UNCERTAIN  5
+#define UDF_CREATE_ROLLBACK_FLUSH      6
+
+static NTSTATUS
+UDFQueueCreateRollback(PIRP_CONTEXT IrpContext, PFILE_OBJECT FileObject,
+    PUDF_FILE_INFO* OpenReference, NTSTATUS CreateStatus)
+{
+    PUDF_FILE_INFO FileInfo = *OpenReference;
+    PVCB Vcb = IrpContext->Vcb;
+    PUDF_DATALOC_INFO Dloc;
+    PFCB BoundFcb = NULL;
+    PCCB Ccb = NULL;
+    TYPE_OF_OPEN Type;
+    _SEH2_VOLATILE PUDF_FILE_INFO Extra = NULL;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    LONG Count;
+    if (!FileInfo || !(Dloc = FileInfo->Dloc) || FileInfo->Constructing ||
+        FileInfo->ConstructionFailed || !FileInfo->RefCount ||
+        !FileInfo->ParentFile || !FileInfo->ParentFile->Dloc)
+        return STATUS_FILE_INVALID;
+    Type = UDFDecodeFileObject(FileObject, &BoundFcb, &Ccb);
+    if (Type > StreamFileOpen) {
+        if (!Ccb || !BoundFcb || !BoundFcb->FileInfo || Ccb->FileInfo != FileInfo ||
+            BoundFcb->FileInfo->Dloc != Dloc)
+            return STATUS_FILE_CORRUPT_ERROR;
+        /* CCB already accepted the original reference. Reserve a separate
+         * checked hold before its existing abort path consumes that token. */
+        Status = UDFReferenceFileChecked(Vcb, FileInfo);
+        if (Status != STATUS_SUCCESS) return Status;
+        Extra = FileInfo;
+    }
+    _SEH2_TRY {
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        _SEH2_TRY {
+            if (Dloc->CreateRollbackOwner || FileInfo->CreateRollbackPhase ||
+                FileInfo->CreateRollbackCounted || Dloc->CleanupOwner ||
+                Dloc->NamespaceScratchOwner || Dloc->StreamDeleteContextOwner ||
+                Dloc->StreamCreate || !FileInfo->RefCount || Vcb->CreateRollbackCount < 0 ||
+                Vcb->CreateRollbackCount >= MAXLONG - 1) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            for (;;) {
+                Count = InterlockedCompareExchange(&Vcb->PendingNamespaceCount, 0, 0);
+                if (Count < 0 || Count >= MAXLONG - 1) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+                if (InterlockedCompareExchange(&Vcb->PendingNamespaceCount,
+                                               Count + 1, Count) == Count)
+                    break;
+            }
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            FileInfo->CreateFailureStatus = CreateStatus;
+            FileInfo->CreateRollbackFirstError = STATUS_SUCCESS;
+            FileInfo->CreateRollbackLastError = STATUS_SUCCESS;
+            FileInfo->CreateRollbackTouched = FALSE;
+            FileInfo->CreateRollbackCounted = TRUE;
+            FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_READY;
+            Dloc->CreateRollbackOwner = FileInfo;
+            InsertTailList(&Vcb->CreateRollbackQueue, &FileInfo->CreateRollbackLinks);
+            InterlockedIncrement(&Vcb->CreateRollbackCount);
+            /* One callback-free handoff. With a CCB, Extra is the new owner;
+             * otherwise the caller's original ordinary hold moves here. */
+            Extra = NULL;
+            *OpenReference = NULL;
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&Vcb->DlocResource2);
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (Extra)
+            UDFReleaseCreateReference(IrpContext, Vcb,
+                                       (PUDF_FILE_INFO*)&Extra, FALSE);
+        if (_SEH2_AbnormalTermination() || Status == STATUS_FILE_CORRUPT_ERROR) {
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                        STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+        }
+    } _SEH2_END;
+    return Status;
+}
+
+static NTSTATUS
+UDFResumeCreateRollback(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                         PUDF_FILE_INFO FileInfo)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    PFCB Fcb = Dloc->CommonFcb;
+    PFCB Parent = FileInfo->ParentFile ? FileInfo->ParentFile->Fcb : NULL;
+    _SEH2_VOLATILE BOOLEAN MainHeld = FALSE, ParentHeld = FALSE;
+    BOOLEAN WasWriter = BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_DEVICE_BUSY;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    if (Dloc->CreateRollbackOwner != FileInfo || !FileInfo->CreateRollbackCounted)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (FileInfo->CreateRollbackPhase == UDF_CREATE_ROLLBACK_FLUSH ||
+        FileInfo->CreateRollbackPhase == UDF_CREATE_ROLLBACK_UNLINK ||
+        FileInfo->CreateRollbackPhase == UDF_CREATE_ROLLBACK_RELEASE)
+        return STATUS_DEVICE_BUSY; /* a recursive flush cannot replay this owner */
+    if (FileInfo->CreateRollbackPhase != UDF_CREATE_ROLLBACK_READY &&
+        FileInfo->CreateRollbackPhase != UDF_CREATE_ROLLBACK_COMMITTED)
+        return NT_SUCCESS(FileInfo->CreateRollbackFirstError) ?
+               STATUS_FILE_CORRUPT_ERROR : FileInfo->CreateRollbackFirstError;
+    if (FileInfo->CreateRollbackPhase == UDF_CREATE_ROLLBACK_READY &&
+        FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY))
+        return NT_SUCCESS(FileInfo->CreateRollbackFirstError) ?
+               FileInfo->CreateFailureStatus : FileInfo->CreateRollbackFirstError;
+    if ((Fcb && (!Fcb->Header.Resource || Fcb->TeardownInProgress)) ||
+        (Parent && (!Parent->Header.Resource || Parent->TeardownInProgress)))
+        return STATUS_DEVICE_BUSY;
+    if (Fcb && !ExIsResourceAcquiredExclusiveLite(Fcb->Header.Resource)) {
+        if (ExIsResourceAcquiredSharedLite(Fcb->Header.Resource) ||
+            !UDFAcquireFcbExclusive(IrpContext, Fcb, TRUE))
+            return STATUS_DEVICE_BUSY;
+        MainHeld = TRUE;
+    }
+    SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    _SEH2_TRY {
+        _SEH2_TRY {
+            if (Parent && Parent != Fcb &&
+                !ExIsResourceAcquiredExclusiveLite(Parent->Header.Resource)) {
+                if (ExIsResourceAcquiredSharedLite(Parent->Header.Resource) ||
+                    !UDFAcquireFcbExclusive(IrpContext, Parent, TRUE))
+                    _SEH2_LEAVE;
+                ParentHeld = TRUE;
+            }
+            if (FileInfo->CreateRollbackPhase == UDF_CREATE_ROLLBACK_READY) {
+                if (!Parent || !FileInfo->FileIdent) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+                /* The old failed CCB/cache owner must finish separately.
+                 * A mapping, another handle or another exact FI is not ours
+                 * to close merely to make rollback appear successful. */
+                if (FileInfo->RefCount != 1 || FileInfo->OpenCount ||
+                    (Fcb && (Fcb->FcbCleanup || !IsListEmpty(&Fcb->AbortedOpenQueue) ||
+                     !MmCanFileBeTruncated(&Fcb->FcbNonpaged->SegmentObject,
+                                           &UdfData.UDFLargeZero))))
+                    _SEH2_LEAVE;
+                FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_FLUSH;
+                Status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+                FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_READY;
+                if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+                FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_UNLINK;
+                FileInfo->CreateRollbackTouched = FALSE;
+                Status = UDFUnlinkFileEx__(IrpContext, Vcb, FileInfo, TRUE,
+                                           &FileInfo->CreateRollbackTouched);
+                if (Status != STATUS_SUCCESS) {
+                    FileInfo->CreateRollbackPhase = FileInfo->CreateRollbackTouched ?
+                        UDF_CREATE_ROLLBACK_UNCERTAIN : UDF_CREATE_ROLLBACK_READY;
+                    if (FileInfo->CreateRollbackTouched)
+                        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                    _SEH2_LEAVE;
+                }
+                FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_COMMITTED;
+            }
+            /* Unlink has a durable receipt. Retry only reference retirement,
+             * never the namespace operation or an already spent close. */
+            UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+            if (Dloc->CreateRollbackOwner != FileInfo || FileInfo->RefCount != 1 ||
+                !FileInfo->CreateRollbackCounted || Vcb->PendingNamespaceCount <= 0 ||
+                Vcb->PendingNamespaceCount == MAXLONG || Vcb->CreateRollbackCount <= 0 ||
+                Vcb->CreateRollbackCount == MAXLONG) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+            } else {
+                FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_RELEASE;
+                Status = STATUS_SUCCESS;
+            }
+            UDFReleaseResource(&Vcb->DlocResource2);
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            Status = UDFDereferenceFileChecked(Vcb, FileInfo);
+            if (Status != STATUS_SUCCESS) {
+                FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_COMMITTED;
+                _SEH2_LEAVE; /* returned refusal consumed no reference */
+            }
+            UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+            RemoveEntryList(&FileInfo->CreateRollbackLinks);
+            InitializeListHead(&FileInfo->CreateRollbackLinks);
+            Dloc->CreateRollbackOwner = NULL;
+            FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_NONE;
+            FileInfo->CreateRollbackCounted = FALSE;
+            FileInfo->CleanupPending = TRUE;
+            InterlockedDecrement(&Vcb->PendingNamespaceCount);
+            InterlockedDecrement(&Vcb->CreateRollbackCount);
+            UDFReleaseResource(&Vcb->DlocResource2);
+        } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                      EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+            Status = _SEH2_GetExceptionCode();
+            if (FileInfo->CreateRollbackPhase == UDF_CREATE_ROLLBACK_FLUSH)
+                FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_READY;
+            else if (FileInfo->CreateRollbackPhase == UDF_CREATE_ROLLBACK_UNLINK ||
+                FileInfo->CreateRollbackPhase == UDF_CREATE_ROLLBACK_RELEASE) {
+                FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_UNCERTAIN;
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            }
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) {
+            FileInfo->CreateRollbackPhase = UDF_CREATE_ROLLBACK_UNCERTAIN;
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        }
+        if (Status != STATUS_SUCCESS && NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+        FileInfo->CreateRollbackLastError = Status;
+        if (Status != STATUS_SUCCESS) {
+            if (Status != STATUS_DEVICE_BUSY) {
+                if (NT_SUCCESS(FileInfo->CreateRollbackFirstError))
+                    FileInfo->CreateRollbackFirstError = Status;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                            Status, STATUS_SUCCESS);
+            }
+        }
+        if (ParentHeld) UDFReleaseFcb(IrpContext, Parent);
+        if (MainHeld) UDFReleaseFcb(IrpContext, Fcb);
+        if (!WasWriter) ClearFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Only active inline owners are visited. Fetch the head anew after each
+ * attempt; never keep a list restart pointer across unlink/cache callbacks.
+ * The original count bounds the pass if a recursive request adds work. */
+NTSTATUS
+UDFRetryVolumeCreateRollbacks(PIRP_CONTEXT IrpContext, PVCB Vcb)
+{
+    LONG Index, Capacity;
+    NTSTATUS Status;
+    PUDF_FILE_INFO FileInfo;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    Capacity = InterlockedCompareExchange(&Vcb->CreateRollbackCount, 0, 0);
+    if (Capacity < 0 || Capacity == MAXLONG) {
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                    STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+    if (!Capacity) {
+        BOOLEAN Empty;
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        Empty = IsListEmpty(&Vcb->CreateRollbackQueue);
+        UDFReleaseResource(&Vcb->DlocResource2);
+        if (Empty) return STATUS_SUCCESS;
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                    STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+    for (Index = 0; Index < Capacity; Index++) {
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        FileInfo = IsListEmpty(&Vcb->CreateRollbackQueue) ? NULL :
+            CONTAINING_RECORD(Vcb->CreateRollbackQueue.Flink,
+                              UDF_FILE_INFO, CreateRollbackLinks);
+        UDFReleaseResource(&Vcb->DlocResource2);
+        if (!FileInfo) {
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                        STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+            return STATUS_FILE_CORRUPT_ERROR;
+        }
+        Status = UDFResumeCreateRollback(IrpContext, Vcb, FileInfo);
+        if (Status != STATUS_SUCCESS) {
+            if (Status == STATUS_FILE_CORRUPT_ERROR) {
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                            Status, STATUS_SUCCESS);
+            }
+            return Status;
+        }
+    }
+    return InterlockedCompareExchange(&Vcb->CreateRollbackCount, 0, 0) ?
+           STATUS_DEVICE_BUSY : STATUS_SUCCESS;
+}
+
+
 NTSTATUS
 UDFOpenExistingFcb(
     IN PIRP_CONTEXT IrpContext,
@@ -175,7 +845,8 @@ UDFOpenExistingFcb(
     IN OUT PFCB *PtrNewFcb,
     IN BOOLEAN IgnoreCase,
     IN PFILE_OBJECT RelatedFileObject OPTIONAL,
-    IN PFCB RelatedFcb OPTIONAL
+    IN PFCB RelatedFcb OPTIONAL,
+    IN ULONG CreateDisposition
     )
 {
     NTSTATUS Status;
@@ -183,9 +854,9 @@ UDFOpenExistingFcb(
     TYPE_OF_OPEN TypeOfOpen;
     ULONG DesiredInformation;
     USHORT TmpFileAttributes;
+    PDIR_INDEX_ITEM OpenDirectoryEntry;
 
     ULONG Options = IrpSp->Parameters.Create.Options;
-    ULONG CreateDisposition = (Options >> 24) & 0x000000FF;
     USHORT FileAttributes = (USHORT)(IrpSp->Parameters.Create.FileAttributes & ~FILE_ATTRIBUTE_NORMAL);
     LONGLONG AllocationSize = IrpContext->Irp->Overlay.AllocationSize.QuadPart;
     ACCESS_MASK DesiredAccess = IrpSp->Parameters.Create.SecurityContext->DesiredAccess;
@@ -195,6 +866,18 @@ UDFOpenExistingFcb(
 
     PAGED_CODE();
     ASSERT(*PtrNewFcb);
+    if (UDFIsReservedMetadataFile(NewFileInfo))
+        return STATUS_ACCESS_DENIED;
+
+    if (UDFIsADirectory(NewFileInfo)) {
+        if (FlagOn(Options, FILE_NON_DIRECTORY_FILE) ||
+            CreateDisposition == FILE_SUPERSEDE ||
+            CreateDisposition == FILE_OVERWRITE ||
+            CreateDisposition == FILE_OVERWRITE_IF)
+            return STATUS_FILE_IS_A_DIRECTORY;
+    } else if (FlagOn(Options, FILE_DIRECTORY_FILE)) {
+        return STATUS_NOT_A_DIRECTORY;
+    }
 
     // Check share access BEFORE creating CCB/incrementing counts.
     Status = UDFCheckAccessRights(FileObject, AccessState, *PtrNewFcb, NULL, DesiredAccess, ShareAccess);
@@ -249,11 +932,22 @@ UDFOpenExistingFcb(
         break;
     }
 
+    /* Refuse a failed cache flush/purge before any successful CCB/share
+     * count publication. Later direct I/O still enforces per-request cache
+     * coherence; this admission does not replace that obligation. */
+    if (TypeOfOpen == UserFileOpen && FlagOn(Options, FILE_NO_INTERMEDIATE_BUFFERING) &&
+        !(*PtrNewFcb)->CachedOpenHandleCount &&
+        (*PtrNewFcb)->FcbNonpaged->SegmentObject.DataSectionObject) {
+        Status = UDFPrepareNoncachedOpen(IrpContext, Vcb, *PtrNewFcb, NewFileInfo);
+        if (Status != STATUS_SUCCESS) return Status;
+    }
+
     // Create CCB, set share access, increment open counts
     Status = UDFCompleteFcbOpen(IrpContext,
                                 IrpSp,
                                 Vcb,
                                 PtrNewFcb,
+                                NewFileInfo,
                                 TypeOfOpen,
                                 CcbFlags,
                                 CreateDisposition,
@@ -283,18 +977,6 @@ UDFOpenExistingFcb(
             }
         }
 
-        if (FlagOn(Options, FILE_NO_INTERMEDIATE_BUFFERING) &&
-           !((*PtrNewFcb)->CachedOpenHandleCount) &&
-            ((*PtrNewFcb)->FcbNonpaged->SegmentObject.DataSectionObject) ) {
-            //  If this is a non-cached open, and there are no open cached
-            //  handles, but there is still a data section, attempt a flush
-            //  and purge operation to avoid cache coherency overhead later.
-            //  We ignore any I/O errors from the flush.
-            MmPrint(("    CcFlushCache()\n"));
-            CcFlushCache(&(*PtrNewFcb)->FcbNonpaged->SegmentObject, NULL, 0, NULL);
-            MmPrint(("    CcPurgeCacheSection()\n"));
-            CcPurgeCacheSection(&(*PtrNewFcb)->FcbNonpaged->SegmentObject, NULL, 0, FALSE);
-        }
     }
 
     if (DeleteOnClose && UDFIsADirectory(NewFileInfo) && !UDFIsDirEmpty__(NewFileInfo)) {
@@ -302,8 +984,12 @@ UDFOpenExistingFcb(
         return STATUS_DIRECTORY_NOT_EMPTY;
     }
 
-    // Get attributes from FCB cache.
-    TmpFileAttributes = (USHORT)(*PtrNewFcb)->FileAttributes;
+    // FID attributes belong to this name, not the canonical/by-ID FI.
+    OpenDirectoryEntry = UDFDirIndex(UDFGetDirIndexByFileInfo(NewFileInfo),
+                                      NewFileInfo->Index);
+    TmpFileAttributes = (USHORT)(OpenDirectoryEntry ?
+        UDFAttributesToNT(OpenDirectoryEntry, NewFileInfo->Dloc->FileEntry) :
+        (*PtrNewFcb)->FileAttributes);
 
     // Reject DeleteOnClose on readonly files
     if (DeleteOnClose &&
@@ -452,6 +1138,142 @@ UDFOpenExistingFcb(
 * Return Value: STATUS_SUCCESS/Error
 *
 *************************************************************************/
+/* Current/Previous name resources actually owned by this request. Keep
+ * both FCB identities pinned while changing lock order, and publish each
+ * acquired/released resource before any next fallible step. */
+static NTSTATUS
+UDFMoveCreateFcb(PIRP_CONTEXT IrpContext, PVCB Vcb, PFCB Child,
+                 PFCB* Current, PFCB* Previous)
+{
+    PFCB Parent = *Current, Extra;
+    BOOLEAN ParentPinned = FALSE, ChildPinned = FALSE;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    if (!Child || !Child->FcbNonpaged || Child->Vcb != Vcb ||
+        (Parent && Parent->Vcb != Vcb)) return STATUS_FILE_INVALID;
+    if (Child == Parent) return STATUS_SUCCESS;
+    UDF_CHECK_PAGING_IO_RESOURCE(Child);
+    if (ExIsResourceAcquiredSharedLite(&Child->FcbNonpaged->FcbResource) &&
+        !ExIsResourceAcquiredExclusiveLite(&Child->FcbNonpaged->FcbResource))
+        return STATUS_SHARING_VIOLATION;
+    if (UDFAcquireFcbExclusive(IrpContext, Child, TRUE)) {
+        Extra = *Previous;
+        *Previous = NULL;
+        if (Extra && Extra != Parent) UDFReleaseFcb(IrpContext, Extra);
+        *Previous = Parent;
+        *Current = Child;
+        return STATUS_SUCCESS;
+    }
+    if (!BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT))
+        return STATUS_DEVICE_BUSY; /* no retry token after FI admission */
+    UDFLockVcb(IrpContext, Vcb);
+    if (Child->TeardownInProgress || (Parent && Parent->TeardownInProgress))
+        Status = STATUS_SHARING_VIOLATION;
+    else if (Child->FcbReference == MAXULONG || (Parent && Parent->FcbReference == MAXULONG))
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+    else {
+        Child->FcbReference++;
+        ChildPinned = TRUE;
+        if (Parent) { Parent->FcbReference++; ParentPinned = TRUE; }
+    }
+    UDFUnlockVcb(IrpContext, Vcb);
+    if (Status != STATUS_SUCCESS) return Status;
+    _SEH2_TRY {
+        Extra = *Previous;
+        *Previous = NULL;
+        if (Extra && Extra != Parent) UDFReleaseFcb(IrpContext, Extra);
+        *Current = NULL;
+        if (Parent) UDFReleaseFcb(IrpContext, Parent);
+        if (!UDFAcquireFcbExclusive(IrpContext, Child, FALSE)) {
+            Status = STATUS_SHARING_VIOLATION;
+            _SEH2_LEAVE;
+        }
+        *Current = Child;
+        if (Parent) {
+            UDF_CHECK_PAGING_IO_RESOURCE(Parent);
+            /* A waiting upward reacquire can invert another CREATE's
+             * parent/child handoff. Keep the acquired child and refuse this
+             * attempt if the old parent cannot be reacquired immediately. */
+            if (!UDFAcquireFcbExclusive(IrpContext, Parent, TRUE)) {
+                Status = STATUS_DEVICE_BUSY;
+                _SEH2_LEAVE;
+            }
+            *Previous = Parent;
+        }
+    } _SEH2_FINALLY {
+        BOOLEAN Failed = _SEH2_AbnormalTermination() || Status != STATUS_SUCCESS;
+        UDFLockVcb(IrpContext, Vcb);
+        _SEH2_TRY {
+            if (ChildPinned) { ASSERT(Child->FcbReference); Child->FcbReference--; }
+            if (ParentPinned) { ASSERT(Parent->FcbReference); Parent->FcbReference--; }
+            if (Failed && !Child->FcbReference &&
+                FlagOn(Child->FcbState, FCB_STATE_IN_FCB_TABLE) && !Child->TeardownRetryPending) {
+                Child->TeardownRetryPending = TRUE;
+                InterlockedIncrement(&Vcb->ClosedFcbRetryCount);
+            }
+            if (Failed && Parent && !Parent->FcbReference &&
+                FlagOn(Parent->FcbState, FCB_STATE_IN_FCB_TABLE) && !Parent->TeardownRetryPending) {
+                Parent->TeardownRetryPending = TRUE;
+                InterlockedIncrement(&Vcb->ClosedFcbRetryCount);
+            }
+        } _SEH2_FINALLY {
+            UDFUnlockVcb(IrpContext, Vcb);
+        } _SEH2_END;
+    } _SEH2_END;
+    return Status;
+}
+
+/* Teardown only the FCB whose resource slot is actually owned, not a stale
+ * last successful path pointer. The previous FCB remains independently
+ * pinned through an ancestor walk and through raised cleanup failures. */
+static NTSTATUS
+UDFTeardownCreateFcb(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                     PFCB* Current, PFCB* Previous)
+{
+    PFCB Target = *Current, Parent = *Previous;
+    BOOLEAN ParentPinned = FALSE;
+    BOOLEAN WasWriter = BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    _SEH2_VOLATILE BOOLEAN Removed = FALSE;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    if (!Target || Target == Vcb->RootIndexFcb ||
+        !ExIsResourceAcquiredExclusiveLite(&Target->FcbNonpaged->FcbResource))
+        return STATUS_SUCCESS;
+    if (Parent && Parent != Target) {
+        UDFLockVcb(IrpContext, Vcb);
+        if (Parent->FcbReference == MAXULONG) Status = STATUS_INSUFFICIENT_RESOURCES;
+        else { Parent->FcbReference++; ParentPinned = TRUE; }
+        UDFUnlockVcb(IrpContext, Vcb);
+        if (Status != STATUS_SUCCESS) {
+            UDFScheduleFcbTeardownRetry(IrpContext, Target);
+            return Status;
+        }
+    }
+    SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    _SEH2_TRY {
+        _SEH2_TRY {
+            Status = UDFTeardownStructuresEx(IrpContext, Target, FALSE, TRUE, (PBOOLEAN)&Removed);
+        } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                      EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+            Status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (Removed) {
+            if (*Previous == Target) *Previous = NULL;
+            *Current = NULL; /* teardown already consumed this acquisition */
+        }
+        if (ParentPinned) {
+            UDFLockVcb(IrpContext, Vcb);
+            ASSERT(Parent->FcbReference);
+            Parent->FcbReference--;
+            UDFUnlockVcb(IrpContext, Vcb);
+            if (!Parent->FcbReference) UDFScheduleFcbTeardownRetry(IrpContext, Parent);
+        }
+        if (!WasWriter) ClearFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    } _SEH2_END;
+    if (Status != STATUS_SUCCESS && Status != STATUS_DEVICE_BUSY)
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+    return Status;
+}
+
 NTSTATUS
 UDFOpenObjectFromDirContext(
     IN PIRP_CONTEXT IrpContext,
@@ -472,9 +1294,9 @@ UDFOpenObjectFromDirContext(
     OUT PFCB *OutFcb
     )
 {
-    NTSTATUS Status;
-    PUDF_FILE_INFO NewFileInfo = NULL;
-    PFCB PtrNewFcb = NULL;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    _SEH2_VOLATILE PUDF_FILE_INFO NewFileInfo = NULL;
+    _SEH2_VOLATILE PFCB PtrNewFcb = NULL;
 
     PAGED_CODE();
 
@@ -489,9 +1311,26 @@ UDFOpenObjectFromDirContext(
     } else {
         // Step 1: Open FileInfo from directory context (read from disk or find cached)
         ASSERT(DirContext);
-        Status = UDFOpenFileInfoFromDirContext(IrpContext, Vcb, DirContext, TRUE, &NewFileInfo);
+        _SEH2_TRY {
+            _SEH2_TRY {
+                Status = UDFOpenFileInfoFromDirContext(IrpContext, Vcb, DirContext,
+                                       TRUE, (PUDF_FILE_INFO*)&NewFileInfo);
+                if (Status != STATUS_SUCCESS && NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+            } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                          EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                Status = _SEH2_GetExceptionCode();
+            } _SEH2_END;
+            if (Status == STATUS_CANT_WAIT) Status = STATUS_DEVICE_BUSY;
+        } _SEH2_FINALLY {
+            if (_SEH2_AbnormalTermination()) Status = STATUS_FILE_CORRUPT_ERROR;
+            if (Status != STATUS_SUCCESS) {
+                /* No successful open was returned. Keep its exact failed
+                 * constructor reachable even when this wrapper's caller has
+                 * no partial output, or an exception skips the return. */
+                UDFRetainFailedStreamOpen(Vcb, (PUDF_FILE_INFO*)&NewFileInfo);
+            }
+        } _SEH2_END;
         if (Status == STATUS_FILE_DELETED) {
-            NewFileInfo = NULL;
             AdPrint(("    File deleted\n"));
             return STATUS_ACCESS_DENIED;
         }
@@ -505,128 +1344,51 @@ UDFOpenObjectFromDirContext(
         }
     }
 
-    // Step 2: Get or create FCB (always without CCB first)
-    if (!(PtrNewFcb = NewFileInfo->Fcb)) {
-        // First open — create FCB (no CCB).
-        // CCB is created later by UDFOpenExistingFcb when PerformUserOpen=TRUE.
-        Status = UDFFirstOpenFile(IrpContext, Vcb,
-                                  &PtrNewFcb, RelatedFileInfo, NewFileInfo);
-        if (!NT_SUCCESS(Status)) {
-            BrutePoint();
-            AdPrint(("    Can't perform FirstOpen\n"));
-            if (ExistingFileInfo) {
-                // Caller provided pre-created FileInfo — return it for cleanup.
-                // Caller needs it to undo disk creation (flush + unlink).
-                *OutFileInfo = NewFileInfo;
-                *OutFcb = PtrNewFcb;
-            } else {
-                UDFCloseFile__(IrpContext, Vcb, NewFileInfo);
-                if (PtrNewFcb) {
-                    if (NewFileInfo->Dloc &&
-                        NewFileInfo->Dloc->CommonFcb == PtrNewFcb) {
-                        NewFileInfo->Dloc->CommonFcb = NULL;
-                    }
-                    UDFDeleteFcb(IrpContext, PtrNewFcb);
-                }
-                NewFileInfo->Fcb = NULL;
-                if (UDFCleanUpFile__(Vcb, NewFileInfo)) {
-                    MyFreePool__(NewFileInfo);
-                    NewFileInfo = NULL;
-                }
-            }
-            return Status;
-        }
-    } else {
-        // FCB already exists — validate it
-        if (!(PtrNewFcb->FcbState & UDF_FCB_VALID)) {
-            BrutePoint();
-            AdPrint(("    Fcb not valid\n"));
-            if (ExistingFileInfo) {
-                *OutFileInfo = NewFileInfo;
-                *OutFcb = PtrNewFcb;
-            } else {
-                UDFCloseFile__(IrpContext, Vcb, NewFileInfo);
-                if (UDFCleanUpFile__(Vcb, NewFileInfo)) {
-                    MyFreePool__(NewFileInfo);
-                    NewFileInfo = NULL;
-                }
-            }
-            return STATUS_ACCESS_DENIED;
-        }
-    }
-
-    // Step 2b: For user open — complete the open (access check + CCB)
-    if (PerformUserOpen) {
-        Status = UDFOpenExistingFcb(IrpContext, IrpSp, Vcb,
-                                    IrpSp->FileObject, NewFileInfo, &PtrNewFcb,
-                                    IgnoreCase, RelatedFileObject, RelatedFcb);
-        if (!NT_SUCCESS(Status)) {
-            *OutFileInfo = NewFileInfo;
-            *OutFcb = PtrNewFcb;
-            return Status;
-        }
-    }
-
-    // Step 3: Keep ParentFcb in sync with current traversal path
-    PtrNewFcb->ParentFcb = RelatedFileInfo->Fcb;
-
-    // Step 4: Acquire FCB lock
-    {
-        PFCB NewFcb = NewFileInfo->Fcb;
-        if (NewFcb != *CurrentFcb) {
-            UDF_CHECK_PAGING_IO_RESOURCE(NewFcb);
-            if (!UDFAcquireFcbExclusive(IrpContext, NewFcb, TRUE)) {
-                // Try-lock failed — release all locks, then re-acquire
-                // child first, parent second. This avoids deadlock: all locks
-                // are released before re-acquiring, so no circular wait.
-                // Bump child ref to prevent teardown while unlocked.
-                UDFLockVcb(IrpContext, Vcb);
-                NewFcb->FcbReference += 1;
-                UDFUnlockVcb(IrpContext, Vcb);
-
-                if (*PreviousFcb && *PreviousFcb != *CurrentFcb) {
-                    UDFReleaseFcb(IrpContext, *PreviousFcb);
-                }
-                UDFReleaseFcb(IrpContext, *CurrentFcb);
-
-                UDFAcquireFcbExclusive(IrpContext, NewFcb, FALSE);
-                UDF_CHECK_PAGING_IO_RESOURCE((*CurrentFcb));
-                UDFAcquireFcbExclusive(IrpContext, *CurrentFcb, FALSE);
-
-                UDFLockVcb(IrpContext, Vcb);
-                NewFcb->FcbReference -= 1;
-                UDFUnlockVcb(IrpContext, Vcb);
-
-                *PreviousFcb = *CurrentFcb;
-            } else {
-                if (*PreviousFcb && *PreviousFcb != *CurrentFcb) {
-                    UDFReleaseFcb(IrpContext, *PreviousFcb);
-                }
-                *PreviousFcb = *CurrentFcb;
-            }
-            *CurrentFcb = NewFcb;
-        }
-    }
-
-    // Step 5: For intermediate directories — create LCB linking parent→child.
-    // Parent lock is held (PreviousFcb == parent) in both normal and
-    // try-lock failure paths — splay tree insert will succeed.
-    if (RemainingNameLength && *PreviousFcb && RelatedFileInfo && RelatedFileInfo->Fcb) {
-        UDFAcquirePrefix(IrpContext,
-                         RelatedFileInfo->Fcb,
-                         PtrNewFcb,
-                         NULL, NULL, NULL,
-                         NewFileInfo ? NewFileInfo->Index : 0);
-
-        // Release parent lock — now protected by LCB reference.
-        if (*PreviousFcb && *PreviousFcb != *CurrentFcb) {
-            UDFReleaseFcb(IrpContext, *PreviousFcb);
-            *PreviousFcb = *CurrentFcb;
-        }
-    }
-
+    /* From here a successful temporary open belongs to the caller's output,
+     * even if an expected/abnormal FCB/prefix/CCB setup step fails. */
     *OutFileInfo = NewFileInfo;
-    *OutFcb = PtrNewFcb;
+    _SEH2_TRY {
+        if (!(PtrNewFcb = NewFileInfo->Fcb)) {
+            Status = UDFFirstOpenFile(IrpContext, Vcb,
+                            (PFCB*)&PtrNewFcb, RelatedFileInfo, NewFileInfo);
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        } else if (!(PtrNewFcb->FcbState & UDF_FCB_VALID) || PtrNewFcb->TeardownInProgress) {
+            Status = STATUS_ACCESS_DENIED;
+            _SEH2_LEAVE;
+        }
+        *OutFcb = PtrNewFcb;
+        Status = UDFMoveCreateFcb(IrpContext, Vcb, PtrNewFcb, CurrentFcb, PreviousFcb);
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        if (PtrNewFcb->FileInfo == NewFileInfo && NewFileInfo->ParentFile == RelatedFileInfo)
+            PtrNewFcb->ParentFcb = RelatedFileInfo->Fcb;
+        /* Logical self/parent traversal is not a new namespace child link. */
+        if (RemainingNameLength && *PreviousFcb && RelatedFileInfo &&
+            NewFileInfo->ParentFile == RelatedFileInfo &&
+            (NewFileInfo->Index >= 2 || UDFIsAStreamDir(NewFileInfo))) {
+            PLCB Prefix;
+            Status = UDFAcquirePrefix(IrpContext, RelatedFileInfo->Fcb, PtrNewFcb,
+                        NewFileInfo, NULL, NULL, NULL, NewFileInfo->Index, &Prefix);
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            if (*PreviousFcb && *PreviousFcb != *CurrentFcb) {
+                PFCB Parent = *PreviousFcb;
+                *PreviousFcb = *CurrentFcb;
+                UDFReleaseFcb(IrpContext, Parent);
+            }
+        }
+        /* Access/share/overwrite/cache/CCB work needs child Main already
+         * held. No fallible lock/prefix work follows a successful CCB. */
+        if (PerformUserOpen) {
+            Status = UDFOpenExistingFcb(IrpContext, IrpSp, Vcb,
+                IrpSp->FileObject, NewFileInfo, (PFCB*)&PtrNewFcb,
+                IgnoreCase, RelatedFileObject, RelatedFcb, CreateDisposition);
+            *OutFcb = PtrNewFcb;
+        }
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        if (NT_SUCCESS(Status)) Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    if (Status == STATUS_CANT_WAIT) Status = STATUS_DEVICE_BUSY;
+    if (Status != STATUS_SUCCESS && NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
     return Status;
 
 } // end UDFOpenObjectFromDirContext()
@@ -659,18 +1421,20 @@ UDFOpenObjectByFileId(
     _Inout_ PFCB *CurrentFcb
     )
 {
-    NTSTATUS Status = STATUS_ACCESS_DENIED;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_ACCESS_DENIED;
 
-    BOOLEAN UnlockFcbTable = FALSE;
-    BOOLEAN FcbExisted = FALSE;
-    PUDF_FILE_INFO OpenFileInfoReference = NULL;
+    _SEH2_VOLATILE BOOLEAN UnlockFcbTable = FALSE;
+    _SEH2_VOLATILE BOOLEAN FcbExisted = FALSE;
+    _SEH2_VOLATILE BOOLEAN NewFcbVcbLocked = FALSE;
+    _SEH2_VOLATILE PUDF_FILE_INFO OpenFileInfoReference = NULL;
+    _SEH2_VOLATILE PUDF_FILE_INFO UnattachedFileInfo = NULL;
 
     NODE_TYPE_CODE NodeTypeCode;
     TYPE_OF_OPEN TypeOfOpen;
 
     FILE_ID FileId;
 
-    PFCB NextFcb = NULL;
+    _SEH2_VOLATILE PFCB NextFcb = NULL;
 
     PAGED_CODE();
 
@@ -692,7 +1456,12 @@ UDFOpenObjectByFileId(
     // without that bit, so the FCB lookup below accepts either form.
     //
 
+    if (!IrpSp->FileObject->FileName.Buffer ||
+        IrpSp->FileObject->FileName.Length != sizeof(FILE_ID))
+        return STATUS_INVALID_PARAMETER;
     RtlCopyMemory(&FileId, IrpSp->FileObject->FileName.Buffer, sizeof(FILE_ID));
+    if (((ULONG)FileId.HighPart ^ (ULONG)(UINT_PTR)Vcb) & ~((ULONG)FID_DIR_MASK))
+        return STATUS_INVALID_PARAMETER;
 
     //
     // Use a try-finally to facilitate cleanup.
@@ -733,6 +1502,13 @@ UDFOpenObjectByFileId(
             //
 
             FcbExisted = TRUE;
+            if (NextFcb->TeardownInProgress ||
+                !(NextFcb->FcbState & UDF_FCB_VALID) ||
+                !NextFcb->FileInfo || !NextFcb->FileInfo->Dloc ||
+                FlagOn(NextFcb->FcbState, UDF_FCB_DELETED | UDF_FCB_NOT_FOUND_ON_MEDIA))
+                try_return(Status = STATUS_SHARING_VIOLATION);
+            if (UDFIsReservedMetadataFile(NextFcb->FileInfo))
+                try_return(Status = STATUS_ACCESS_DENIED);
 
         } else {
 
@@ -750,43 +1526,37 @@ UDFOpenObjectByFileId(
             // Convert FileId back to physical LBA.
             // UDFGetNTFileId stores: LowPart = physLBA - PartitionRoot
             //
-            uint32 PhysLba = (uint32)FileId.LowPart + UDFPartStart(Vcb, -2);
-
-            //
-            // Find which partition contains this LBA and convert to
-            // partition-relative logical block number.
-            //
-            uint32 PartRef = UDFGetRefPartNumByPhysLba(Vcb, PhysLba);
-            if (PartRef == (uint32)-1) {
-                try_return(Status = STATUS_INVALID_PARAMETER);
-            }
-
+            uint64 WidePhysical = (uint64)(uint32)FileId.LowPart + UDFPartStart(Vcb, -2);
             lb_addr FileLoc;
-            FileLoc.logicalBlockNum = UDFPhysLbaToPart(Vcb, PartRef, PhysLba);
-            FileLoc.partitionReferenceNum = (uint16)PartRef;
-
-            if (FileLoc.logicalBlockNum == (ULONG)-1) {
+            if (WidePhysical >= LBA_OUT_OF_EXTENT || WidePhysical > Vcb->SessionEndLba)
                 try_return(Status = STATUS_INVALID_PARAMETER);
-            }
 
-            //
-            // Allocate and open the UDF_FILE_INFO directly from disk.
-            //
+            /* A VAT inverse may read the physical tag. No FCB-table mutex
+             * may cover that I/O, allocation or constructor operation. */
+            UDFUnlockFcbTable(IrpContext, Vcb);
+            UnlockFcbTable = FALSE;
+            Status = UDFResolvePhysicalIcbAddress(IrpContext, Vcb, (uint32)WidePhysical, &FileLoc);
+            if (!NT_SUCCESS(Status))
+                try_return(Status);
+
             PUDF_FILE_INFO FileInfo = (PUDF_FILE_INFO)
                 MyAllocatePoolTag__(UDF_FILE_INFO_MT, sizeof(UDF_FILE_INFO), MEM_FINF_TAG);
+            UnattachedFileInfo = FileInfo;
 
             if (!FileInfo) {
                 try_return(Status = STATUS_INSUFFICIENT_RESOURCES);
             }
 
+            /* Even an exception before constructor admission leaves a
+             * recognizable unbound shell, not uninitialized owner fields. */
+            RtlZeroMemory(FileInfo, sizeof(*FileInfo));
+            FileInfo->NextLinkedFile = FileInfo->PrevLinkedFile = FileInfo;
             Status = UDFOpenRootFile__(IrpContext, Vcb, &FileLoc, FileInfo);
 
-            if (!NT_SUCCESS(Status)) {
-
-                UDFCleanUpFile__(Vcb, FileInfo);
-                MyFreePool__(FileInfo);
-                try_return(Status = STATUS_INVALID_PARAMETER);
-            }
+            if (!NT_SUCCESS(Status))
+                try_return(Status);
+            if (UDFIsReservedMetadataFile(FileInfo))
+                try_return(Status = STATUS_ACCESS_DENIED);
 
             //
             // Now we know the file type from the on-disk data.
@@ -809,34 +1579,32 @@ UDFOpenObjectByFileId(
             //
             // Create the FCB with the correct type and FileId.
             //
-            NextFcb = UDFCreateFcb(IrpContext, StoredFileId, NodeTypeCode, &FcbExisted);
+            UDFLockFcbTable(IrpContext, Vcb);
+            UnlockFcbTable = TRUE;
+            NextFcb = UDFCreateFcb(IrpContext, StoredFileId, NodeTypeCode, (PBOOLEAN)&FcbExisted);
 
-            if (!NextFcb) {
-
-                UDFCloseFile__(IrpContext, Vcb, FileInfo);
-                UDFCleanUpFile__(Vcb, FileInfo);
-                MyFreePool__(FileInfo);
+            if (!NextFcb)
                 try_return(Status = STATUS_INSUFFICIENT_RESOURCES);
-            }
 
             if (FcbExisted) {
-
-                //
-                // Another thread created this FCB between our lookup and
-                // UDFCreateFcb. Close the FileInfo we opened — the existing
-                // FCB already has its own.
-                //
-
-                UDFCloseFile__(IrpContext, Vcb, FileInfo);
-                UDFCleanUpFile__(Vcb, FileInfo);
-                MyFreePool__(FileInfo);
-
+                if (NextFcb->TeardownInProgress ||
+                    !(NextFcb->FcbState & UDF_FCB_VALID) || !NextFcb->FileInfo ||
+                    NextFcb->FileInfo->Dloc != FileInfo->Dloc ||
+                    FlagOn(NextFcb->FcbState, UDF_FCB_DELETED | UDF_FCB_NOT_FOUND_ON_MEDIA))
+                    try_return(Status = STATUS_SHARING_VIOLATION);
+                /* The constructor hold prevents the indexed teardown gate
+                 * from claiming this Dloc. Dispose of this anonymous alias
+                 * in FINALLY after releasing the table mutex. */
             } else {
 
                 //
                 // Link FCB to FileInfo and initialize it.
                 //
 
+                /* A table miss does not release another admission's
+                 * canonical Dloc identity. Never overwrite that owner. */
+                if (!FileInfo->Dloc || FileInfo->Dloc->CommonFcb)
+                    try_return(Status = STATUS_SHARING_VIOLATION);
                 NextFcb->FileInfo = FileInfo;
                 FileInfo->Fcb = NextFcb;
 
@@ -854,17 +1622,18 @@ UDFOpenObjectByFileId(
                 //
 
                 UDFLockVcb(IrpContext, Vcb);
+                NewFcbVcbLocked = TRUE;
 
                 Status = UDFInitializeFCB(NextFcb, Vcb,
                              IsDirectory ? UDF_FCB_DIRECTORY : 0);
 
                 if (!NT_SUCCESS(Status)) {
                     UDFUnlockVcb(IrpContext, Vcb);
+                    NewFcbVcbLocked = FALSE;
                     NextFcb->FileInfo = NULL;
                     FileInfo->Fcb = NULL;
-                    UDFCloseFile__(IrpContext, Vcb, FileInfo);
-                    UDFCleanUpFile__(Vcb, FileInfo);
-                    MyFreePool__(FileInfo);
+                    if (FileInfo->Dloc && FileInfo->Dloc->CommonFcb == NextFcb)
+                        FileInfo->Dloc->CommonFcb = NULL;
                     try_return(Status);
                 }
 
@@ -911,13 +1680,16 @@ UDFOpenObjectByFileId(
                 /* The fresh open owns this FI reference until a CCB accepts
                  * it. A cached valid FCB is not an owner of a failed open. */
                 OpenFileInfoReference = FileInfo;
+                UnattachedFileInfo = NULL;
 
-                // Insert into table and mark valid
-                UDFInsertFcbIntoTable(IrpContext, NextFcb);
+                // Table admission must succeed before publishing validity.
+                Status = UDFInsertFcbIntoTable(IrpContext, NextFcb);
+                if (Status != STATUS_SUCCESS) try_return(Status);
                 NextFcb->NtReqFCBFlags |= UDF_NTREQ_FCB_VALID;
                 NextFcb->FcbState |= UDF_FCB_VALID;
 
                 UDFUnlockVcb(IrpContext, Vcb);
+                NewFcbVcbLocked = FALSE;
             }
         }
 
@@ -956,31 +1728,40 @@ UDFOpenObjectByFileId(
         //
 
         if (!UDFAcquireFcbExclusive(IrpContext, NextFcb, TRUE)) {
-
+            /* No wait/retry token may outlive a consumed FI owner. */
+            if (!BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT))
+                try_return(Status = STATUS_DEVICE_BUSY);
             UDFLockVcb(IrpContext, Vcb);
-            NextFcb->FcbReference += 1;
+            if (NextFcb->FcbReference == MAXULONG || NextFcb->TeardownInProgress) {
+                UDFUnlockVcb(IrpContext, Vcb);
+                try_return(Status = STATUS_SHARING_VIOLATION);
+            }
+            NextFcb->FcbReference++;
             UDFUnlockVcb(IrpContext, Vcb);
-
-            UDFUnlockFcbTable(IrpContext, Vcb);
-            UnlockFcbTable = FALSE;
-
-            UDFAcquireFcbExclusive(IrpContext, NextFcb, FALSE);
-
-            UDFLockVcb(IrpContext, Vcb);
-            NextFcb->FcbReference -= 1;
-            UDFUnlockVcb(IrpContext, Vcb);
-
+            _SEH2_TRY {
+                UnlockFcbTable = FALSE;
+                UDFUnlockFcbTable(IrpContext, Vcb);
+                UDFAcquireFcbExclusive(IrpContext, NextFcb, FALSE);
+                *CurrentFcb = NextFcb; /* acquired, even if finalization raises */
+            } _SEH2_FINALLY {
+                BOOLEAN FailedAcquire = _SEH2_AbnormalTermination() || *CurrentFcb != NextFcb;
+                UDFLockVcb(IrpContext, Vcb);
+                _SEH2_TRY {
+                    ASSERT(NextFcb->FcbReference);
+                    NextFcb->FcbReference--;
+                    if (FailedAcquire && !NextFcb->FcbReference && !NextFcb->TeardownRetryPending) {
+                        NextFcb->TeardownRetryPending = TRUE;
+                        InterlockedIncrement(&Vcb->ClosedFcbRetryCount);
+                    }
+                } _SEH2_FINALLY {
+                    UDFUnlockVcb(IrpContext, Vcb);
+                } _SEH2_END;
+            } _SEH2_END;
         } else {
-
-            UDFUnlockFcbTable(IrpContext, Vcb);
+            *CurrentFcb = NextFcb; /* publish before dropping table ownership */
             UnlockFcbTable = FALSE;
+            UDFUnlockFcbTable(IrpContext, Vcb);
         }
-
-        //
-        // Move to this FCB.
-        //
-
-        *CurrentFcb = NextFcb;
 
         //
         // Check the requested access on this FCB.
@@ -999,7 +1780,8 @@ UDFOpenObjectByFileId(
                 if (!NextFcb->FileInfo) {
                     try_return(Status = STATUS_FILE_CORRUPT_ERROR);
                 }
-                UDFReferenceFile__(NextFcb->FileInfo);
+                Status = UDFReferenceFileChecked(Vcb, NextFcb->FileInfo);
+                if (!NT_SUCCESS(Status)) try_return(Status);
                 OpenFileInfoReference = NextFcb->FileInfo;
             }
 
@@ -1007,6 +1789,7 @@ UDFOpenObjectByFileId(
                                          IrpSp,
                                          Vcb,
                                          CurrentFcb,
+                                         OpenFileInfoReference,
                                          TypeOfOpen,
                                          CCB_FLAG_OPEN_BY_ID,
                                          FILE_OPEN,
@@ -1021,15 +1804,46 @@ UDFOpenObjectByFileId(
 try_exit:   NOTHING;
 
     } _SEH2_FINALLY {
-
-        if (OpenFileInfoReference) {
-            UDFCloseFile__(IrpContext, Vcb, OpenFileInfoReference);
+        if (NewFcbVcbLocked)
+            UDFUnlockVcb(IrpContext, Vcb);
+        BOOLEAN DeleteNewFcb = NextFcb && !FcbExisted &&
+            !FlagOn(NextFcb->FcbState, UDF_FCB_VALID);
+        if (DeleteNewFcb) {
+            PUDF_FILE_INFO Partial = NextFcb->FileInfo;
+            if (Partial) {
+                Partial->Fcb = NULL;
+                if (Partial->Dloc && Partial->Dloc->CommonFcb == NextFcb)
+                    Partial->Dloc->CommonFcb = NULL;
+                NextFcb->FileInfo = NULL;
+            }
+            if (FlagOn(NextFcb->FcbState, FCB_STATE_IN_FCB_TABLE)) {
+                struct { FILE_ID FileId; PFCB Fcb; } Key;
+                Key.FileId = NextFcb->FileId;
+                UDFLockVcb(IrpContext, Vcb);
+                RtlDeleteElementGenericTable(&Vcb->FcbTable, &Key);
+                ClearFlag(NextFcb->FcbState, FCB_STATE_IN_FCB_TABLE);
+                UDFUnlockVcb(IrpContext, Vcb);
+            }
         }
-
         if (UnlockFcbTable) {
-
             UDFUnlockFcbTable(IrpContext, Vcb);
+            UnlockFcbTable = FALSE;
         }
+
+        if (_SEH2_AbnormalTermination() || !NT_SUCCESS(Status)) {
+            UDFUnwindCompletedOpen(IrpContext, IrpSp->FileObject,
+                                    (PUDF_FILE_INFO*)&OpenFileInfoReference);
+        }
+        if (OpenFileInfoReference) {
+            UDFReleaseCreateReference(IrpContext, Vcb, (PUDF_FILE_INFO*)&OpenFileInfoReference, TRUE);
+        }
+
+        /* Successful anonymous aliases own one ordinary token; partial
+         * constructors own their separate generation. Neither is a reason
+         * to re-enter close-time I/O from a failed CREATE. */
+        if (UnattachedFileInfo)
+            UDFReleaseCreateReference(IrpContext, Vcb,
+                (PUDF_FILE_INFO*)&UnattachedFileInfo, TRUE);
 
         //
         // Destroy the new FCB if it was not fully initialized.
@@ -1037,7 +1851,7 @@ try_exit:   NOTHING;
         // into the table and never fully initialized.
         //
 
-        if (NextFcb && !FcbExisted && !FlagOn(NextFcb->FcbState, UDF_FCB_VALID)) {
+        if (DeleteNewFcb) {
 
             UDFDeleteFcb(IrpContext, NextFcb);
         }
@@ -1118,7 +1932,7 @@ UDFCommonCreate(
     PIRP Irp
     )
 {
-    NTSTATUS Status = STATUS_SUCCESS;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
     PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
     PFILE_OBJECT FileObject = NULL;
     PFILE_OBJECT RelatedFileObject = NULL;
@@ -1133,8 +1947,8 @@ UDFCommonCreate(
     PVCB Vcb = NULL;
     // Hold two locks during tree traversal (child + parent)
     // CurrentFcb = current node lock, PreviousFcb = parent node lock (released after operations)
-    PFCB CurrentFcb = NULL;
-    PFCB PreviousFcb = NULL;
+    _SEH2_VOLATILE PFCB CurrentFcb = NULL;
+    _SEH2_VOLATILE PFCB PreviousFcb = NULL;
 
     BOOLEAN DeleteOnClose;
     BOOLEAN OpenByFileId;
@@ -1148,7 +1962,7 @@ UDFCommonCreate(
 
     PCCB RelatedCcb = NULL;
     PFCB NextFcb = NULL;
-    PFCB PtrNewFcb = NULL;
+    _SEH2_VOLATILE PFCB PtrNewFcb = NULL;
     PLCB OpenLcb = NULL;            // LCB from prefix match (for direct open)
 
     PUNICODE_STRING FileName;
@@ -1164,14 +1978,16 @@ UDFCommonCreate(
 
     PUDF_FILE_INFO RelatedFileInfo;
     PUDF_FILE_INFO OldRelatedFileInfo = NULL;
-    PUDF_FILE_INFO NewFileInfo = NULL;
-    PUDF_FILE_INFO LastGoodFileInfo = NULL;
+    _SEH2_VOLATILE PUDF_FILE_INFO NewFileInfo = NULL;
+    _SEH2_VOLATILE PUDF_FILE_INFO LastGoodFileInfo = NULL;
     BOOLEAN VolumeOpen = FALSE;
 
     BOOLEAN StreamOpen = FALSE;
     ULONG SNameIndex = 0;
 
     BOOLEAN NewFileCreated = FALSE;
+    _SEH2_VOLATILE BOOLEAN FreshFileCreated = FALSE;
+    _SEH2_VOLATILE PUDF_FILE_INFO FreshFileInfo = NULL;
     DIR_ENUM_CONTEXT DirContext;
 
     PAGED_CODE();
@@ -1447,16 +2263,16 @@ UDFCommonCreate(
                 try_return(Status = STATUS_ACCESS_DENIED);
             }
 
+            // Publish only a resource acquired by this request. A no-wait
+            // failure must not make finalization release another owner.
+            UDFAcquireFcbExclusive(IrpContext, Vcb->VolumeDasdFcb, FALSE);
             CurrentFcb = Vcb->VolumeDasdFcb;
-
-            // Acquire the Fcb exclusively before completing the open
-
-            UDFAcquireFcbExclusive(IrpContext, CurrentFcb, FALSE);
 
             Status = UDFCompleteFcbOpen(IrpContext,
                                         IrpSp,
                                         Vcb,
-                                        &CurrentFcb,
+                                        (PFCB*)&CurrentFcb,
+                                        NULL,
                                         UserVolumeOpen,
                                         0,
                                         CreateDisposition,
@@ -1493,7 +2309,7 @@ UDFCommonCreate(
             try_return(Status = UDFOpenObjectByFileId(IrpContext,
                                                       IrpSp,
                                                       Vcb,
-                                                      &CurrentFcb));
+                                                      (PFCB*)&CurrentFcb));
         }
 
         //
@@ -1546,25 +2362,23 @@ UDFCommonCreate(
             }
 
             // Acquire target FCB exclusively
-            if (PtrNewFcb != CurrentFcb) {
-                UDF_CHECK_PAGING_IO_RESOURCE(PtrNewFcb);
-                UDFAcquireFcbExclusive(IrpContext, PtrNewFcb, FALSE);
-                if (PreviousFcb && PreviousFcb != CurrentFcb) {
-                    UDFReleaseFcb(IrpContext, PreviousFcb);
-                }
-                PreviousFcb = CurrentFcb;
-                CurrentFcb = PtrNewFcb;
-            }
+            Status = UDFMoveCreateFcb(IrpContext, Vcb, PtrNewFcb, (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb);
+            if (Status != STATUS_SUCCESS) try_return(Status);
 
             // Reference the FileInfo (balanced by UDFCloseFile__ on error
             // or by IRP_MJ_CLEANUP on success)
-            NewFileInfo = PtrNewFcb->FileInfo;
-            UDFReferenceFile__(NewFileInfo);
+            NewFileInfo = (RelatedCcb && RelatedCcb->FileInfo) ?
+                RelatedCcb->FileInfo : PtrNewFcb->FileInfo;
+            Status = UDFReferenceFileChecked(Vcb, NewFileInfo);
+            if (!NT_SUCCESS(Status)) {
+                NewFileInfo = NULL;
+                try_return(Status);
+            }
 
             try_return(Status = UDFOpenExistingFcb(IrpContext, IrpSp, Vcb,
                                                     FileObject, NewFileInfo,
-                                                    &PtrNewFcb, IgnoreCase,
-                                                    RelatedFileObject, NextFcb));
+                                                    (PFCB*)&PtrNewFcb, IgnoreCase,
+                                                    RelatedFileObject, NextFcb, CreateDisposition));
         }
 
         _SEH2_TRY {
@@ -1596,7 +2410,8 @@ UDFCommonCreate(
 
         if (RelatedFileObject) {
             // Our "start directory" is the one identified by the related file object
-            RelatedFileInfo = NextFcb->FileInfo;
+            RelatedFileInfo = (RelatedCcb && RelatedCcb->FileInfo) ?
+                RelatedCcb->FileInfo : NextFcb->FileInfo;
         } else {
             // Start at the root of the file system
             RelatedFileInfo = Vcb->RootIndexFcb->FileInfo;
@@ -1612,9 +2427,12 @@ UDFCommonCreate(
         LastGoodFileInfo = RelatedFileInfo;
         // reference RelatedObject to prevent releasing parent structures
         // Acquire only CurrentFcb (= LastGoodFileInfo->Fcb)
-        CurrentFcb = RelatedFileInfo->Fcb;
-        UDF_CHECK_PAGING_IO_RESOURCE(CurrentFcb);
-        UDFAcquireFcbExclusive(IrpContext, CurrentFcb, FALSE);
+        {
+            PFCB Start = RelatedFileInfo->Fcb;
+            UDF_CHECK_PAGING_IO_RESOURCE(Start);
+            UDFAcquireFcbExclusive(IrpContext, Start, FALSE);
+            CurrentFcb = Start; /* only after the resource was acquired */
+        }
 
         // Parent references are now handled by LCB in UDFCompleteFcbOpen
         // when child files are opened through this directory.
@@ -1626,7 +2444,7 @@ UDFCommonCreate(
         // ****************
         {
             BOOLEAN ShortNameMatch = FALSE;
-            PFCB PrefixFcb = CurrentFcb;
+            PFCB PrefixStart = CurrentFcb, PrefixFcb;
             UNICODE_STRING SearchPath = RemainingName;
             PLCB PrefixLcb;
 
@@ -1634,17 +2452,16 @@ UDFCommonCreate(
                 IrpContext,
                 CurrentFcb,
                 IgnoreCase,
-                &PrefixFcb,
+                (PFCB*)&CurrentFcb,
                 &SearchPath,
                 &ShortNameMatch
             );
 
-            if (PrefixLcb && PrefixFcb && PrefixFcb != CurrentFcb && PrefixFcb->FileInfo) {
-
-                // UDFFindPathPrefix already released old CurrentFcb lock
-                // and holds PrefixFcb locked exclusive. Update state.
-                CurrentFcb = PrefixFcb;
-                PreviousFcb = CurrentFcb;  // single lock model
+            /* The prefix walker updates our actual acquisition slot on
+             * each transition, including before a later raised failure. */
+            PrefixFcb = CurrentFcb;
+            PreviousFcb = CurrentFcb; // only one resource survived the walk
+            if (PrefixLcb && PrefixFcb && PrefixFcb != PrefixStart && PrefixLcb->LinkFileInfo) {
 
                 // Check for delete-in-progress on matched FCB
                 if (PrefixLcb->Flags & UDF_LCB_FLAG_LINK_DELETED) {
@@ -1666,18 +2483,18 @@ UDFCommonCreate(
                             try_return(Status = STATUS_INVALID_PARAMETER);
                         }
 
-                        // Switch lock from file to parent directory
-                        if (ParentFcb != CurrentFcb) {
-                            UDF_CHECK_PAGING_IO_RESOURCE(ParentFcb);
-                            UDFAcquireFcbExclusive(IrpContext, ParentFcb, FALSE);
-                            UDFReleaseFcb(IrpContext, CurrentFcb);
-                            CurrentFcb = ParentFcb;
+                        Status = UDFMoveCreateFcb(IrpContext, Vcb, ParentFcb,
+                                    (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb);
+                        if (Status != STATUS_SUCCESS) try_return(Status);
+                        if (PreviousFcb && PreviousFcb != CurrentFcb) {
+                            PFCB OldChild = PreviousFcb;
+                            PreviousFcb = CurrentFcb;
+                            UDFReleaseFcb(IrpContext, OldChild);
                         }
-                        PreviousFcb = CurrentFcb;
 
                         OldRelatedFileInfo = RelatedFileInfo;
-                        RelatedFileInfo = ParentFcb->FileInfo;
-                        LastGoodFileInfo = ParentFcb->FileInfo;
+                        RelatedFileInfo = PrefixLcb->ParentFileInfo;
+                        LastGoodFileInfo = RelatedFileInfo;
 
                         // Set RemainingName to file name so UDFDissectName extracts it
                         // into FinalName, then the early OpenTargetDirectory check
@@ -1689,7 +2506,7 @@ UDFCommonCreate(
                     // Entire path found in prefix - skip loop, open directly
                     OpenLcb = PrefixLcb;
                     PtrNewFcb = PrefixFcb;
-                    LastGoodFileInfo = PrefixFcb->FileInfo;
+                    LastGoodFileInfo = PrefixLcb->LinkFileInfo;
                     OldRelatedFileInfo = RelatedFileInfo;
 
                     // Validate file/directory type against caller's request
@@ -1710,21 +2527,25 @@ UDFCommonCreate(
                     }
 
                     // Reference the FileInfo (will be balanced by cleanup)
-                    NewFileInfo = PrefixFcb->FileInfo;
-                    UDFReferenceFile__(NewFileInfo);
+                    NewFileInfo = PrefixLcb->LinkFileInfo;
+                    Status = UDFReferenceFileChecked(Vcb, NewFileInfo);
+                    if (!NT_SUCCESS(Status)) {
+                        NewFileInfo = NULL;
+                        try_return(Status);
+                    }
 
                     // Skip the search loop - open directly
                     try_return(Status = UDFOpenExistingFcb(IrpContext, IrpSp, Vcb,
                                                             FileObject, NewFileInfo,
-                                                            &PtrNewFcb, IgnoreCase,
-                                                            RelatedFileObject, NextFcb));
+                                                            (PFCB*)&PtrNewFcb, IgnoreCase,
+                                                            RelatedFileObject, NextFcb, CreateDisposition));
 
                     } // end if OpenTargetDirectory
 
                 } else {
                     // Partial match - use as starting point for loop
                     OldRelatedFileInfo = RelatedFileInfo;
-                    RelatedFileInfo = PrefixFcb->FileInfo;
+                    RelatedFileInfo = PrefixLcb->LinkFileInfo;
                     LastGoodFileInfo = RelatedFileInfo;
                     RemainingName = SearchPath;
                 }
@@ -1828,18 +2649,9 @@ UDFCommonCreate(
                 // UDFIsNameValid rejects trailing '.' which would break "." and ".." components.
                 // Acquire FCB lock for tree traversal
                 // Skip if same FCB to avoid recursive acquire leading to lock leak
-                {
-                    PFCB NewFcb = RelatedFileInfo->Fcb;
-                    if (NewFcb != CurrentFcb) {
-                        UDF_CHECK_PAGING_IO_RESOURCE(NewFcb);
-                        UDFAcquireFcbExclusive(IrpContext, NewFcb, FALSE);
-                        if (PreviousFcb && PreviousFcb != CurrentFcb) {
-                            UDFReleaseFcb(IrpContext, PreviousFcb);
-                        }
-                        PreviousFcb = CurrentFcb;
-                        CurrentFcb = NewFcb;
-                    }
-                }
+                Status = UDFMoveCreateFcb(IrpContext, Vcb, RelatedFileInfo->Fcb,
+                            (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb);
+                if (Status != STATUS_SUCCESS) try_return(Status);
 
                 // check traverse rights (uses RelatedFileInfo->Fcb which is now locked as PreviousFcb)
                 Status = UDFCheckAccessRights(NULL, NULL, RelatedFileInfo->Fcb, RelatedCcb, FILE_TRAVERSE, 0);
@@ -1876,12 +2688,16 @@ UDFCommonCreate(
                                 }
                                 NewFileInfo = LastGoodFileInfo;
                                 PtrNewFcb = NewFileInfo->Fcb;
-                                UDFReferenceFile__(NewFileInfo);
+                                Status = UDFReferenceFileChecked(Vcb, NewFileInfo);
+                                if (!NT_SUCCESS(Status)) {
+                                    NewFileInfo = NULL;
+                                    try_return(Status);
+                                }
                                 Status = UDFCheckAccessRights(FileObject, AccessState, PtrNewFcb, NULL, DesiredAccess, ShareAccess);
                                 if (!NT_SUCCESS(Status)) {
                                     try_return(Status);
                                 }
-                                Status = UDFCompleteFcbOpen(IrpContext, IrpSp, Vcb, &PtrNewFcb, UserDirectoryOpen,
+                                Status = UDFCompleteFcbOpen(IrpContext, IrpSp, Vcb, (PFCB*)&PtrNewFcb, NewFileInfo, UserDirectoryOpen,
                                                        (IgnoreCase ? CCB_FLAG_IGNORE_CASE : 0), CreateDisposition, FALSE,
                                                        FILE_EXISTS);
                                 LastGoodFileInfo = NewFileInfo;
@@ -1904,15 +2720,17 @@ UDFCommonCreate(
                             Status = UDFOpenObjectFromDirContext(
                                 IrpContext, IrpSp, Vcb, &DirContext,
                                 RelatedFileInfo,
-                                &CurrentFcb, &PreviousFcb,
+                                (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb,
                                 IgnoreCase, FALSE, CreateDisposition,
                                 RemainingName.Length,
                                 NULL, NULL,
                                 NULL,  // ExistingFileInfo
-                                &NewFileInfo, &PtrNewFcb);
+                                (PUDF_FILE_INFO*)&NewFileInfo, (PFCB*)&PtrNewFcb);
                             if (NT_SUCCESS(Status)) {
                                 LastGoodFileInfo = NewFileInfo;
-                                UDFDereferenceFile__(NewFileInfo);
+                                if (FreshFileInfo == NewFileInfo) FreshFileInfo = NULL;
+                                Status = UDFReleaseCreateReference(IrpContext, Vcb, (PUDF_FILE_INFO*)&NewFileInfo, FALSE);
+                                if (Status != STATUS_SUCCESS) try_return(Status);
                             }
                         }
                     }
@@ -1946,8 +2764,8 @@ UDFCommonCreate(
                            (CreateDisposition == FILE_OVERWRITE_IF)) {
                             Status = UDFCreateStreamDir__(IrpContext, Vcb, RelatedFileInfo, &StreamDirInfo);
                         }
-                        if (!NT_SUCCESS(Status)) {
-                            // Remap STATUS_NOT_FOUND for consistent error handling
+                        if (Status == STATUS_NOT_FOUND) {
+                            // Preserve conversion/allocation/I/O errors from stream creation.
                             Status = STATUS_OBJECT_NAME_NOT_FOUND;
                         }
                     }
@@ -1961,18 +2779,21 @@ UDFCommonCreate(
                             IrpContext, IrpSp, Vcb,
                             NULL,           // no DirContext
                             RelatedFileInfo,
-                            &CurrentFcb, &PreviousFcb,
+                            (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb,
                             IgnoreCase, FALSE, CreateDisposition,
                             RemainingName.Length,
                             NULL, NULL,
                             StreamDirInfo,  // ExistingFileInfo
-                            &NewFileInfo, &PtrNewFcb);
+                            (PUDF_FILE_INFO*)&NewFileInfo, (PFCB*)&PtrNewFcb);
                         if (NT_SUCCESS(Status)) {
                             LastGoodFileInfo = NewFileInfo;
-                            UDFDereferenceFile__(NewFileInfo);
+                            if (FreshFileInfo == NewFileInfo) FreshFileInfo = NULL;
+                            Status = UDFReleaseCreateReference(IrpContext, Vcb, (PUDF_FILE_INFO*)&NewFileInfo, FALSE);
+                            if (Status != STATUS_SUCCESS) try_return(Status);
                         } else {
-                            // FCB setup failed — close stream dir and exit
-                            UDFCloseFile__(IrpContext, Vcb, StreamDirInfo);
+                            /* ExistingFileInfo's successful open is returned
+                             * in NewFileInfo. Common failure unwind owns its
+                             * one close; do not close StreamDirInfo as well. */
                             try_return(Status);
                         }
                     }
@@ -1995,12 +2816,16 @@ UDFCommonCreate(
                     }
                     NewFileInfo = LastGoodFileInfo;
                     PtrNewFcb = NewFileInfo->Fcb;
-                    UDFReferenceFile__(NewFileInfo);
+                    Status = UDFReferenceFileChecked(Vcb, NewFileInfo);
+                    if (!NT_SUCCESS(Status)) {
+                        NewFileInfo = NULL;
+                        try_return(Status);
+                    }
                     Status = UDFCheckAccessRights(FileObject, AccessState, PtrNewFcb, NULL, DesiredAccess, ShareAccess);
                     if (!NT_SUCCESS(Status)) {
                         try_return(Status);
                     }
-                    Status = UDFCompleteFcbOpen(IrpContext, IrpSp, Vcb, &PtrNewFcb, UserDirectoryOpen,
+                    Status = UDFCompleteFcbOpen(IrpContext, IrpSp, Vcb, (PFCB*)&PtrNewFcb, NewFileInfo, UserDirectoryOpen,
                                            (IgnoreCase ? CCB_FLAG_IGNORE_CASE : 0), CreateDisposition, FALSE,
                                            FILE_DOES_NOT_EXIST);
                     LastGoodFileInfo = NewFileInfo;
@@ -2009,7 +2834,7 @@ UDFCommonCreate(
 
                 // update last good state information...
                 OldRelatedFileInfo = RelatedFileInfo;
-                RelatedFileInfo = NewFileInfo;
+                RelatedFileInfo = NT_SUCCESS(Status) ? LastGoodFileInfo : NewFileInfo;
 
                 // Base file of a stream path doesn't exist. Stop here: FinalName
                 // holds the base name and RemainingName still holds the ":stream"
@@ -2080,7 +2905,9 @@ UDFCommonCreate(
                         // Create the file on disk
                         Status = UDFCreateFile__(IrpContext, Vcb, IgnoreCase, &FinalName, 0, 0,
                                              UdfIsExtendedFESupported(Vcb),
-                                             (CreateDisposition == FILE_CREATE), OldRelatedFileInfo, &NewFileInfo);
+                                             (CreateDisposition == FILE_CREATE), OldRelatedFileInfo, (PUDF_FILE_INFO*)&NewFileInfo,
+                                             (PBOOLEAN)&FreshFileCreated);
+                        FreshFileInfo = NT_SUCCESS(Status) && FreshFileCreated ? NewFileInfo : NULL;
                         if (!NT_SUCCESS(Status)) {
                             UDFPrint(("UDF BM: UDFCreateFile__ FAILED Status=%x Dir=%d Name=%wZ\n",
                                 Status, DirectoryFile, &FinalName));
@@ -2093,22 +2920,16 @@ UDFCommonCreate(
                            (NextFcb->FileInfo == NewFileInfo->ParentFile)) {
                                 RelatedFileObject->Flags |= (FO_FILE_MODIFIED | FO_FILE_SIZE_CHANGED);
                         }
-                        if (DirectoryFile) {
+                        if (DirectoryFile && FreshFileCreated) {
                             Status = UDFRecordDirectory__(IrpContext, Vcb, NewFileInfo);
                             if (!NT_SUCCESS(Status)) {
                                 AdPrint(("    Can't transform to directory\n"));
-                                if ((Status != STATUS_FILE_IS_A_DIRECTORY) &&
-                                   (Status != STATUS_NOT_A_DIRECTORY) &&
-                                   (Status != STATUS_ACCESS_DENIED)) {
-                                    UDFFlushFile__(IrpContext, Vcb, NewFileInfo, 0);
-                                    UDFUnlinkFile__(IrpContext, Vcb, NewFileInfo, TRUE);
-                                }
-                                // UDFCloseFile__ is handled by the finally block.
+                                /* Common unwind queues rollback only for a fresh FI. */
                                 try_return(Status);
                             }
                         }
                         NewFileCreated = TRUE;
-                        CreateDisposition = FILE_CREATE;
+                        if (FreshFileCreated) CreateDisposition = FILE_CREATE;
                         Status = STATUS_SUCCESS;
                     }
                     break;
@@ -2146,7 +2967,11 @@ UDFCommonCreate(
                 // Restore from LastGoodFileInfo (the base file).
                 PtrNewFcb = LastGoodFileInfo->Fcb;
                 NewFileInfo = LastGoodFileInfo;
-                UDFReferenceFile__(NewFileInfo);
+                Status = UDFReferenceFileChecked(Vcb, NewFileInfo);
+                if (!NT_SUCCESS(Status)) {
+                    NewFileInfo = NULL;
+                    try_return(Status);
+                }
                 // break open loop and continue with Open
                 // (Create will be skipped)
                 break;
@@ -2166,23 +2991,15 @@ UDFCommonCreate(
             Status = UDFOpenObjectFromDirContext(
                 IrpContext, IrpSp, Vcb, NULL,
                 OldRelatedFileInfo,
-                &CurrentFcb, &PreviousFcb,
+                (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb,
                 IgnoreCase, TRUE, CreateDisposition,
                 0,  // RemainingNameLength = 0 (final component)
                 RelatedFileObject, NextFcb,
                 NewFileInfo,  // ExistingFileInfo — skip disk read
-                &NewFileInfo, &PtrNewFcb);
+                (PUDF_FILE_INFO*)&NewFileInfo, (PFCB*)&PtrNewFcb);
             if (!NT_SUCCESS(Status)) {
                 AdPrint(("    Can't open newly created file\n"));
-                // Undo create — flush and unlink from disk.
-                // UDFCloseFile__ is handled by the finally block (line ~2714).
-                if (NewFileInfo &&
-                    (Status != STATUS_FILE_IS_A_DIRECTORY) &&
-                    (Status != STATUS_NOT_A_DIRECTORY) &&
-                    (Status != STATUS_ACCESS_DENIED)) {
-                    UDFFlushFile__(IrpContext, Vcb, NewFileInfo, 0);
-                    UDFUnlinkFile__(IrpContext, Vcb, NewFileInfo, TRUE);
-                }
+                /* Common unwind separates the CCB hold from fresh-FI rollback. */
                 try_return(Status);
             }
 
@@ -2268,7 +3085,9 @@ UDFCommonCreate(
 
             Status = UDFCreateFile__(IrpContext, Vcb, IgnoreCase, &FinalName, 0, 0,
                                  UdfIsExtendedFESupported(Vcb),
-                                 (CreateDisposition == FILE_CREATE), RelatedFileInfo, &NewFileInfo);
+                                 (CreateDisposition == FILE_CREATE), RelatedFileInfo, (PUDF_FILE_INFO*)&NewFileInfo,
+                                 (PBOOLEAN)&FreshFileCreated);
+            FreshFileInfo = NT_SUCCESS(Status) && FreshFileCreated ? NewFileInfo : NULL;
             if (!NT_SUCCESS(Status)) {
                 AdPrint(("    Creation error\n"));
                 try_return(Status);
@@ -2281,19 +3100,12 @@ UDFCommonCreate(
                     RelatedFileObject->Flags |= (FO_FILE_MODIFIED | FO_FILE_SIZE_CHANGED);
             }
 
-            if (DirectoryFile) {
-                // user wants the directory to be created
+            if (DirectoryFile && FreshFileCreated) {
+                // user wants the new directory to be created
                 Status = UDFRecordDirectory__(IrpContext, Vcb, NewFileInfo);
                 if (!NT_SUCCESS(Status)) {
                     AdPrint(("    Can't transform to directory\n"));
-                    // Undo create - flush and unlink from disk
-                    if ((Status != STATUS_FILE_IS_A_DIRECTORY) &&
-                       (Status != STATUS_NOT_A_DIRECTORY) &&
-                       (Status != STATUS_ACCESS_DENIED)) {
-                        UDFFlushFile__(IrpContext, Vcb, NewFileInfo, 0);
-                        UDFUnlinkFile__(IrpContext, Vcb, NewFileInfo, TRUE);
-                    }
-                    // The common failure path releases this create reference.
+                    /* Common unwind queues rollback only for a fresh FI. */
                     try_return(Status);
                 }
             }
@@ -2323,12 +3135,12 @@ UDFCommonCreate(
                 Status = UDFOpenObjectFromDirContext(
                     IrpContext, IrpSp, Vcb,
                     NULL, RelatedFileInfo,
-                    &CurrentFcb, &PreviousFcb,
+                    (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb,
                     IgnoreCase, FALSE, CreateDisposition,
                     1,  // non-zero: intermediate — creates LCB
                     NULL, NULL,
                     BaseFileInfo,
-                    &NewFileInfo, &PtrNewFcb);
+                    (PUDF_FILE_INFO*)&NewFileInfo, (PFCB*)&PtrNewFcb);
                 if (!NT_SUCCESS(Status)) {
                     AdPrint(("    Can't open file for stream creation\n"));
                     BrutePoint();
@@ -2341,11 +3153,12 @@ UDFCommonCreate(
                     FILE_ACTION_ADDED,
                     NULL, FileObject);
 
-                UDFDereferenceFile__(NewFileInfo);
-            
-                // PHASE 1: Create stream directory + open through unified path
                 RelatedFileInfo = NewFileInfo;
-                NewFileInfo = NULL;
+                if (FreshFileInfo == NewFileInfo) FreshFileInfo = NULL;
+                Status = UDFReleaseCreateReference(IrpContext, Vcb, (PUDF_FILE_INFO*)&NewFileInfo, FALSE);
+                if (Status != STATUS_SUCCESS) try_return(Status);
+
+                // PHASE 1: Create stream directory + open through unified path
                 PUDF_FILE_INFO StreamDirInfo = NULL;
                 Status = UDFCreateStreamDir__(IrpContext, Vcb, RelatedFileInfo, &StreamDirInfo);
                 if (!NT_SUCCESS(Status)) {
@@ -2357,29 +3170,31 @@ UDFCommonCreate(
                 Status = UDFOpenObjectFromDirContext(
                     IrpContext, IrpSp, Vcb,
                     NULL, RelatedFileInfo,
-                    &CurrentFcb, &PreviousFcb,
+                    (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb,
                     IgnoreCase, FALSE, CreateDisposition,
                     1,  // non-zero: intermediate — creates LCB
                     NULL, NULL,
                     StreamDirInfo,
-                    &NewFileInfo, &PtrNewFcb);
+                    (PUDF_FILE_INFO*)&NewFileInfo, (PFCB*)&PtrNewFcb);
                 if (!NT_SUCCESS(Status)) {
                     AdPrint(("    Can't open SDir\n"));
-                    BrutePoint();
-                    UDFCloseFile__(IrpContext, Vcb, StreamDirInfo);
+                    /* The returned NewFileInfo owns this same temporary
+                     * stream open for common failure unwind, once. */
                     try_return(Status);
                 }
                 LastGoodFileInfo = NewFileInfo;
 
-                UDFDereferenceFile__(NewFileInfo);
+                RelatedFileInfo = NewFileInfo;
+                if (FreshFileInfo == NewFileInfo) FreshFileInfo = NULL;
+                Status = UDFReleaseCreateReference(IrpContext, Vcb, (PUDF_FILE_INFO*)&NewFileInfo, FALSE);
+                if (Status != STATUS_SUCCESS) try_return(Status);
 
                 // PHASE 2: Create stream file in the stream directory.
                 // StreamName already holds the bare stream name (no leading ':').
-                RelatedFileInfo = NewFileInfo;
-                NewFileInfo = NULL;
                 Status = UDFCreateFile__(IrpContext, Vcb, IgnoreCase, &StreamName, 0, 0,
                          UdfIsExtendedFESupported(Vcb), (CreateDisposition == FILE_CREATE),
-                         RelatedFileInfo, &NewFileInfo);
+                         RelatedFileInfo, (PUDF_FILE_INFO*)&NewFileInfo, (PBOOLEAN)&FreshFileCreated);
+                FreshFileInfo = NT_SUCCESS(Status) && FreshFileCreated ? NewFileInfo : NULL;
                 if (!NT_SUCCESS(Status)) {
                     AdPrint(("    Can't create Stream\n"));
                     BrutePoint();
@@ -2387,31 +3202,24 @@ UDFCommonCreate(
                 }
             }
 
+            if (FreshFileCreated) CreateDisposition = FILE_CREATE;
             // Open the created object through unified path (FCB + CCB + lock)
             {
                 PUDF_FILE_INFO CreatedFileInfo = NewFileInfo;
                 Status = UDFOpenObjectFromDirContext(
                     IrpContext, IrpSp, Vcb,
                     NULL, RelatedFileInfo,
-                    &CurrentFcb, &PreviousFcb,
+                    (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb,
                     IgnoreCase, TRUE, CreateDisposition,
                     0,  // final component — no LCB
                     NULL, NULL,
                     CreatedFileInfo,
-                    &NewFileInfo, &PtrNewFcb);
+                    (PUDF_FILE_INFO*)&NewFileInfo, (PFCB*)&PtrNewFcb);
             }
             if (!NT_SUCCESS(Status)) {
                 AdPrint(("    Can't open created file or stream\n"));
                 BrutePoint();
-                // Undo create — flush and unlink from disk
-                if (NewFileInfo &&
-                    (Status != STATUS_FILE_IS_A_DIRECTORY) &&
-                    (Status != STATUS_NOT_A_DIRECTORY) &&
-                    (Status != STATUS_ACCESS_DENIED)) {
-                    UDFFlushFile__(IrpContext, Vcb, NewFileInfo, 0);
-                    UDFUnlinkFile__(IrpContext, Vcb, NewFileInfo, TRUE);
-                }
-                // The common failure path releases this create reference.
+                /* Common unwind separates the CCB hold from fresh-FI rollback. */
                 try_return(Status);
             }
 
@@ -2446,8 +3254,8 @@ UDFCommonCreate(
 
             try_return(Status = UDFOpenExistingFcb(IrpContext, IrpSp, Vcb,
                                                     FileObject, NewFileInfo,
-                                                    &PtrNewFcb, IgnoreCase,
-                                                    RelatedFileObject, NextFcb));
+                                                    (PFCB*)&PtrNewFcb, IgnoreCase,
+                                                    RelatedFileObject, NextFcb, CreateDisposition));
         }
 
         // File path — final component not yet opened, DirContext has the entry
@@ -2484,12 +3292,12 @@ UDFCommonCreate(
         Status = UDFOpenObjectFromDirContext(
             IrpContext, IrpSp, Vcb, &DirContext,
             RelatedFileInfo,
-            &CurrentFcb, &PreviousFcb,
+            (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb,
             IgnoreCase, TRUE, CreateDisposition,
             0,  // RemainingNameLength = 0 (final component)
             RelatedFileObject, NextFcb,
             NULL,  // ExistingFileInfo
-            &NewFileInfo, &PtrNewFcb);
+            (PUDF_FILE_INFO*)&NewFileInfo, (PFCB*)&PtrNewFcb);
         try_return(Status);
 
 try_exit:   NOTHING;
@@ -2515,140 +3323,112 @@ try_exit:   NOTHING;
         }
 
     } _SEH2_FINALLY {
-
-        //
-        //  The result of this open could be success, pending or some error
-        //  condition.
-        //
-
-        if (_SEH2_AbnormalTermination()) {
+        BOOLEAN BodyAbnormal = _SEH2_AbnormalTermination();
+        _SEH2_TRY {
+            if ((BodyAbnormal || !NT_SUCCESS(Status)) && NewFileInfo &&
+                NewFileInfo == FreshFileInfo) {
+                _SEH2_VOLATILE NTSTATUS QueueStatus = STATUS_UNSUCCESSFUL;
+                _SEH2_TRY {
+                    QueueStatus = UDFQueueCreateRollback(IrpContext, FileObject,
+                        (PUDF_FILE_INFO*)&NewFileInfo,
+                        BodyAbnormal ? STATUS_UNSUCCESSFUL : Status);
+                } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                              EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                    QueueStatus = _SEH2_GetExceptionCode();
+                } _SEH2_END;
+                if (QueueStatus != STATUS_SUCCESS) {
+                    if (NT_SUCCESS(QueueStatus)) QueueStatus = STATUS_IO_DEVICE_ERROR;
+                    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                    /* Keep the original CREATE error/exception; an ownership
+                     * admission failure is separately latched and never
+                     * followed by a speculative flush/unlink. */
+                    InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                                QueueStatus, STATUS_SUCCESS);
+                }
+            }
 
             //
-            //  In the error path we start by calling our teardown routine if we
-            //  have a CurrentFcb.
+            //  The result of this open could be success, pending or some error
+            //  condition.
             //
+
+            if (BodyAbnormal) {
+                UDFUnwindCompletedOpen(IrpContext, FileObject,
+                                        (PUDF_FILE_INFO*)&NewFileInfo);
+                if (NewFileInfo)
+                    UDFReleaseCreateReference(IrpContext, Vcb, (PUDF_FILE_INFO*)&NewFileInfo, TRUE);
+                UDFTeardownCreateFcb(IrpContext, Vcb, (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb);
+
+                // No need to complete the request.
+
+                IrpContext = NULL;
+                Irp = NULL;
+
+            // If we posted this request we need to show that there is no
+            // reason to complete the request.
+
+            } else if (Status == STATUS_PENDING) {
+
+                IrpContext = NULL;
+                Irp = NULL;
+
+            } else if (!NT_SUCCESS(Status)) {
+
+                UDFUnwindCompletedOpen(IrpContext, FileObject,
+                                        (PUDF_FILE_INFO*)&NewFileInfo);
+
+                // Failure path — clean up partial structures.
+
+                AdPrint(("UDF: CREATE FAILED RC=%x Fcb=%p Name='%wZ' Disp=%x DesAccess=%x\n",
+                         Status, PtrNewFcb,
+                         &(IrpSp->FileObject->FileName),
+                         (IrpSp->Parameters.Create.Options >> 24) & 0xFF,
+                         IrpSp->Parameters.Create.SecurityContext ?
+                             IrpSp->Parameters.Create.SecurityContext->DesiredAccess : 0));
+
+                // Balance UDFReferenceFile__ from prefix match / path traversal.
+
+                if (NewFileInfo) {
+                    UDFReleaseCreateReference(IrpContext, Vcb, (PUDF_FILE_INFO*)&NewFileInfo, TRUE);
+                }
+
+                // Mark last successfully opened directory as valid.
+
+                if (LastGoodFileInfo && LastGoodFileInfo->Fcb) {
+                    LastGoodFileInfo->Fcb->FcbState |= UDF_FCB_VALID;
+                    LastGoodFileInfo->Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_VALID;
+                }
+
+
+                UDFTeardownCreateFcb(IrpContext, Vcb, (PFCB*)&CurrentFcb, (PFCB*)&PreviousFcb);
+            }
+
+        } _SEH2_FINALLY {
+            /* A raised finalizer belongs to the outer dispatcher. Release
+             * our resources, but never complete/free that IRP context here. */
+            if (_SEH2_AbnormalTermination()) { IrpContext = NULL; Irp = NULL; }
+            // Release the Fcb locks.
+
+            if (PreviousFcb && PreviousFcb != CurrentFcb) {
+
+                UDFReleaseFcb(IrpContext, PreviousFcb);
+            }
 
             if (CurrentFcb != NULL) {
 
-                BOOLEAN RemovedFcb = FALSE;
-
-                UDFTeardownStructures( IrpContext, CurrentFcb, FALSE, &RemovedFcb );
-
-                if (RemovedFcb) {
-
-                    if (PreviousFcb == CurrentFcb) {
-                        PreviousFcb = NULL;
-                    }
-                    CurrentFcb = NULL;
-                }
+                UDFReleaseFcb(IrpContext, CurrentFcb);
             }
 
-            // No need to complete the request.
+            // Release the Vcb.
 
-            IrpContext = NULL;
-            Irp = NULL;
+            UDFReleaseVcb(IrpContext, Vcb);
 
-        // If we posted this request we need to show that there is no
-        // reason to complete the request.
+            // Call our completion routine.  It will handle the case where either
+            // the Irp and/or IrpContext are gone.
 
-        } else if (Status == STATUS_PENDING) {
+            UDFCompleteRequest( IrpContext, Irp, Status );
 
-            IrpContext = NULL;
-            Irp = NULL;
-
-        } else if (!NT_SUCCESS(Status)) {
-
-            // Failure path — clean up partial structures.
-
-            AdPrint(("UDF: CREATE FAILED RC=%x Fcb=%p Name='%wZ' Disp=%x DesAccess=%x\n",
-                     Status, PtrNewFcb,
-                     &(IrpSp->FileObject->FileName),
-                     (IrpSp->Parameters.Create.Options >> 24) & 0xFF,
-                     IrpSp->Parameters.Create.SecurityContext ?
-                         IrpSp->Parameters.Create.SecurityContext->DesiredAccess : 0));
-
-            // Balance UDFReferenceFile__ from prefix match / path traversal.
-
-            if (NewFileInfo) {
-                UDFCloseFile__(IrpContext, Vcb, NewFileInfo);
-            }
-
-            // Mark last successfully opened directory as valid.
-
-            if (LastGoodFileInfo && LastGoodFileInfo->Fcb) {
-                LastGoodFileInfo->Fcb->FcbState |= UDF_FCB_VALID;
-                LastGoodFileInfo->Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_VALID;
-            }
-
-
-            // Teardown partial FCB structures.
-            // Protect PreviousFcb from deletion via FcbReference bump —
-            // TeardownStructures walks parent chain and may free parents.
-
-            // CurrentFcb may be NULL on early failures (e.g. FILE_CREATE on existing root)
-            // while LastGoodFileInfo->Fcb is valid from path traversal. This is expected.
-            ASSERT(!LastGoodFileInfo || !LastGoodFileInfo->Fcb ||
-                   !CurrentFcb || CurrentFcb == LastGoodFileInfo->Fcb);
-
-            // Type/disposition checks for a related-file reopen can fail
-            // before we acquire its FCB. Teardown requires that FCB exclusive;
-            // the still-open related handle owns it in that early-failure case.
-            if (Vcb && (PtrNewFcb != Vcb->RootIndexFcb) &&
-                LastGoodFileInfo && CurrentFcb == LastGoodFileInfo->Fcb) {
-
-                BOOLEAN ProtectedPreviousFcb = FALSE;
-                if (PreviousFcb && PreviousFcb != CurrentFcb) {
-                    UDFLockVcb(IrpContext, Vcb);
-                    PreviousFcb->FcbReference++;
-                    UDFUnlockVcb(IrpContext, Vcb);
-                    ProtectedPreviousFcb = TRUE;
-                }
-
-                BOOLEAN RemovedFcb = FALSE;
-                UDFTeardownStructures(IrpContext, LastGoodFileInfo->Fcb, FALSE, &RemovedFcb);
-
-                if (RemovedFcb) {
-                    if (PreviousFcb == CurrentFcb) {
-                        PreviousFcb = NULL;
-                    }
-                    CurrentFcb = NULL;
-                }
-
-                if (ProtectedPreviousFcb) {
-                    UDFLockVcb(IrpContext, Vcb);
-                    PreviousFcb->FcbReference--;
-                    UDFUnlockVcb(IrpContext, Vcb);
-                }
-
-            } else {
-                // The target is root, or validation failed before its FCB
-                // was acquired. Neither case owns a target FCB for teardown.
-                ASSERT(!LastGoodFileInfo || !CurrentFcb ||
-                       (PtrNewFcb == Vcb->RootIndexFcb));
-            }
-        }
-
-        // Release the Fcb locks.
-
-        if (PreviousFcb && PreviousFcb != CurrentFcb) {
-
-            UDFReleaseFcb(IrpContext, PreviousFcb);
-        }
-
-        if (CurrentFcb != NULL) {
-
-            UDFReleaseFcb(IrpContext, CurrentFcb);
-        }
-
-        // Release the Vcb.
-
-        UDFReleaseVcb(IrpContext, Vcb);
-
-        // Call our completion routine.  It will handle the case where either
-        // the Irp and/or IrpContext are gone.
-
-        UDFCompleteRequest( IrpContext, Irp, Status );
-
+        } _SEH2_END;
     } _SEH2_END;
 
     return(Status);
@@ -2677,150 +3457,135 @@ UDFFirstOpenFile(
     IN PUDF_FILE_INFO NewFileInfo
     )
 {
-    NTSTATUS            RC = STATUS_SUCCESS;
-    PDIR_INDEX_HDR      hDirIndex;
-    PDIR_INDEX_ITEM     DirIndex;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    _SEH2_VOLATILE PFCB NewFcb = NULL;
+    _SEH2_VOLATILE BOOLEAN FcbExisted = FALSE;
+    _SEH2_VOLATILE BOOLEAN TableLocked = FALSE, VcbLocked = FALSE;
+    _SEH2_VOLATILE BOOLEAN Published = FALSE;
     FILE_ID FileId;
     NODE_TYPE_CODE NodeTypeCode;
-    BOOLEAN FcbExisted;
+    BOOLEAN IsDirectory, Embedded;
+    PUDF_FILE_INFO AttributesFile;
+    PDIR_INDEX_HDR Index;
+    PDIR_INDEX_ITEM Entry;
+    DIR_INDEX_ITEM DefaultAttributes;
 
-    ASSERT(RelatedFileInfo);
-
-    AdPrint(("UDFFirstOpenFile\n"));
-
+    if (!PtrNewFcb) return STATUS_INVALID_PARAMETER;
+    *PtrNewFcb = NULL;
+    if (!IrpContext || !Vcb || !RelatedFileInfo || !RelatedFileInfo->Dloc ||
+        !RelatedFileInfo->Dloc->FileEntry || !NewFileInfo ||
+        !NewFileInfo->Dloc || !NewFileInfo->Dloc->FileEntry || !NewFileInfo->RefCount)
+        return STATUS_FILE_INVALID;
+    if (UDFIsReservedMetadataFile(NewFileInfo)) return STATUS_ACCESS_DENIED;
+    if (!Vcb->SectorSize || NewFileInfo->Dloc->DataLoc.Length < 0 ||
+        NewFileInfo->Dloc->DataLoc.Length > MAXLONGLONG - (Vcb->SectorSize - 1))
+        return STATUS_FILE_CORRUPT_ERROR;
+    IsDirectory = UDFIsADirectory(NewFileInfo);
+    Embedded = !IsDirectory &&
+        ((((PFILE_ENTRY)NewFileInfo->Dloc->FileEntry)->icbTag.flags &
+          ICB_FLAG_ALLOC_MASK) == ICB_FLAG_AD_IN_ICB);
     FileId = UDFGetNTFileId(Vcb, NewFileInfo);
+    NodeTypeCode = IsDirectory ? UDF_NODE_TYPE_INDEX : UDF_NODE_TYPE_DATA;
+    if (IsDirectory) SetFlag(FileId.HighPart, FID_DIR_MASK);
 
-    if (UDFIsADirectory(NewFileInfo)) {
-
-        NodeTypeCode = UDF_NODE_TYPE_INDEX;
-        SetFlag(FileId.HighPart, FID_DIR_MASK);
-
-    } else {
-
-        NodeTypeCode = UDF_NODE_TYPE_DATA;
-    }
-
-    // Acquire FcbTableMutex for atomic create + init.
-    // This prevents another thread from finding a half-initialized FCB
-    // in FcbTable (or via DirNdx->FileInfo->Fcb / Dloc->CommonFcb).
-    // Lock ordering: FcbTableMutex (outer) before VcbMutex (inner).
-    UDFLockFcbTable(IrpContext, Vcb);
-
-    if (!((*PtrNewFcb) = UDFCreateFcb(IrpContext, FileId, NodeTypeCode, &FcbExisted))) {
-
-        AdPrint(("Can't allocate FCB\n"));
-        UDFUnlockFcbTable(IrpContext, Vcb);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    if (FcbExisted) {
-
-        // Make link between Fcb and FileInfo
-        (*PtrNewFcb)->FileInfo = NewFileInfo;
-        NewFileInfo->Fcb = (*PtrNewFcb);
-        (*PtrNewFcb)->ParentFcb = RelatedFileInfo->Fcb;
-
-        // On 32-bit, FID_DIR_MASK is a no-op (bit 31 already set in
-        // kernel addresses), so a file and a directory at the same LBA
-        // share the same FileId.  When an LBA is reused (e.g., deleted
-        // file's block allocated for a new stream directory), the stale
-        // FCB in FcbTable may have wrong type flags.  Update them.
-        if (UDFIsADirectory(NewFileInfo)) {
-            (*PtrNewFcb)->FcbState |= UDF_FCB_DIRECTORY;
-            (*PtrNewFcb)->Header.NodeTypeCode = UDF_NODE_TYPE_INDEX;
-        } else {
-            (*PtrNewFcb)->FcbState &= ~UDF_FCB_DIRECTORY;
-            (*PtrNewFcb)->Header.NodeTypeCode = UDF_NODE_TYPE_DATA;
-        }
-        // Clear stale flags from previous incarnation
-        (*PtrNewFcb)->FcbState &= ~(UDF_FCB_DELETED | UDF_FCB_NOT_FOUND_ON_MEDIA);
-        // Update Dloc linkage for the new file
-        NewFileInfo->Dloc->CommonFcb = (*PtrNewFcb);
-
-        UDFUnlockFcbTable(IrpContext, Vcb);
-        return STATUS_SUCCESS;
-
-    }
-
-    // Make link between Fcb and FileInfo
-    (*PtrNewFcb)->FileInfo = NewFileInfo;
-    NewFileInfo->Fcb = (*PtrNewFcb);
-    (*PtrNewFcb)->ParentFcb = RelatedFileInfo->Fcb;
-
-    // FcbTable is the single source of truth for FCB lookup.
-    // If UDFCreateFcb didn't find an existing FCB (FcbExisted=FALSE),
-    // this is a new FCB regardless of what CommonFcb says.
-    // CommonFcb may contain a stale pointer from a previously failed open.
-    NewFileInfo->Dloc->CommonFcb = (*PtrNewFcb);
-
-    PFCB NewFcb = *PtrNewFcb;
-    // Initialize times and sizes from on-disk FileEntry
-    UDFGetFileXTime((*PtrNewFcb)->FileInfo,
-        &(NewFcb->CreationTime.QuadPart),
-        &(NewFcb->LastAccessTime.QuadPart),
-        &(NewFcb->ChangeTime.QuadPart),
-        &(NewFcb->LastWriteTime.QuadPart) );
-
-    // Set the allocation size for the object
-    NewFcb->Header.AllocationSize.QuadPart =
-        UDFSysGetAllocSize(Vcb, NewFileInfo->Dloc->DataLoc.Length);
-    NewFcb->Header.FileSize.QuadPart =
-    NewFcb->Header.ValidDataLength.QuadPart = NewFileInfo->Dloc->DataLoc.Length;
-
-    // VcbMutex (inner lock) for refcount operations in UDFInitializeFCB
-    UDFLockVcb(IrpContext, Vcb);
-
-    // FileObject=NULL: CCB is created later by UDFOpenExistingFcb
-    RC = UDFInitializeFCB(*PtrNewFcb, Vcb,
-                 UDFIsADirectory(NewFileInfo) ? UDF_FCB_DIRECTORY : 0);
-
-    if (!NT_SUCCESS(RC)) {
-
-        UDFUnlockVcb(IrpContext, Vcb);
-        UDFUnlockFcbTable(IrpContext, Vcb);
-        return RC;
-    }
-    // Set embedded data flag if file data is stored in ICB
-    if (!UDFIsADirectory(NewFileInfo) &&
-        (((PFILE_ENTRY)(NewFileInfo->Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK) == ICB_FLAG_AD_IN_ICB) {
-        (*PtrNewFcb)->FcbState |= UDF_FCB_EMBEDDED_DATA;
-    }
-    // set Read-only attribute
-    if (!UDFIsAStreamDir(NewFileInfo)) {
-        hDirIndex = UDFGetDirIndexByFileInfo(NewFileInfo);
-#ifdef UDF_DBG
-        if (!hDirIndex) {
-            BrutePoint();
-        } else {
-#endif // UDF_DBG
-            (*PtrNewFcb)->FileAttributes = UDFAttributesToNT(DirIndex = UDFDirIndex(hDirIndex, NewFileInfo->Index),NULL);
-            if ((*PtrNewFcb)->FileAttributes & FILE_ATTRIBUTE_READONLY) {
-                (*PtrNewFcb)->FcbState |= UDF_FCB_READ_ONLY;
+    _SEH2_TRY {
+        UDFLockFcbTable(IrpContext, Vcb);
+        TableLocked = TRUE;
+        NewFcb = UDFCreateFcb(IrpContext, FileId, NodeTypeCode, (PBOOLEAN)&FcbExisted);
+        if (!NewFcb) { Status = STATUS_INSUFFICIENT_RESOURCES; _SEH2_LEAVE; }
+        if (FcbExisted) {
+            PUDF_FILE_INFO Canonical = NewFcb->FileInfo;
+            if (NewFcb->TeardownInProgress || !(NewFcb->FcbState & UDF_FCB_VALID) ||
+                !Canonical || !Canonical->Dloc || Canonical->Dloc != NewFileInfo->Dloc ||
+                Canonical->Dloc->CommonFcb != NewFcb ||
+                UDFIsADirectory(Canonical) != IsDirectory ||
+                (NewFcb->FcbState & (UDF_FCB_DELETED | UDF_FCB_NOT_FOUND_ON_MEDIA))) {
+                Status = STATUS_SHARING_VIOLATION;
+                _SEH2_LEAVE;
             }
-            // Names are now stored in LCB, not appended to FCBName
-#ifdef UDF_DBG
+            NewFileInfo->Fcb = NewFcb;
+            *PtrNewFcb = NewFcb;
+            Published = TRUE;
+            Status = STATUS_SUCCESS;
+            _SEH2_LEAVE;
         }
-#endif // UDF_DBG
-    } else if (RelatedFileInfo->ParentFile) {
-        hDirIndex = UDFGetDirIndexByFileInfo(RelatedFileInfo);
-        (*PtrNewFcb)->FileAttributes = UDFAttributesToNT(DirIndex = UDFDirIndex(hDirIndex, RelatedFileInfo->Index),NULL);
-        if ((*PtrNewFcb)->FileAttributes & FILE_ATTRIBUTE_READONLY) {
-            (*PtrNewFcb)->FcbState |= UDF_FCB_READ_ONLY;
+        /* A missing table key does not prove a non-NULL canonical pointer
+         * stale. It belongs to an earlier owner/unfinished admission. */
+        if (NewFileInfo->Dloc->CommonFcb) {
+            Status = STATUS_SHARING_VIOLATION;
+            _SEH2_LEAVE;
         }
-        // Names are now stored in LCB, not appended to FCBName
-//    } else {
-//        BrutePoint();
-    }
+        /* Everything below still belongs to this private FCB. No new FI
+         * or Dloc backpointer is installed until table admission succeeds. */
+        NewFcb->FileInfo = NewFileInfo;
+        NewFcb->ParentFcb = RelatedFileInfo->Fcb;
+        UDFGetFileXTime(NewFileInfo, &NewFcb->CreationTime.QuadPart,
+            &NewFcb->LastAccessTime.QuadPart, &NewFcb->ChangeTime.QuadPart,
+            &NewFcb->LastWriteTime.QuadPart);
+        NewFcb->Header.AllocationSize.QuadPart =
+            UDFSysGetAllocSize(Vcb, NewFileInfo->Dloc->DataLoc.Length);
+        NewFcb->Header.FileSize.QuadPart =
+        NewFcb->Header.ValidDataLength.QuadPart = NewFileInfo->Dloc->DataLoc.Length;
+        AttributesFile = UDFIsAStreamDir(NewFileInfo) ? RelatedFileInfo : NewFileInfo;
+        Index = UDFGetDirIndexByFileInfo(AttributesFile);
+        Entry = Index ? UDFDirIndex(Index, AttributesFile->Index) : NULL;
+        RtlZeroMemory(&DefaultAttributes, sizeof(DefaultAttributes));
+        NewFcb->FileAttributes = UDFAttributesToNT(Entry ? Entry : &DefaultAttributes,
+                                                 AttributesFile->Dloc->FileEntry);
 
-    // Insert FCB into table and mark valid.
-    UDFInsertFcbIntoTable(IrpContext, *PtrNewFcb);
-    (*PtrNewFcb)->NtReqFCBFlags |= UDF_NTREQ_FCB_VALID;
-    (*PtrNewFcb)->FcbState |= UDF_FCB_VALID;
+        UDFLockVcb(IrpContext, Vcb);
+        VcbLocked = TRUE;
+        Status = UDFInitializeFCB(NewFcb, Vcb, IsDirectory ? UDF_FCB_DIRECTORY : 0);
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        if (Embedded) NewFcb->FcbState |= UDF_FCB_EMBEDDED_DATA;
+        if (NewFcb->FileAttributes & FILE_ATTRIBUTE_READONLY)
+            NewFcb->FcbState |= UDF_FCB_READ_ONLY;
+        Status = UDFInsertFcbIntoTable(IrpContext, NewFcb);
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        /* No fallible work follows this receipt while the two identity
+         * locks are held. Publish one stable shared-data representative. */
+        NewFileInfo->Fcb = NewFcb;
+        NewFileInfo->Dloc->CommonFcb = NewFcb;
+        NewFcb->NtReqFCBFlags |= UDF_NTREQ_FCB_VALID;
+        NewFcb->FcbState |= UDF_FCB_VALID;
+        *PtrNewFcb = NewFcb;
+        Published = TRUE;
+    } _SEH2_FINALLY {
+        _SEH2_TRY {
+            if (!Published && NewFcb && !FcbExisted &&
+                FlagOn(NewFcb->FcbState, FCB_STATE_IN_FCB_TABLE)) {
+                /* No expected/fallible step follows insertion. If an
+                 * unexpected exception still interrupts publication, the
+                 * exact indexed FCB must reserve its FI before caller close.
+                 * Keep a counted gate, never a dangling borrowed pointer. */
+                if (!VcbLocked) {
+                    UDFLockVcb(IrpContext, Vcb);
+                    VcbLocked = TRUE;
+                }
+                NewFileInfo->Fcb = NewFcb;
+                NewFileInfo->Dloc->CommonFcb = NewFcb;
+                NewFcb->TeardownInProgress = TRUE;
+                if (!NewFcb->TeardownRetryPending) {
+                    NewFcb->TeardownRetryPending = TRUE;
+                    InterlockedIncrement(&Vcb->ClosedFcbRetryCount);
+                }
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                            STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+            }
+        } _SEH2_FINALLY {
+            if (VcbLocked) UDFUnlockVcb(IrpContext, Vcb);
+            if (TableLocked) UDFUnlockFcbTable(IrpContext, Vcb);
+        } _SEH2_END;
+        if (!Published && NewFcb && !FcbExisted &&
+            !FlagOn(NewFcb->FcbState, FCB_STATE_IN_FCB_TABLE)) {
+            NewFcb->FileInfo = NULL;
+            NewFcb->ParentFcb = NULL;
+            UDFDeleteFcb(IrpContext, NewFcb);
+        }
+    } _SEH2_END;
+    return Status;
 
-    UDFUnlockVcb(IrpContext, Vcb);
-    UDFUnlockFcbTable(IrpContext, Vcb);
-
-    return RC;
 } // end UDFFirstOpenFile()
 
 /*************************************************************************
@@ -2844,6 +3609,7 @@ UDFCompleteFcbOpen(
     _In_ PIO_STACK_LOCATION IrpSp,
     _In_ PVCB Vcb,
     _Inout_ PFCB *CurrentFcb,
+    _In_opt_ PUDF_FILE_INFO OpenFileInfo,
     _In_ TYPE_OF_OPEN TypeOfOpen,
     _In_ ULONG UserCcbFlags,
     _In_ ULONG CreateDisposition,
@@ -2851,12 +3617,18 @@ UDFCompleteFcbOpen(
     _In_ ULONG DesiredInformation
     )
 {
-    NTSTATUS Status = STATUS_SUCCESS;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
     BOOLEAN LockVolume = FALSE;
-    BOOLEAN VcbAcquired = FALSE;
-    BOOLEAN DeleteCcbOnUnwind = FALSE;
+    _SEH2_VOLATILE BOOLEAN VcbAcquired = FALSE;
+    _SEH2_VOLATILE BOOLEAN DeleteCcbOnUnwind = FALSE;
+    _SEH2_VOLATILE BOOLEAN ShareAccessUpdated = FALSE;
+    _SEH2_VOLATILE BOOLEAN CacheCountAdded = FALSE;
+    _SEH2_VOLATILE UNICODE_STRING FileName = {0};
+    _SEH2_VOLATILE UNICODE_STRING CaseFileName = {0};
+    _SEH2_VOLATILE UNICODE_STRING ShortName = {0};
+    SHARE_ACCESS ShareAccessBefore;
     PFCB Fcb = *CurrentFcb;
-    PCCB Ccb = NULL;
+    _SEH2_VOLATILE PCCB Ccb = NULL;
     ULONG Information = DesiredInformation;
     USHORT FileAttributes = IrpSp->Parameters.Create.FileAttributes;
     PIO_SECURITY_CONTEXT SecurityContext = IrpSp->Parameters.Create.SecurityContext;
@@ -2865,6 +3637,24 @@ UDFCompleteFcbOpen(
     BOOLEAN DeleteOnClose = BooleanFlagOn(IrpSp->Parameters.Create.Options, FILE_DELETE_ON_CLOSE);
 
     ASSERT_FCB(Fcb);
+    if (!IsListEmpty(&Fcb->AbortedOpenQueue)) return STATUS_DEVICE_BUSY;
+    if (TypeOfOpen != UserVolumeOpen &&
+        (!OpenFileInfo || !OpenFileInfo->Dloc || !Fcb->FileInfo ||
+         OpenFileInfo->Dloc != Fcb->FileInfo->Dloc ||
+         !OpenFileInfo->RefCount))
+        return STATUS_FILE_INVALID;
+    if (OpenFileInfo && OpenFileInfo->ParentFile && !OpenFileInfo->ParentFile->Fcb)
+        return STATUS_FILE_INVALID;
+    if ((OpenFileInfo && (OpenFileInfo->LinkDeleteCommitted ||
+         (OpenFileInfo->Dloc && OpenFileInfo->Dloc->DeleteCommitted))) ||
+        (Fcb->FcbState & (UDF_FCB_DELETED | UDF_FCB_NOT_FOUND_ON_MEDIA)))
+        return STATUS_FILE_DELETED;
+    if (TypeOfOpen != UserVolumeOpen && UDFIsLinkDeletePending(Fcb, OpenFileInfo))
+        return STATUS_DELETE_PENDING;
+    if (DeleteOnClose && TypeOfOpen != UserVolumeOpen &&
+        (!OpenFileInfo->ParentFile ||
+         FlagOn(UserCcbFlags, CCB_FLAG_OPEN_BY_ID | CCB_FLAG_OPEN_RELATIVE_BY_ID)))
+        return STATUS_CANNOT_DELETE;
 
     // Expand maximum allowed to something sensible for share access checking
 
@@ -2994,14 +3784,19 @@ UDFCompleteFcbOpen(
                 UDFLockVcb(IrpContext, Fcb->Vcb);
             }
 
-            Fcb->FcbReference++;
-            Fcb->Vcb->VcbReference++;
+            if (Fcb->FcbReference == MAXULONG || Fcb->Vcb->VcbReference == MAXULONG) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+            } else {
+                Fcb->FcbReference++;
+                Fcb->Vcb->VcbReference++;
+                VcbAcquired = TRUE;
+            }
 
             if (!VcbLocked) {
                 UDFUnlockVcb(IrpContext, Fcb->Vcb);
             }
 
-            VcbAcquired = TRUE;
+            if (Status != STATUS_SUCCESS) try_return(Status);
 
             if (!MmFlushImageSection(&Fcb->FcbNonpaged->SegmentObject, MmFlushForWrite)) {
 
@@ -3024,8 +3819,23 @@ UDFCompleteFcbOpen(
             }
         }
 
-        // Update the share access.
-
+        // Update the share access and retain its exact accepted contribution.
+        // Provider-specific ignored-share opens can contribute zero counters.
+        ShareAccessBefore = Fcb->ShareAccess;
+        if (!Fcb->FcbCleanup &&
+            (ShareAccessBefore.OpenCount || ShareAccessBefore.Readers ||
+             ShareAccessBefore.Writers || ShareAccessBefore.Deleters ||
+             ShareAccessBefore.SharedRead || ShareAccessBefore.SharedWrite ||
+             ShareAccessBefore.SharedDelete)) {
+            try_return(Status = STATUS_FILE_CORRUPT_ERROR);
+        }
+        /* Main serializes this FCB's share state. IoUpdateShareAccess can
+         * add one to each ULONG; reject before the provider mutates it. */
+        if (ShareAccessBefore.OpenCount == MAXULONG ||
+            ShareAccessBefore.Readers == MAXULONG || ShareAccessBefore.Writers == MAXULONG ||
+            ShareAccessBefore.Deleters == MAXULONG || ShareAccessBefore.SharedRead == MAXULONG ||
+            ShareAccessBefore.SharedWrite == MAXULONG || ShareAccessBefore.SharedDelete == MAXULONG)
+            try_return(Status = STATUS_INSUFFICIENT_RESOURCES);
         if (Fcb->FcbCleanup == 0) {
 
             IoSetShareAccess(DesiredAccess,
@@ -3037,6 +3847,14 @@ UDFCompleteFcbOpen(
 
             IoUpdateShareAccess(IrpSp->FileObject, &Fcb->ShareAccess);
         }
+        ShareAccessUpdated = TRUE;
+        Ccb->OpenShareAccess.OpenCount = Fcb->ShareAccess.OpenCount - ShareAccessBefore.OpenCount;
+        Ccb->OpenShareAccess.Readers = Fcb->ShareAccess.Readers - ShareAccessBefore.Readers;
+        Ccb->OpenShareAccess.Writers = Fcb->ShareAccess.Writers - ShareAccessBefore.Writers;
+        Ccb->OpenShareAccess.Deleters = Fcb->ShareAccess.Deleters - ShareAccessBefore.Deleters;
+        Ccb->OpenShareAccess.SharedRead = Fcb->ShareAccess.SharedRead - ShareAccessBefore.SharedRead;
+        Ccb->OpenShareAccess.SharedWrite = Fcb->ShareAccess.SharedWrite - ShareAccessBefore.SharedWrite;
+        Ccb->OpenShareAccess.SharedDelete = Fcb->ShareAccess.SharedDelete - ShareAccessBefore.SharedDelete;
 
         // initialize the CCB
         Ccb->Fcb = Fcb;
@@ -3064,61 +3882,46 @@ UDFCompleteFcbOpen(
         // LCB keeps parent FCB alive while children are open, preventing
         // premature teardown of in-memory directory index.
         // LCB is also inserted into splay trees for O(log n) name lookup.
-        if (Fcb->ParentFcb) {
+        if (OpenFileInfo && OpenFileInfo->ParentFile &&
+            OpenFileInfo->ParentFile->Fcb) {
 
-            if (Fcb->FileInfo) {
-                UNICODE_STRING FileName;
-                UNICODE_STRING CaseFileName;
-                UNICODE_STRING ShortName;
-                NTSTATUS NameStatus;
-
-                // Extract file name from FileInfo
-                RtlZeroMemory(&FileName, sizeof(UNICODE_STRING));
-                RtlZeroMemory(&CaseFileName, sizeof(UNICODE_STRING));
-                RtlZeroMemory(&ShortName, sizeof(UNICODE_STRING));
-
-                NameStatus = UDFGetFileNameFromFileInfo(Fcb->FileInfo, &FileName);
-
-                if (NT_SUCCESS(NameStatus) && FileName.Buffer != NULL) {
-                    // Create uppercase version for case-insensitive comparisons
-                    UDFUpcaseString(&CaseFileName, &FileName);
-
-                    // Generate 8.3 short name for DOS compatibility
-                    if (!UDFCanNameBeA8dot3(&FileName)) {
-                        UDFGenerateShortName(Fcb->Vcb, &FileName, &ShortName);
-                    }
-
-                    Ccb->Lcb = UDFAcquirePrefix(IrpContext,
-                                                Fcb->ParentFcb,
-                                                Fcb,
-                                                &FileName,
-                                                &CaseFileName,
-                                                ShortName.Buffer ? &ShortName : NULL,
-                                                Fcb->FileInfo->Index);
-
-                    if (FileName.Buffer) {
-                        MyFreePool__(FileName.Buffer);
-                    }
-                    if (CaseFileName.Buffer) {
-                        ExFreePool(CaseFileName.Buffer);
-                    }
-                    if (ShortName.Buffer) {
-                        ExFreePool(ShortName.Buffer);
-                    }
-                } else {
-                    Ccb->Lcb = UDFAcquirePrefix(IrpContext,
-                                                Fcb->ParentFcb,
-                                                Fcb,
-                                                NULL, NULL, NULL,
-                                                Fcb->FileInfo->Index);
+            /* These scratch buffers remain owned by the outer finally,
+             * including a raised pool allocation inside prefix creation.
+             * UDFInsertPrefix copies them; an LCB never consumes them. */
+            Status = UDFGetFileNameFromFileInfo(OpenFileInfo,
+                                                (PUNICODE_STRING)&FileName);
+            if (Status != STATUS_SUCCESS) try_return(Status);
+            if (FileName.Buffer) {
+                Status = UDFUpcaseString((PUNICODE_STRING)&CaseFileName,
+                                         (PUNICODE_STRING)&FileName);
+                if (Status != STATUS_SUCCESS) try_return(Status);
+                if (!UDFCanNameBeA8dot3((PUNICODE_STRING)&FileName)) {
+                    Status = UDFGenerateShortName(Vcb,
+                        (PUNICODE_STRING)&FileName, (PUNICODE_STRING)&ShortName);
+                    if (Status != STATUS_SUCCESS) try_return(Status);
                 }
-            } else {
-                Ccb->Lcb = UDFAcquirePrefix(IrpContext,
-                                            Fcb->ParentFcb,
-                                            Fcb,
-                                            NULL, NULL, NULL,
-                                            0);
             }
+            Status = UDFAcquirePrefix(IrpContext,
+                OpenFileInfo->ParentFile->Fcb, Fcb, OpenFileInfo,
+                FileName.Buffer ? (PUNICODE_STRING)&FileName : NULL,
+                CaseFileName.Buffer ? (PUNICODE_STRING)&CaseFileName : NULL,
+                ShortName.Buffer ? (PUNICODE_STRING)&ShortName : NULL,
+                OpenFileInfo->Index, &Ccb->Lcb);
+        }
+
+        if (Status != STATUS_SUCCESS) try_return(Status);
+
+        /* A named CCB needs the exact parent's LCB hold. Allocation failure
+         * cannot be converted to an apparently successful unanchored open. */
+        if (OpenFileInfo && OpenFileInfo->ParentFile && !Ccb->Lcb)
+            try_return(Status = STATUS_INSUFFICIENT_RESOURCES);
+
+        /* Reserve the exact FI/LCB request before reporting a successful
+         * FILE_DELETE_ON_CLOSE. Cleanup must not need a new allocation or
+         * borrow whichever FI happens to close last. */
+        if (DeleteOnClose) {
+            Status = UDFReserveDeleteOnClose(IrpContext, Ccb, OpenFileInfo, VcbLocked);
+            if (!NT_SUCCESS(Status)) try_return(Status);
         }
 
         // Set the file object type.
@@ -3146,8 +3949,13 @@ UDFCompleteFcbOpen(
             if (FlagOn(IrpSp->Parameters.Create.Options, FILE_NO_INTERMEDIATE_BUFFERING)) {
                 IrpSp->FileObject->Flags |= FO_NO_INTERMEDIATE_BUFFERING;
             } else {
-                IrpSp->FileObject->Flags |= FO_CACHE_SUPPORTED;
-                InterlockedIncrement((PLONG)&Fcb->CachedOpenHandleCount);
+                if (Fcb->CachedOpenHandleCount == MAXULONG) {
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                } else {
+                    IrpSp->FileObject->Flags |= FO_CACHE_SUPPORTED;
+                    InterlockedIncrement((PLONG)&Fcb->CachedOpenHandleCount);
+                    CacheCountAdded = TRUE;
+                }
             }
 
         } else if (TypeOfOpen == UserVolumeOpen) {
@@ -3161,6 +3969,7 @@ UDFCompleteFcbOpen(
         }
 
         UDFUnlockFcb(IrpContext, Fcb);
+        if (Status != STATUS_SUCCESS) try_return(Status);
 
         // Point to the section object pointer in the non-paged Fcb.
         IrpSp->FileObject->SectionObjectPointer = &Fcb->FcbNonpaged->SegmentObject;
@@ -3175,37 +3984,39 @@ UDFCompleteFcbOpen(
             UDFLockVcb(IrpContext, Fcb->Vcb);
         }
 
-        // Cleanup counts:
-        Fcb->FcbCleanup++;
-        Fcb->Vcb->VcbCleanup++;
+        /* Another FCB may have consumed the VCB budget since our early
+         * pin. Admit the entire accepted-CCB group under the VCB mutex;
+         * no callback/allocation separates these checks from publication. */
+        if (Fcb->FcbCleanup == MAXULONG || Fcb->Vcb->VcbCleanup == MAXULONG ||
+            Fcb->FcbUserReference == MAXULONG || Fcb->Vcb->VcbUserReference == MAXULONG ||
+            (!VcbAcquired && (Fcb->FcbReference == MAXULONG ||
+                             Fcb->Vcb->VcbReference == MAXULONG)) ||
+            (Ccb->Lcb && Ccb->Lcb->Reference >= MAXLONG)) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+        } else {
+            Fcb->FcbCleanup++;
+            Fcb->Vcb->VcbCleanup++;
+            if (!VcbAcquired) {
+                Fcb->FcbReference++;
+                Fcb->Vcb->VcbReference++;
+            }
+            Fcb->FcbUserReference++;
+            Fcb->Vcb->VcbUserReference++;
+            if (Ccb->Lcb) InterlockedIncrement((PLONG)&Ccb->Lcb->Reference);
+            Ccb->FileInfo = OpenFileInfo;
 
-        // Reference counts: skip FcbReference/VcbReference if already
-        // pre-incremented for MmFlushImageSection check above.
-        if (!VcbAcquired) {
-            Fcb->FcbReference++;
-            Fcb->Vcb->VcbReference++;
+            /* Only this commit transfers the original FI and the exact
+             * pin/share/cache receipts to the accepted CCB. */
+            VcbAcquired = FALSE;
+            DeleteCcbOnUnwind = FALSE;
+            ShareAccessUpdated = FALSE;
+            CacheCountAdded = FALSE;
         }
-
-        // User reference counts: always increment.
-        Fcb->FcbUserReference++;
-        Fcb->Vcb->VcbUserReference++;
-
-        // Increment LCB reference count.
-        // This reference will be decremented in cleanup.cpp.
-        if (Ccb->Lcb) {
-            Ccb->Lcb->Reference++;
-        }
-
-        // All reference increments succeeded — clear VcbAcquired so the
-        // finally block does not undo the pre-incremented counts.
-        VcbAcquired = FALSE;
-
-        // CCB is now owned by the file object — don't delete on unwind.
-        DeleteCcbOnUnwind = FALSE;
 
         if (!VcbLocked) {
             UDFUnlockVcb(IrpContext, Fcb->Vcb);
         }
+        if (Status != STATUS_SUCCESS) try_return(Status);
 
         // For SL_OPEN_TARGET_DIRECTORY: save full path length in MaximumLength,
         // then trim Length to the parent directory path (up to last '\').
@@ -3253,6 +4064,10 @@ UDFCompleteFcbOpen(
 try_exit:   NOTHING;
     } _SEH2_FINALLY {
 
+        if (FileName.Buffer) MyFreePool__(FileName.Buffer);
+        if (CaseFileName.Buffer) ExFreePool(CaseFileName.Buffer);
+        if (ShortName.Buffer) ExFreePool(ShortName.Buffer);
+
         // Undo pre-incremented reference counts if we failed between
         // the early increment (MmFlushImageSection path) and the final
         // increment block where VcbAcquired is cleared.
@@ -3271,6 +4086,18 @@ try_exit:   NOTHING;
         }
 
         if (DeleteCcbOnUnwind) {
+            NTSTATUS RequestStatus = UDFDiscardDeleteOnClose(IrpContext, Ccb, VcbLocked);
+            if (NT_SUCCESS(Status) && !NT_SUCCESS(RequestStatus)) Status = RequestStatus;
+            if (ShareAccessUpdated)
+                IoRemoveShareAccess(IrpSp->FileObject, &Fcb->ShareAccess);
+            if (CacheCountAdded) {
+                InterlockedDecrement((PLONG)&Fcb->CachedOpenHandleCount);
+                ClearFlag(IrpSp->FileObject->Flags, FO_CACHE_SUPPORTED);
+            }
+            if (IrpSp->FileObject->FsContext == Fcb) {
+                UDFSetFileObject(IrpSp->FileObject, UnopenedFileObject, NULL, NULL);
+                IrpSp->FileObject->SectionObjectPointer = NULL;
+            }
             Ccb->Lcb = NULL;
             UDFDeleteCcb(Ccb);
         }

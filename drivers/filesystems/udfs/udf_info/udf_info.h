@@ -118,6 +118,10 @@ NTSTATUS UDFFindFile(IN PVCB Vcb,
                      IN PUDF_FILE_INFO DirInfo,
                   IN OUT uint_di* Index);
 
+NTSTATUS UDFFindFileExceptIndex(IN PVCB Vcb, IN BOOLEAN IgnoreCase,
+    IN BOOLEAN NotDeleted, IN PUNICODE_STRING Name, IN PUDF_FILE_INFO DirInfo,
+    IN OUT uint_di* Index, IN uint_di ExcludedIndex);
+
 __inline NTSTATUS UDFFindFile__(IN PVCB Vcb,
                                 IN BOOLEAN IgnoreCase,
                                 IN PUNICODE_STRING Name,
@@ -148,55 +152,26 @@ NTSTATUS UDFOpenFileInfoFromDirContext(
 
 // calculate file mapping length (in bytes) including ZERO-terminator
 uint32   UDFGetMappingLength(IN PEXTENT_MAP Extent);
-// merge 2 sequencial file mappings
-PEXTENT_MAP
-__fastcall UDFMergeMappings(IN PEXTENT_MAP Extent,
-                             IN PEXTENT_MAP Extent2);
+// Status form for fallible owned-map sizing, including alignment headroom.
+NTSTATUS UDFGetMappingByteCount(IN PEXTENT_MAP Mapping, OUT uint32* Bytes);
+// Private append/commit: preserve both owners on failure; tail is never consumed.
+NTSTATUS
+__fastcall UDFAppendMapping(IN OUT PEXTENT_MAP* Mapping, IN PEXTENT_MAP Tail);
 
-// build file mapping according to ShortAllocDesc (SHORT_AD) array
-PEXTENT_MAP
-UDFShortAllocDescToMapping(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 PartNum,
-    IN PSHORT_AD AllocDesc,
-    IN uint32 AllocDescLength,
-    IN uint32 SubCallCount,
-    OUT PEXTENT_INFO AllocLoc
-    );
-
-// build file mapping according to LongAllocDesc (LONG_AD) array
-PEXTENT_MAP
-UDFLongAllocDescToMapping(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PLONG_AD AllocDesc,
-    IN uint32 AllocDescLength,
-    IN uint32 SubCallCount,
-    OUT PEXTENT_INFO AllocLoc
-    );
-
-// build file mapping according to ExtendedAllocDesc (EXT_AD) array
-PEXTENT_MAP
-UDFExtAllocDescToMapping(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PEXT_AD AllocDesc,
-    IN uint32 AllocDescLength,
-    IN uint32 SubCallCount,
-    OUT PEXTENT_INFO AllocLoc
-    );
-
-// build file mapping according to (Extended)FileEntry
-PEXTENT_MAP
+// Build private, bounded FE/EFE/AED maps and publish only on full success.
+NTSTATUS
 UDFReadMappingFromXEntry(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN uint32 PartNum,
-    IN tag* XEntry,
-    IN OUT uint32* Offset,
-    OUT PEXTENT_INFO AllocLoc
+    IN const LONG_AD* FileIcb,
+    IN const tag* XEntry,
+    IN OUT PEXTENT_INFO DataInfo,
+    IN OUT PEXTENT_INFO AllocLoc
     );
+
+// Recover a typed ICB from a mount-local physical file ID, outside table locks.
+NTSTATUS UDFResolvePhysicalIcbAddress(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+    IN uint32 Physical, OUT lb_addr* Address);
 
 // read FileEntry described in FileIdentDesc
 NTSTATUS UDFReadFileEntry(
@@ -213,17 +188,20 @@ NTSTATUS
 UDFFindLastFileSet(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN lb_addr *Addr,  // Addr for the 1st FileSet
+    IN OUT lb_addr *Addr,  // first address in, authenticated selected address out
     IN OUT PFILE_SET_DESC FileSetDesc
     );
 
-// read all sparing tables & stores them in contiguos memory
+// Load one validated coherent sparing generation; mounted storage is immutable.
 NTSTATUS
 UDFLoadSparingTable(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
     IN PSPARABLE_PARTITION_MAP PartMap
     );
+
+NTSTATUS UDFBindSparingPartition(IN PVCB Vcb, IN uint16 Number,
+    IN uint32 Root, IN uint32 Length);
 
 // build mapping for extent
 PEXTENT_MAP
@@ -249,26 +227,10 @@ UDFRemapPacket(
     IN BOOLEAN RemapSpared
     );
 
-//    This routine releases sector mapping when entire packet is marked as free
-NTSTATUS
-__fastcall UDFUnmapRange(IN PVCB Vcb,
-                        IN uint32 Lba,
-                        IN uint32 BCount);
-
-// return physical address for relocated sector
-uint32
-__fastcall UDFRelocateSector(IN PVCB Vcb,
-                          IN uint32 Lba);
-// check
-BOOLEAN
-__fastcall UDFAreSectorsRelocated(IN PVCB Vcb,
-                                  IN uint32 Lba,
-                                  IN uint32 BlockCount);
-// build mapping for relocated extent
-PEXTENT_MAP
-__fastcall UDFRelocateSectors(IN PVCB Vcb,
-                               IN uint32 Lba,
-                               IN uint32 BlockCount);
+/* Checked remap: caller owns a nonidentity result; invalid/missing mappings
+ * return an error, not an identity address or sparse successful extent. */
+NTSTATUS UDFMapVolumeSectorSpan(IN PVCB Vcb, IN uint32 Lba, IN uint32 BlockCount,
+    OUT PEXTENT_MAP* Result);
 
 // validate char
 BOOLEAN
@@ -385,10 +347,39 @@ void     UDFMarkSpaceAsXXX_(IN PVCB Vcb,
 #define AS_USED         0x01
 #define AS_DISCARDED    0x02
 #define AS_BAD          0x04
+// Proven physical bitmap owner, independent of metadata-map pointer identity.
+#define AS_PHYSICAL    0x08
+// Unpublished private claims; never defer them in an unrelated truncate ledger.
+#define AS_PRIVATE_ROLLBACK 0x10
+
+NTSTATUS UDFAllocationFailureStatus(IN PVCB Vcb);
+// A physical lease owns an immutable borrowed map until publish/commit or abort.
+NTSTATUS UDFAllocPhysicalExtentLease(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+    IN uint32 PartRef, IN int64 Length, IN uint32 SearchStart, IN uint32 SearchLim,
+    OUT PEXTENT_INFO ExtInfo, IN uint8 AllocFlags, OUT PUDF_ALLOCATION_FAILURE* Lease);
+// Typed lease: a metadata map owns metadata bitmap bits, never parent blocks.
+NTSTATUS UDFAllocExtentLease(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+    IN uint32 PartRef, IN int64 Length, IN uint32 SearchStart, IN uint32 SearchLim,
+    OUT PEXTENT_INFO ExtInfo, IN uint8 AllocFlags, OUT PUDF_ALLOCATION_FAILURE* Lease);
+NTSTATUS UDFPublishAllocationLease(IN PVCB Vcb, IN PUDF_ALLOCATION_FAILURE Lease);
+NTSTATUS UDFCommitAllocationLease(IN PVCB Vcb, IN OUT PUDF_ALLOCATION_FAILURE* Lease);
+NTSTATUS UDFAbortAllocationLease(IN PVCB Vcb, IN OUT PUDF_ALLOCATION_FAILURE* Lease,
+    IN NTSTATUS FirstError);
+
+// Segmented unpublished allocation; caller owns Extent.Mapping and Claims.
+NTSTATUS UDFPreparePrivateExtent(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+    IN uint32 PartRef, IN int64 Length, IN uint8 Flags,
+    OUT PEXTENT_INFO Extent, OUT PUDF_PRIVATE_ALLOCATION* Claims);
+NTSTATUS UDFPublishPrivateExtent(IN PVCB Vcb, IN PUDF_PRIVATE_ALLOCATION Claims);
+// Transferred means an independently owned live mapping now owns all claims.
+// FirstError survives cleanup; underlying uncertain leases remain VCB owners.
+NTSTATUS UDFCompletePrivateExtent(IN PVCB Vcb, IN OUT PUDF_PRIVATE_ALLOCATION* Claims,
+    IN BOOLEAN Transferred, IN NTSTATUS FirstError);
 
 // build mapping for Length bytes in FreeSpace
 NTSTATUS UDFAllocFreeExtent_(IN PIRP_CONTEXT IrpContext,
                             IN PVCB Vcb,
+                            IN uint32 PartRef,
                             IN int64 Length,
                             IN uint32 SearchStart,
                             IN uint32 SearchLim,
@@ -401,9 +392,9 @@ NTSTATUS UDFAllocFreeExtent_(IN PIRP_CONTEXT IrpContext,
                             );
 
 #ifdef UDF_TRACK_ALLOC_FREE_EXTENT
-#define UDFAllocFreeExtent(v, l, ss, sl, e, af)  UDFAllocFreeExtent_(v, l, ss, sl, e, af, UDF_BUG_CHECK_ID, __LINE__)
+#define UDFAllocFreeExtent(c, v, p, l, ss, sl, e, af)  UDFAllocFreeExtent_(c, v, p, l, ss, sl, e, af, UDF_BUG_CHECK_ID, __LINE__)
 #else //UDF_TRACK_ALLOC_FREE_EXTENT
-#define UDFAllocFreeExtent(c, v, l, ss, sl, e, af)  UDFAllocFreeExtent_(c, v, l, ss, sl, e, af)
+#define UDFAllocFreeExtent(c, v, p, l, ss, sl, e, af)  UDFAllocFreeExtent_(c, v, p, l, ss, sl, e, af)
 #endif //UDF_TRACK_ALLOC_FREE_EXTENT
 //
 
@@ -413,25 +404,9 @@ UDFGetPartFreeSpace(IN PVCB Vcb,
 
 #define UDF_PREALLOC_CLASS_DIR   0x00
 
-// try to find cached allocation
-NTSTATUS
-UDFGetCachedAllocation(
-    IN PVCB Vcb,
-    IN uint32 ParentLocation,
-   OUT PEXTENT_INFO Ext,
-   OUT uint32* Items, // optional
-    IN uint32 AllocClass
-    );
-// put released pre-allocation to cache
-NTSTATUS
-UDFStoreCachedAllocation(
-    IN PVCB Vcb,
-    IN uint32 ParentLocation,
-    IN PEXTENT_INFO Ext,
-    IN uint32 Items,
-    IN uint32 AllocClass
-    );
-// discard all cached allocations
+/* No untyped cache admission/transfer API. Existing checkpoint callers
+ * require an empty legacy cache; unexpected owners are retained/refused. */
+// confirm the obsolete allocation cache is empty
 NTSTATUS
 UDFFlushAllCachedAllocations(
     IN PVCB Vcb,
@@ -457,13 +432,18 @@ UDFAllocateFESpace(
     IN uint32 Len
     );
 
+// Borrowed claim map; publish a separate live map before lease commit.
+NTSTATUS UDFAllocateFESpaceLease(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+    IN PUDF_FILE_INFO DirInfo, IN uint32 PartNum, OUT PEXTENT_INFO FEExtInfo,
+    IN uint32 Len, OUT PUDF_ALLOCATION_FAILURE* Lease);
+
 // free space FE's allocation
 void UDFFreeFESpace(IN PVCB Vcb,
                     IN PUDF_FILE_INFO DirInfo,
                     IN PEXTENT_INFO FEExtInfo);
 
 // discard file allocation
-void UDFFreeFileAllocation(IN PVCB Vcb,
+NTSTATUS UDFFreeFileAllocation(IN PVCB Vcb,
                            IN PUDF_FILE_INFO DirInfo,
                            IN PUDF_FILE_INFO FileInfo);
 // convert physical address to logical in specified partition
@@ -484,7 +464,8 @@ UDFBuildShortAllocDescs(
     IN uint32 PartNum,
     OUT int8** Buff,  // data for AllocLoc
     IN uint32 InitSz,
-    IN OUT PUDF_FILE_INFO FileInfo
+    IN OUT PUDF_FILE_INFO FileInfo,
+    OUT uint32* Capacity
     );
 
 // build data for AllocDesc sequence for specified
@@ -495,7 +476,8 @@ UDFBuildLongAllocDescs(
     IN uint32 PartNum,
     OUT int8** Buff,  // data for AllocLoc
     IN uint32 InitSz,
-    IN OUT PUDF_FILE_INFO FileInfo
+    IN OUT PUDF_FILE_INFO FileInfo,
+    OUT uint32* Capacity
     );
 
 // builds FileEntry & associated AllocDescs for specified extent.
@@ -535,8 +517,7 @@ UDFBuildFreeSpaceBitmap(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
     IN uint32 PartNdx,
-    IN PPARTITION_HEADER_DESC phd,
-    IN uint32 Lba
+    IN PPARTITION_HEADER_DESC phd
     );
 
 // fill ExtentInfo for specified FileEntry
@@ -649,11 +630,22 @@ NTSTATUS
 UDFResizeExtent(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
+    IN PUDF_FILE_INFO FileInfo,
     IN uint32 PartNum,
     IN int64 Length,
     IN BOOLEAN AlwaysInIcb,   // must be TRUE for AllocDescs
     OUT PEXTENT_INFO ExtInfo
     );
+
+// Private map/range planning only: caller owns both returned buffers until
+// it explicitly transfers them. No bitmap or live mapping is changed.
+NTSTATUS UDFPrepareExtentShrink(IN PVCB Vcb, IN uint32 PartNum,
+    IN int64 Length, IN BOOLEAN AlwaysInIcb, IN PEXTENT_INFO Source,
+    OUT PEXTENT_INFO Replacement, OUT PUDF_EXTENT_RETIREMENT* Deferred);
+
+// Only after the replacement FE is written; includes the lower barrier.
+NTSTATUS UDFCommitExtentRetirements(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+    IN PUDF_FILE_INFO FileInfo);
 
 // (re)build AllocDescs data  & resize associated extent
 NTSTATUS UDFBuildAllocDescs(
@@ -661,7 +653,8 @@ NTSTATUS UDFBuildAllocDescs(
     IN PVCB Vcb,
     IN uint32 PartNum,
     IN OUT PUDF_FILE_INFO FileInfo,
-    OUT int8** AllocData
+    OUT int8** AllocData,
+    OUT uint32* Capacity
     );
 
 // set informationLength field in (Ext)FileEntry
@@ -676,8 +669,12 @@ int64 UDFGetFileSize(IN PUDF_FILE_INFO FileInfo);
 //
 int64 UDFGetFileSizeFromDirNdx(IN PVCB Vcb,
                                   IN PUDF_FILE_INFO FileInfo);
+// Check the owned FE/EFE buffer and header/EA boundary before any copy.
+NTSTATUS UDFValidateFileEntryBuffer(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo,
+    OUT uint32* HeaderLength);
+
 // set lengthAllocDesc field in (Ext)FileEntry
-void     UDFSetAllocDescLen(IN PVCB Vcb,
+NTSTATUS UDFSetAllocDescLen(IN PVCB Vcb,
                             IN PUDF_FILE_INFO FileInfo);
 // change fileLinkCount field in (Ext)FileEntry
 void     UDFChangeFileLinkCount(IN PUDF_FILE_INFO FileInfo,
@@ -747,12 +744,30 @@ UDFUnlinkFile__(
     IN BOOLEAN FreeSpace
     );
 
+/* Same unlink, exposing whether namespace mutation began to its exact
+ * pending owner. A failed touched generation cannot be cancelled/rebound. */
+NTSTATUS UDFUnlinkFileEx__(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO FileInfo, BOOLEAN FreeSpace, PBOOLEAN NamespaceTouched);
+
 // A named stream with an uncleaned FILE_OBJECT still owns its stream FCB.
 // The caller must hold the VCB against concurrent namespace changes.
 BOOLEAN
 UDFStreamDirectoryHasLiveHandles(
     IN PUDF_FILE_INFO SDirInfo
     );
+
+NTSTATUS UDFAbortStreamDeleteFile(PVCB Vcb, PUDF_DATALOC_INFO Owner,
+                                 PUDF_FILE_INFO* FileInfo);
+NTSTATUS UDFRetainFailedStreamOpen(PVCB Vcb, PUDF_FILE_INFO* FileInfo);
+
+/* Transfer one successful temporary open into/out of a stream operation.
+ * Caller owns VCB and owner directory/base serialization. Reference release
+ * is non-I/O; Dispose permits post-success cold-object cleanup under an
+ * atomic claim. An error-path caller must pass Dispose=FALSE. */
+NTSTATUS UDFOwnStreamDeleteFile(PVCB Vcb, PUDF_DATALOC_INFO Owner,
+                               PUDF_FILE_INFO FileInfo);
+NTSTATUS UDFReleaseStreamDeleteFile(PVCB Vcb, PUDF_DATALOC_INFO Owner,
+                                   PUDF_FILE_INFO* FileInfo, BOOLEAN Dispose);
 
 // drop the stream directory (all named streams) of a file that itself survives
 // (overwrite/supersede). Requires exclusive Vcb access.
@@ -763,7 +778,7 @@ UDFDeleteAllStreams(
     IN PUDF_FILE_INFO FileInfo
     );
 
-// delete all files in directory (FreeSpace = TRUE)
+// Synchronous deletion of supported named streams in a stream directory.
 NTSTATUS
 UDFUnlinkAllFilesInDir(
     IN PIRP_CONTEXT IrpContext,
@@ -812,7 +827,8 @@ UDFCreateFile__(
     IN BOOLEAN Extended,
     IN BOOLEAN CreateNew,
     IN OUT PUDF_FILE_INFO DirInfo,
-    OUT PUDF_FILE_INFO* _FileInfo
+    OUT PUDF_FILE_INFO* _FileInfo,
+    OUT PBOOLEAN FreshFileCreated
     );
 
 // A Dloc owns unpublished, contiguous directory appends until FE flush.
@@ -988,7 +1004,9 @@ UDFRenameMoveFile__(
     //    IN uint32 ExtAttrSz,
     IN OUT PUDF_FILE_INFO DirInfo1,
     IN OUT PUDF_FILE_INFO DirInfo2,
-    IN OUT PUDF_FILE_INFO FileInfo // source (opened)
+    IN OUT PUDF_FILE_INFO FileInfo, // source (opened)
+    OUT PBOOLEAN NamespaceChanged,
+    OUT PBOOLEAN TargetRemoved
     );
 
 // change file size (on disc)
@@ -1043,8 +1061,6 @@ NTSTATUS UDFOverlayDeletePrefreePhysical(IN PVCB Vcb,
 NTSTATUS UDFOverlayDeletePrefreeMetadata(IN PVCB Vcb,
     IN OUT int8* Bitmap, IN uint32 BitCount);
 VOID UDFReleaseDeletePrefreeRecords(IN PVCB Vcb);
-VOID UDFAbandonDeletePrefreeDloc(IN PVCB Vcb,
-    IN PUDF_DATALOC_INFO Dloc);
 
 NTSTATUS
 UDFOpenMetadataFile(
@@ -1056,11 +1072,16 @@ UDFOpenMetadataFile(
     OUT PUDF_FILE_INFO* FileInfo
 );
 
-void
+NTSTATUS
 UDFReleaseMetadata(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb
 );
+
+NTSTATUS UDFHoldResidualNonAlloc(IN PVCB Vcb);
+NTSTATUS UDFCheckpointResidualFiles(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb);
+/* Checked clean internal owners only. Never invokes a close/flush helper. */
+NTSTATUS UDFRetireResidualFiles(IN PVCB Vcb);
 
 // get volume free space
 int64
@@ -1293,34 +1314,51 @@ UDFHardLinkFile__(
     IN PUNICODE_STRING fn,     // destination
     IN OUT PUDF_FILE_INFO DirInfo1,
     IN OUT PUDF_FILE_INFO DirInfo2,
-    IN OUT PUDF_FILE_INFO FileInfo  // source (opened)
+    IN OUT PUDF_FILE_INFO FileInfo, // source (opened)
+    OUT PBOOLEAN TargetRemoved,
+    OUT PBOOLEAN LinkCreated
     );
 
 //
 LONG     UDFFindDloc(IN PVCB Vcb,
                      IN uint32 Lba);
+LONG     UDFFindDlocInMem(IN PVCB Vcb,
+                          IN PUDF_DATALOC_INFO Dloc);
 //
 LONG     UDFFindFreeDloc(IN PVCB Vcb,
                          IN uint32 Lba);
 //
-NTSTATUS UDFAcquireDloc(IN PVCB Vcb,
-                        IN PUDF_DATALOC_INFO Dloc);
-//
-NTSTATUS UDFReleaseDloc(IN PVCB Vcb,
-                        IN PUDF_DATALOC_INFO Dloc);
-//
 NTSTATUS UDFStoreDloc(IN PVCB Vcb,
                       IN PUDF_FILE_INFO fi,
                       IN uint32 Lba);
+
+NTSTATUS UDFCreateDloc(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo, IN uint32 Lba);
+NTSTATUS UDFCompleteFileInfoConstruction(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo);
+VOID UDFDropFileInfoConstruction(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo);
+NTSTATUS UDFSetFileInfoConstructionParent(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo,
+                                          IN PUDF_FILE_INFO Parent OPTIONAL);
+NTSTATUS UDFReferenceFileChecked(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo);
+NTSTATUS UDFDereferenceFileChecked(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo);
+/* Caller holds VCB shared/exclusive. Consume one CREATE traversal/open
+ * reference without I/O; CloseLater retains its normal final metadata work.
+ * A refused decrement transfers the token to explicit failed-open inventory. */
+NTSTATUS UDFReleaseCreateReference(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+    IN OUT PUDF_FILE_INFO* OpenReference, IN BOOLEAN CloseLater);
+NTSTATUS UDFCompleteFileClose(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+                              IN PUDF_FILE_INFO FileInfo);
+NTSTATUS UDFReferenceClonedFile(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo,
+                               IN PUDF_FILE_INFO Source);
+uint32 UDFCleanUpFileForFcb(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo,
+                           OUT PNTSTATUS CleanupStatus);
+NTSTATUS UDFReapFailedFileInfos(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb);
+NTSTATUS UDFReleaseInternalFile(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+                                IN OUT PUDF_FILE_INFO* FileInfo);
+BOOLEAN UDFHasRetainedDlocs(IN PVCB Vcb);
 //
-NTSTATUS UDFRemoveDloc(IN PVCB Vcb,
-                       IN PUDF_DATALOC_INFO Dloc);
-//
-NTSTATUS UDFUnlinkDloc(IN PVCB Vcb,
-                       IN PUDF_DATALOC_INFO Dloc);
-//
-void     UDFFreeDloc(IN PVCB Vcb,
-                     IN PUDF_DATALOC_INFO Dloc);
+// VCB exclusive, current thread owns CleanupOwner. No shell/buffer free.
+// Check first while indexed; detach only after all fallible release work.
+NTSTATUS UDFCheckDlocCleanup(IN PVCB Vcb, IN PUDF_FILE_INFO FileInfo,
+                             IN BOOLEAN Detach);
 //
 void     UDFRelocateDloc(IN PVCB Vcb,
                          IN PUDF_DATALOC_INFO Dloc,
@@ -1333,10 +1371,13 @@ PUDF_FILE_INFO UDFLocateParallelFI(PUDF_FILE_INFO di,  // parent FileInfo
                                    PUDF_FILE_INFO fi);
 //
 PUDF_FILE_INFO UDFLocateAnyParallelFI(PUDF_FILE_INFO fi);   // FileInfo to start search from
+/* VCB/FCB namespace resources must serialize the FI ring and its owners. */
+BOOLEAN UDFHasLiveFileInfoPeer(PUDF_FILE_INFO FileInfo);
 //
 void UDFInsertLinkedFile(PUDF_FILE_INFO fi,   // FileInfo to be added to chain
                          PUDF_FILE_INFO fi2);   // any FileInfo fro the chain
-//
+// Internal constructor: success remains UNDER_INIT/Constructing. Its sole
+// stream-create caller binds an exact parent/owner before completing the FI.
 NTSTATUS
 UDFCreateRootFile__(
     IN PIRP_CONTEXT IrpContext,
@@ -1415,6 +1456,17 @@ __fastcall UDFPartLen(PVCB Vcb,
 uint32
 __fastcall UDFGetLastPhysPartRef(PVCB Vcb);
 
+/* Create under the metadata writer domain. Installation consumes the new
+ * publication reference; readers never borrow the mutable FI mappings. */
+NTSTATUS UDFCreateMetadataView(IN PVCB Vcb, IN PEXTENT_MAP MainMap,
+    IN PEXTENT_MAP MirrorMap, OUT PUDF_METADATA_VIEW* View);
+PUDF_METADATA_VIEW UDFAcquireMetadataView(IN PVCB Vcb);
+VOID UDFReleaseMetadataView(IN PUDF_METADATA_VIEW View);
+VOID UDFInstallMetadataView(IN PVCB Vcb, IN PUDF_METADATA_VIEW View);
+uint32 UDFMetadataViewLbaToPhys(IN const UDF_METADATA_VIEW* View,
+    IN uint32 Lbn, IN BOOLEAN Mirror, OUT PSIZE_T AvailLength);
+uint32 UDFMetadataViewPhysToLba(IN const UDF_METADATA_VIEW* View, IN uint32 Lba);
+
 uint32
 __fastcall UDFMetadataLbaToPhys(IN PVCB Vcb,
                                 IN uint32 Lbn,
@@ -1423,10 +1475,7 @@ uint32
 __fastcall UDFPhysLbaToMetadata(IN PVCB Vcb,
                                 IN uint32 Lba);
  
-PEXTENT_MAP
-UDFSplitMetadataMapping(IN PVCB Vcb,
-                        IN PEXTENT_MAP Extent); 
- 
+
 //
 NTSTATUS UDFPretendFileDeleted__(IN PVCB Vcb,
                                  IN PUDF_FILE_INFO FileInfo);
@@ -1555,7 +1604,7 @@ UDFDirIndex(
 
 extern const char hexChar[];
 
-BOOLEAN
+NTSTATUS
 __fastcall
 UDFCheckArea(
     PIRP_CONTEXT IrpContext,

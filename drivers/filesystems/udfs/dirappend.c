@@ -460,7 +460,7 @@ UDFGrowReservedDirectoryFid(PIRP_CONTEXT IrpContext, PVCB Vcb,
         RtlZeroMemory(&extra, sizeof(extra));
         status = UDFOpenIntegrityForWrite(IrpContext, Vcb, FALSE);
         if (NT_SUCCESS(status))
-            status = UDFAllocFreeExtent(IrpContext, Vcb, Vcb->SectorSize,
+            status = UDFAllocFreeExtent(IrpContext, Vcb, part, Vcb->SectorSize,
                         UDFPartStart(Vcb, part), UDFPartEnd(Vcb, part),
                         &extra, dloc->DataLoc.Flags);
         if (NT_SUCCESS(status) && (!extra.Mapping || extra.Offset ||

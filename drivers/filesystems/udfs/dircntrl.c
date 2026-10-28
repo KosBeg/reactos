@@ -356,6 +356,7 @@ UDFQueryDirectory(
 {
     NTSTATUS Status = STATUS_SUCCESS;
     ULONG Information = 0;
+    BOOLEAN VolumeAcquired = FALSE, DirectoryAcquired = FALSE;
 
     ULONG LastEntry = 0;
     ULONG NextEntry = 0;
@@ -418,12 +419,13 @@ UDFQueryDirectory(
 
     UserBuffer = (PUCHAR)UDFMapUserBuffer(Irp);
 
-    // Acquire the directory.
-
-    UDFAcquireFcbShared(IrpContext, Fcb, FALSE);
-
     _SEH2_TRY
     {
+        /* GC of weak child/parent FI entries takes the VCB exclusively. */
+        UDFAcquireVcbShared(IrpContext, Vcb, FALSE);
+        VolumeAcquired = TRUE;
+        UDFAcquireFcbShared(IrpContext, Fcb, FALSE);
+        DirectoryAcquired = TRUE;
         // Verify the Fcb is still good.
 
         UDFVerifyFcbOperation(IrpContext, Fcb, Ccb);
@@ -556,9 +558,7 @@ UDFQueryDirectory(
                 /* The cached DirNdx->FileInfo may be absent.  The FID's ICB
                  * address still identifies this entry's FE, including after
                  * a cold remount.  Match UDFFirstOpenFile's directory bit. */
-                EntryFileId = UDFMakeLargeInteger(
-                    ((LONGLONG)(PhysLba - PartitionRoot)) +
-                    ((LONGLONG)((UINT_PTR)Vcb) << 32));
+                EntryFileId = UDFMakeNtFileId(Vcb, PhysLba, PartitionRoot);
                 if (DirInformation->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
                     SetFlag(EntryFileId.HighPart, FID_DIR_MASK);
             }
@@ -684,7 +684,7 @@ try_exit:   NOTHING;
 
     } _SEH2_FINALLY {
 
-        if (!_SEH2_AbnormalTermination() && !NT_ERROR(Status)) {
+        if (DirectoryAcquired && !_SEH2_AbnormalTermination() && !NT_ERROR(Status)) {
 
             // Update the CCB to show the current state of the enumeration.
 
@@ -704,7 +704,10 @@ try_exit:   NOTHING;
 
         if (DirInformation) MyFreePool__(DirInformation);
 
-        UDFReleaseFcb(IrpContext, Fcb);
+        if (DirectoryAcquired)
+            UDFReleaseFcb(IrpContext, Fcb);
+        if (VolumeAcquired)
+            UDFReleaseVcb(IrpContext, Vcb);
     } _SEH2_END;
 
     Irp->IoStatus.Information = Information;
@@ -909,7 +912,7 @@ UDFNotifyReportChange(
             !RelativeOpen && !ShortNameLink) {
             FullPath = FileObject->FileName;
         } else if (Lcb) {
-            NTSTATUS Status = UDFBuildFullPathFromLcb(NULL, Lcb, &FullPath, FALSE);
+            NTSTATUS Status = UDFBuildFullPathFromLcb(NULL, Lcb, &FullPath);
             if (NT_SUCCESS(Status)) {
                 PathAllocated = TRUE;
             }

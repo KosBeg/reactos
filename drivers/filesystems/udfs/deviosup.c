@@ -43,6 +43,7 @@ UDFLookupAllocation(
     _In_ PIRP_CONTEXT IrpContext,
     _In_ PFCB Fcb,
     _In_ LONGLONG FileOffset,
+    _In_ ULONG RequestedBytes,
     _Out_ PLONGLONG DiskOffset,
     _Out_ PULONG ByteCount
     );
@@ -94,15 +95,6 @@ UDFFinishBuffers(
     _In_ BOOLEAN FinalCleanup
     );
 
-static
-NTSTATUS
-UDFConvertToRecorded(
-    _In_ PIRP_CONTEXT IrpContext,
-    _In_ PFCB Fcb,
-    _In_ LONGLONG StartingOffset,
-    _In_ ULONG ByteCount
-    );
-
 IO_COMPLETION_ROUTINE UDFSingleSyncCompletionRoutine;
 IO_COMPLETION_ROUTINE UDFSingleAsyncCompletionRoutine;
 IO_COMPLETION_ROUTINE UDFMultiSyncCompletionRoutine;
@@ -151,10 +143,19 @@ UDFNonCachedIo(
     BOOLEAN FlushIoBuffers = FALSE;
     BOOLEAN FirstPass = TRUE;
     BOOLEAN IsWrite = (IrpContext->MajorFunction == IRP_MJ_WRITE);
+    BOOLEAN Wait = BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT);
 
     //  Validate preconditions.
 
-    ASSERT(IrpContext->Irp->MdlAddress != NULL);
+    if (!ByteCount) {
+        IrpContext->Irp->IoStatus.Status = STATUS_SUCCESS;
+        IrpContext->Irp->IoStatus.Information = 0;
+        return STATUS_SUCCESS;
+    }
+    if (!IrpContext->Irp->MdlAddress ||
+        ByteCount > MmGetMdlByteCount(IrpContext->Irp->MdlAddress) ||
+        StartingOffset < 0 || (uint64)StartingOffset + ByteCount > MAXLONGLONG)
+        return STATUS_INVALID_PARAMETER;
 
     // I/O when (volume offset == device offset) must be sector aligned.
     if (Fcb == Fcb->Vcb->VolumeDasdFcb) 
@@ -178,13 +179,8 @@ UDFNonCachedIo(
         return STATUS_PENDING;
     }
 
-    //  For writes with a sub-sector tail (e.g. paging I/O truncated to
-    //  FileSize), round up to a full sector.  The MDL covers whole pages
-    //  and MM zero-fills beyond FileSize, so the extra bytes are zeros.
-
-    if (IsWrite && UdfSectorOffset(Fcb->Vcb, ByteCount)) {
-        ByteCount = UdfSectorAlign(Fcb->Vcb, ByteCount);
-    }
+    /* Never round the request into bytes not supplied by this MDL. Partial
+     * write sectors use the synchronous extent writer's initialized/RMW path. */
 
     RemainingByteCount = ByteCount;
 
@@ -215,8 +211,8 @@ UDFNonCachedIo(
     IrpContext->Vcb = Vcb;
 
     //
-    //  For writes: pre-scan extents and convert NOT_RECORDED to RECORDED
-    //  if needed.  This must happen before building I/O runs.
+    //  Pre-scan writes without changing mapping state. New or unaligned
+    //  ranges use the extent writer, which activates them after complete I/O.
     //
 
     if (IsWrite) {
@@ -224,7 +220,8 @@ UDFNonCachedIo(
         LONGLONG ScanOffset = StartingOffset;
         ULONG ScanRemaining = ByteCount;
         ULONG ScanUserOffset = 0;
-        BOOLEAN NeedConversion = FALSE;
+        BOOLEAN NeedExtentWrite = UdfSectorOffset(Vcb, StartingOffset) ||
+                                  UdfSectorOffset(Vcb, ByteCount);
         LONGLONG DiskOffset;
         ULONG CurrentByteCount;
 
@@ -232,6 +229,7 @@ UDFNonCachedIo(
 
             BOOLEAN Recorded = UDFLookupAllocation(IrpContext, Fcb,
                                                    ScanOffset,
+                                                   ScanRemaining,
                                                    &DiskOffset,
                                                    &CurrentByteCount);
 
@@ -248,36 +246,35 @@ UDFNonCachedIo(
                 return STATUS_DISK_FULL;
             }
 
-            if (!Recorded) {
-                NeedConversion = TRUE;
-            } else {
-                ASSERT(!UdfSectorOffset(Vcb, DiskOffset));
-            }
-
-            ASSERT(!UdfSectorOffset(Vcb, ScanUserOffset));
+            if (!Recorded || UdfSectorOffset(Vcb, DiskOffset) ||
+                UdfSectorOffset(Vcb, CurrentByteCount) ||
+                UdfSectorOffset(Vcb, ScanUserOffset))
+                NeedExtentWrite = TRUE;
 
             ScanRemaining -= CurrentByteCount;
             ScanOffset += CurrentByteCount;
             ScanUserOffset += CurrentByteCount;
         }
 
-        if (NeedConversion) {
-
-            ASSERT(!UdfSectorOffset(Vcb, ByteCount));
-
-            Status = UDFConvertToRecorded(IrpContext, Fcb,
-                                          StartingOffset, ByteCount);
-
-            if (!NT_SUCCESS(Status)) {
-                return Status;
-            }
+        if (NeedExtentWrite) {
+            SIZE_T Written = 0;
+            /* No map mutation or synchronous lower write may start in
+             * the nonwait path. The existing exception/post dispatcher retries
+             * under WAIT; no request buffer or allocation has changed yet. */
+            if (!Wait)
+                UDFRaiseStatus(IrpContext, STATUS_CANT_WAIT);
+            Status = UDFWriteExtent(IrpContext, Vcb, ExtInfo, StartingOffset,
+                                      ByteCount, FALSE, (int8*)UserBuffer, &Written);
+            if (Written > ByteCount || (NT_SUCCESS(Status) && Written != ByteCount))
+                Status = STATUS_IO_DEVICE_ERROR;
+            IrpContext->Irp->IoStatus.Information = min(Written, (SIZE_T)ByteCount);
+            IrpContext->Irp->IoStatus.Status = Status;
+            return Status;
         }
     }
 
     //  The caller must have set up the IoContext before calling us.
     //  (Stack-allocated for sync, pool-allocated for async.)
-
-    BOOLEAN Wait = BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT);
 
     ASSERT(IrpContext->IoContext != NULL);
 
@@ -464,160 +461,75 @@ UDFLookupAllocation(
     _In_ PIRP_CONTEXT IrpContext,
     _In_ PFCB Fcb,
     _In_ LONGLONG FileOffset,
+    _In_ ULONG RequestedBytes,
     _Out_ PLONGLONG DiskOffset,
     _Out_ PULONG ByteCount
     )
 {
     PVCB Vcb = Fcb->Vcb;
     PUDF_FILE_INFO FileInfo = Fcb->FileInfo;
-    PEXTENT_INFO ExtInfo = &FileInfo->Dloc->DataLoc;
-    PEXTENT_MAP Extent = ExtInfo->Mapping;
-
-    uint32 SectorOff, Flags, Index;
+    PEXTENT_INFO ExtInfo;
+    PEXTENT_MAP RelocExtent;
+    uint32 SectorOff, Flags, Index, Lba, BlockCount;
     SIZE_T AvailLength;
+    uint64 Covered;
+    NTSTATUS Status;
 
     UNREFERENCED_PARAMETER(IrpContext);
-
-    uint32 Lba = UDFExtentOffsetToLba(Vcb, Extent, FileOffset,
-                                      &SectorOff, &AvailLength, &Flags, &Index);
-
-    if (Lba == LBA_OUT_OF_EXTENT) {
-
-        //  Past end of extent — treat as unrecorded.
-
-        *DiskOffset = 0;
-        *ByteCount = 0;
+    *DiskOffset = 0;
+    *ByteCount = 0;
+    if (!RequestedBytes)
         return FALSE;
-    }
-
+    if (!FileInfo || !FileInfo->Dloc || FileOffset < 0)
+        ExRaiseStatus(STATUS_FILE_CORRUPT_ERROR);
+    ExtInfo = &FileInfo->Dloc->DataLoc;
+    if (!ExtInfo->Mapping || !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift))
+        ExRaiseStatus(STATUS_FILE_CORRUPT_ERROR);
+    Lba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, FileOffset,
+                               &SectorOff, &AvailLength, &Flags, &Index);
+    if (Lba == LBA_OUT_OF_EXTENT)
+        return FALSE; /* caller distinguishes zero advancement from a sparse run */
+    if (!AvailLength || AvailLength > MAXULONG || SectorOff >= Vcb->SectorSize)
+        ExRaiseStatus(STATUS_FILE_CORRUPT_ERROR);
+    /* Validate only the currently requested cover, not unrelated mapping
+     * entries later in a potentially gigabyte-sized cached extent. */
+    AvailLength = min(AvailLength, (SIZE_T)RequestedBytes);
     *ByteCount = (ULONG)AvailLength;
-
-    if (Flags != EXTENT_RECORDED_ALLOCATED) {
-
-        //  Unrecorded / not-allocated — sparse.
-
-        *DiskOffset = 0;
+    if (Flags == EXTENT_NOT_RECORDED_ALLOCATED ||
+        Flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED)
         return FALSE;
+    if (Flags != EXTENT_RECORDED_ALLOCATED) {
+        *ByteCount = 0;
+        ExRaiseStatus(STATUS_FILE_CORRUPT_ERROR);
     }
 
-    //  Apply sector relocation (sparing table / VAT).
-
-    uint32 BlockCount = (uint32)(AvailLength >> Vcb->SectorShift);
-
-    PEXTENT_MAP RelocExtent = UDFRelocateSectors(Vcb, Lba, BlockCount);
-    if (RelocExtent == NULL) {
-
-        //  Allocation failure — fall back to buffered path.
-
-        *DiskOffset = 0;
+    /* Cover the partial first sector too. Truncating AvailLength alone
+     * skipped translation for sub-sector reads and lost the last sector. */
+    Covered = (uint64)SectorOff + AvailLength;
+    BlockCount = (uint32)((Covered + Vcb->SectorSize - 1) >> Vcb->SectorShift);
+    Status = UDFMapVolumeSectorSpan(Vcb, Lba, BlockCount, &RelocExtent);
+    if (!NT_SUCCESS(Status)) {
         *ByteCount = 0;
-        return FALSE;
+        ExRaiseStatus(Status); /* retain corruption/resource/unsupported provenance */
     }
     if (RelocExtent != UDF_NO_EXTENT_MAP) {
-
-        //  Sectors were relocated — use the first fragment only;
-        //  the caller will re-enter for subsequent fragments.
-
+        uint32 RunBytes = RelocExtent->extLength;
         Lba = RelocExtent->extLocation;
-        AvailLength = RelocExtent->extLength;
-        *ByteCount = (ULONG)AvailLength;
         MyFreePool__(RelocExtent);
+        if (RunBytes <= SectorOff) {
+            *ByteCount = 0;
+            ExRaiseStatus(STATUS_FILE_CORRUPT_ERROR);
+        }
+        *ByteCount = (ULONG)min(AvailLength, (SIZE_T)(RunBytes - SectorOff));
     }
-
-    //  Fixed-packet address translation (no-op on non-FP media).
-
     Lba = UDFFixFPAddress(Vcb, Lba);
-
-    //  Recorded extent — compute the disk byte offset including
-    //  any sub-sector offset.
-
-    *DiskOffset = (((LONGLONG)Lba) << Vcb->SectorShift) + SectorOff;
-
-    return TRUE;
-}
-
-/*************************************************************************
-*
-* Function: UDFConvertToRecorded()
-*
-* Description:
-*   Pre-pass for writes: converts NOT_RECORDED_NOT_ALLOCATED and
-*   NOT_RECORDED_ALLOCATED extents in the given range to
-*   RECORDED_ALLOCATED so that direct I/O dispatch can proceed.
-*
-*   The caller must ensure the write range is fully sector-aligned
-*   (no partial-sector zero padding is performed here).
-*
-*   Note: this may reallocate the extent mapping (ExtInfo->Mapping).
-*
-*************************************************************************/
-
-static
-NTSTATUS
-UDFConvertToRecorded(
-    _In_ PIRP_CONTEXT IrpContext,
-    _In_ PFCB Fcb,
-    _In_ LONGLONG StartingOffset,
-    _In_ ULONG ByteCount
-    )
-{
-    NTSTATUS Status;
-    PVCB Vcb = Fcb->Vcb;
-    PEXTENT_INFO ExtInfo = &Fcb->FileInfo->Dloc->DataLoc;
-    PEXTENT_MAP Extent;
-
-    LONGLONG CurrentOffset = StartingOffset;
-    ULONG Remaining = ByteCount;
-
-    uint32 SectorOff, Flags, Index;
-    SIZE_T AvailLength;
-    ULONG ThisByteCount;
-
-    while (Remaining != 0) {
-
-        Extent = ExtInfo->Mapping;
-
-        UDFExtentOffsetToLba(Vcb, Extent, CurrentOffset,
-                             &SectorOff, &AvailLength, &Flags, &Index);
-
-        ThisByteCount = (ULONG)AvailLength;
-
-        if (ThisByteCount > Remaining) {
-            ThisByteCount = Remaining;
-        }
-
-        if (Flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
-
-            Status = UDFMarkNotAllocatedAsAllocated(IrpContext, Vcb,
-                         CurrentOffset, ThisByteCount, ExtInfo);
-
-            if (!NT_SUCCESS(Status)) {
-                return Status;
-            }
-
-            //  Mapping pointer may have changed — re-read flags.
-
-            Extent = ExtInfo->Mapping;
-
-            UDFExtentOffsetToLba(Vcb, Extent, CurrentOffset,
-                                 &SectorOff, &AvailLength, &Flags, &Index);
-        }
-
-        if (Flags == EXTENT_NOT_RECORDED_ALLOCATED) {
-
-            Status = UDFMarkAllocatedAsRecorded(Vcb,
-                         CurrentOffset, ThisByteCount, ExtInfo);
-
-            if (!NT_SUCCESS(Status)) {
-                return Status;
-            }
-        }
-
-        Remaining -= ThisByteCount;
-        CurrentOffset += ThisByteCount;
+    if (Lba == LBA_OUT_OF_EXTENT) {
+        *ByteCount = 0;
+        ExRaiseStatus(STATUS_FILE_CORRUPT_ERROR);
     }
-
-    return STATUS_SUCCESS;
+    *DiskOffset = (((LONGLONG)Lba) << Vcb->SectorShift) + SectorOff;
+    return TRUE;
 }
 
 /*************************************************************************
@@ -691,6 +603,7 @@ UDFPrepareBuffers(
         Recorded = UDFLookupAllocation(IrpContext,
                                        Fcb,
                                        CurrentFileOffset,
+                                       RemainingByteCount,
                                        &DiskOffset,
                                        &CurrentByteCount);
 
@@ -992,6 +905,8 @@ UDFSingleAsync(
         CompletionRoutine = UDFSingleAsyncCompletionRoutine;
     }
 
+    IrpContext->IoContext->SynchronousIrpContext =
+        FlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT) ? IrpContext : NULL;
     IrpContext->IoContext->ExpectedByteCount = ByteCount;
     IoSetCompletionRoutine(IrpContext->Irp,
                            CompletionRoutine,
@@ -1047,6 +962,7 @@ UDFMultipleAsync(
     PIRP MasterIrp;
     ULONG UnwindRunCount;
 
+    IrpContext->IoContext->SynchronousIrpContext = IrpContext;
     MasterIrp = IrpContext->Irp;
 
     //
@@ -1213,10 +1129,12 @@ UDFSingleSyncCompletionRoutine(
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    if (NT_SUCCESS(Irp->IoStatus.Status) &&
-        Irp->IoStatus.Information != ((PUDF_IO_CONTEXT)Context)->ExpectedByteCount) {
+    if (Irp->IoStatus.Status == STATUS_PENDING || (NT_SUCCESS(Irp->IoStatus.Status) &&
+        Irp->IoStatus.Information != ((PUDF_IO_CONTEXT)Context)->ExpectedByteCount)) {
         Irp->IoStatus.Status = STATUS_IO_DEVICE_ERROR;
     }
+    UDFRecordLowerIoError(((PUDF_IO_CONTEXT)Context)->SynchronousIrpContext,
+                          Irp->IoStatus.Status);
     if (!NT_SUCCESS(Irp->IoStatus.Status)) {
         Irp->IoStatus.Information = 0;
     }
@@ -1254,9 +1172,15 @@ UDFSingleAsyncCompletionRoutine(
     //  zero on error.
     //
 
-    if (NT_SUCCESS(Irp->IoStatus.Status) &&
-        Irp->IoStatus.Information != IoContext->ExpectedByteCount) {
+    if (Irp->IoStatus.Status == STATUS_PENDING ||
+        (NT_SUCCESS(Irp->IoStatus.Status) &&
+         Irp->IoStatus.Information != IoContext->ExpectedByteCount)) {
         Irp->IoStatus.Status = STATUS_IO_DEVICE_ERROR;
+    }
+    if (IoContext->ZeroReadLength) {
+        /* Even an errored/short transfer can have filled this tail with
+         * physical bytes beyond VDL. Never expose them at completion. */
+        RtlZeroMemory(IoContext->ZeroReadBuffer, IoContext->ZeroReadLength);
     }
     Irp->IoStatus.Information = 0;
 
@@ -1318,11 +1242,12 @@ UDFMultiSyncCompletionRoutine(
 
     /* Our own stack retains this run's physical length while the lower
      * stack is used by the target device. Runs can complete out of order. */
-    if (NT_SUCCESS(Irp->IoStatus.Status) &&
+    if (Irp->IoStatus.Status == STATUS_PENDING || (NT_SUCCESS(Irp->IoStatus.Status) &&
         Irp->IoStatus.Information !=
-            IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length) {
+            IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length)) {
         Irp->IoStatus.Status = STATUS_IO_DEVICE_ERROR;
     }
+    UDFRecordLowerIoError(IoContext->SynchronousIrpContext, Irp->IoStatus.Status);
     if (!NT_SUCCESS(Irp->IoStatus.Status)) {
 
         InterlockedCompareExchange(&IoContext->Status,
@@ -1440,3 +1365,137 @@ UDFPerformDevIoCtrl(
 
     return Status;
 } // end UDFPerformDevIoCtrl()
+
+/* Bitmap stream mapping is immutable from publication until its cache and
+ * admitted paging I/O have drained. Never round a short caller buffer up to
+ * a sector or silently accept an MCB hole after the first physical run. */
+static NTSTATUS
+UDFLookupBitmapIoRun(PVCB Vcb, LONGLONG Position, ULONG Remaining,
+                     PLONGLONG DiskOffset, PULONG Chunk)
+{
+    LONGLONG Psn, Sectors, Vbn = Position >> Vcb->SectorShift;
+    ULONGLONG RunBytes;
+    ULONG InSector = (ULONG)(Position & (Vcb->SectorSize - 1));
+    if (!FsRtlLookupLargeMcbEntry(&Vcb->BitmapMcb, Vbn, &Psn, &Sectors,
+                                 NULL, NULL, NULL) || Psn < 0 || Psn > MAXULONG ||
+        Sectors <= 0 || (ULONGLONG)Sectors > ((ULONGLONG)MAXLONGLONG >> Vcb->SectorShift))
+        return STATUS_NONEXISTENT_SECTOR;
+    RunBytes = ((ULONGLONG)Sectors << Vcb->SectorShift) - InSector;
+    *Chunk = (ULONG)min((ULONGLONG)Remaining, RunBytes);
+    if (!*Chunk ||
+        (((ULONGLONG)InSector + *Chunk - 1) >> Vcb->SectorShift) > MAXULONG - (ULONGLONG)Psn)
+        return STATUS_DISK_CORRUPT_ERROR;
+    *DiskOffset = (Psn << Vcb->SectorShift) + InSector;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+UDFBeginBitmapFlush(PVCB Vcb)
+{
+    KIRQL SavedIrql;
+    NTSTATUS Status = STATUS_SUCCESS;
+    KeAcquireSpinLock(&Vcb->BitmapIoLock, &SavedIrql);
+    if (Vcb->BitmapIoStopped || Vcb->BitmapIoCount ||
+        (Vcb->BitmapCacheState != UdfBitmapCacheActive &&
+         Vcb->BitmapCacheState != UdfBitmapCacheQuiescing))
+        Status = STATUS_DEVICE_BUSY;
+    else
+        InterlockedExchange(&Vcb->BitmapIoError, STATUS_SUCCESS);
+    KeReleaseSpinLock(&Vcb->BitmapIoLock, SavedIrql);
+    return Status;
+}
+
+NTSTATUS
+UDFBitmapStreamIo(PIRP_CONTEXT IrpContext, PVCB Vcb, BOOLEAN Write,
+                  LONGLONG Offset, ULONG Length, PVOID Buffer, PULONG Transferred)
+{
+    KIRQL SavedIrql;
+    PFCB Fcb;
+    LONGLONG Size, Allocation, Position;
+    ULONG Actual, Remaining, Chunk;
+    LONGLONG DiskOffset;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    *Transferred = 0;
+    if (!Length) return STATUS_SUCCESS;
+    if (!Buffer || Offset < 0 || Length > MAXLONGLONG - Offset ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 32 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift))
+        return STATUS_INVALID_PARAMETER;
+    KeAcquireSpinLock(&Vcb->BitmapIoLock, &SavedIrql);
+    Fcb = Vcb->BitmapFcb;
+    if (Vcb->BitmapIoStopped || !Fcb || Vcb->BitmapIoCount == MAXLONG) {
+        KeReleaseSpinLock(&Vcb->BitmapIoLock, SavedIrql);
+        return STATUS_FILE_CLOSED;
+    }
+    if (!Vcb->BitmapIoCount++) KeClearEvent(&Vcb->BitmapIoDrained);
+    KeReleaseSpinLock(&Vcb->BitmapIoLock, SavedIrql);
+    _SEH2_TRY {
+        _SEH2_TRY {
+            /* Bitmap sizes/mapping are fixed before publishing the stream.
+             * Paging EOF clipping is distinct from incomplete MCB coverage. */
+            Size = Fcb->Header.FileSize.QuadPart;
+            Allocation = Fcb->Header.AllocationSize.QuadPart;
+            if (Size < 0 || Allocation < Size) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            if (Offset >= Size) {
+                Status = Write ? STATUS_SUCCESS : STATUS_END_OF_FILE;
+                _SEH2_LEAVE;
+            }
+            Actual = (ULONG)min((LONGLONG)Length, Size - Offset);
+            Position = Offset;
+            Remaining = Actual;
+            /* Preflight every run before the first write. */
+            while (Remaining) {
+                Status = UDFLookupBitmapIoRun(Vcb, Position, Remaining, &DiskOffset, &Chunk);
+                if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+                Remaining -= Chunk;
+                Position += Chunk;
+            }
+            Position = Offset;
+            Remaining = Actual;
+            while (Remaining) {
+                SIZE_T Written = 0;
+                Status = UDFLookupBitmapIoRun(Vcb, Position, Remaining, &DiskOffset, &Chunk);
+                if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+                if (Write) {
+                    Status = UDFWriteData(IrpContext, Vcb, FALSE, DiskOffset,
+                                  Chunk, FALSE, (PCHAR)Buffer + *Transferred, &Written);
+                    if (Written > Chunk) {
+                        Status = STATUS_IO_DEVICE_ERROR;
+                        Written = 0;
+                    }
+                    *Transferred += (ULONG)Written;
+                    if (Status == STATUS_SUCCESS && Written != Chunk)
+                        Status = STATUS_IO_DEVICE_ERROR;
+                } else {
+                    Status = UDFReadData(IrpContext, Vcb, FALSE, DiskOffset,
+                                  Chunk, FALSE, (PCHAR)Buffer + *Transferred);
+                    if (Status == STATUS_SUCCESS) *Transferred += Chunk;
+                }
+                if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+                Remaining -= Chunk;
+                Position += Chunk;
+            }
+        } _SEH2_EXCEPT(UDFExceptionFilter(IrpContext, _SEH2_GetExceptionInformation())) {
+            Status = IrpContext->ExceptionStatus;
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        /* Clear unread paging padding only after all physical reads. */
+        if (!Write && *Transferred < Length)
+            RtlZeroMemory((PCHAR)Buffer + *Transferred, Length - *Transferred);
+        if (Status != STATUS_SUCCESS && NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+        if (Write && Status != STATUS_SUCCESS) {
+            InterlockedCompareExchange(&Vcb->BitmapIoError, Status, STATUS_SUCCESS);
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+        }
+        KeAcquireSpinLock(&Vcb->BitmapIoLock, &SavedIrql);
+        NT_ASSERT(Vcb->BitmapIoCount > 0);
+        if (!--Vcb->BitmapIoCount)
+            KeSetEvent(&Vcb->BitmapIoDrained, IO_NO_INCREMENT, FALSE);
+        KeReleaseSpinLock(&Vcb->BitmapIoLock, SavedIrql);
+    } _SEH2_END;
+    return Status;
+}

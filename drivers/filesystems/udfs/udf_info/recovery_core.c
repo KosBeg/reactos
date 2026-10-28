@@ -784,8 +784,10 @@ GraphRecordUniqueId(RECOVERY_GRAPH *graph, uint64_t id, int root)
     return UdfsRecoveryProbeValidLayout;
 }
 
-/* The recovery namespace checker deliberately supports ASCII names only.
- * Ordinary clean mounts retain the full driver's Unicode/hard-link support.
+/* This recovery namespace checker deliberately supports ASCII names only.
+ * The ordinary mount/driver namespace paths are separate; this bound is not
+ * evidence that every Unicode/hard-link operation there is implemented or
+ * verified. Hard-link creation remains conditional in the driver.
  * Do not approximate an unknown Unicode collation during crash recovery. */
 static UDFS_RECOVERY_PROBE_STATUS
 RecoveryName(const uint8_t *fid, uint8_t name[255], uint32_t *length,
@@ -2251,8 +2253,13 @@ ReadRecoveryDescriptors(const UDFS_RECOVERY_READER *reader,
             break;
         case 6:
             if (haveLvd) return UdfsRecoveryProbeUnsupported;
-            /* Include the complete supported partition map in the CRC. */
-            if (Read16(sector + 10) < 510 - 16)
+            /* Validate the declared LVD before deciding whether its map
+             * profile supports recovery. A valid one-map UDF 2.01 LVD is
+             * shorter than the two-map metadata profile; it is unsupported
+             * here, not evidence of a corrupt volume/read-only mount. */
+            if (Read16(sector + 10) < 440 - 16 ||
+                Read32(sector + 264) > UDFS_RECOVERY_SECTOR_SIZE - 440 ||
+                Read16(sector + 10) < 440 - 16 + Read32(sector + 264))
                 return UdfsRecoveryProbeCorrupt;
             memcpy(lvd, sector, UDFS_RECOVERY_SECTOR_SIZE);
             haveLvd = 1;

@@ -97,9 +97,20 @@ __inline LARGE_INTEGER UDFMakeLargeInteger(LONGLONG value) {
     return result;
 }
 
+/* Preserve the existing mount-local 32+32-bit file-ID format without a
+ * signed shift/overflow of a 64-bit kernel pointer. Root is supplied at the
+ * call site, after the full UDFPartStart prototype has been included. */
+__inline LARGE_INTEGER
+UDFMakeNtFileId(PVCB Vcb, ULONG PhysicalLba, ULONG Root)
+{
+    LARGE_INTEGER Id;
+    Id.LowPart = PhysicalLba - Root;
+    Id.HighPart = (LONG)(ULONG)(UINT_PTR)Vcb;
+    return Id;
+}
+
 #define UDFGetNTFileId(Vcb, fi) \
-    UDFMakeLargeInteger((((fi)->Dloc->FELoc.Mapping[0].extLocation - UDFPartStart(Vcb, -2)) + \
-                      ((LONGLONG)((UINT_PTR)Vcb)<<32)))
+    UDFMakeNtFileId((Vcb), (fi)->Dloc->FELoc.Mapping[0].extLocation, UDFPartStart((Vcb), -2))
 
 #define UnicodeIsPrint(a) RtlIsValidOemCharacter(&(a))
 

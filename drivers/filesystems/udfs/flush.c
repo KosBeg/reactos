@@ -76,6 +76,47 @@ UDFRememberFlushStatus(PIO_STATUS_BLOCK IoStatus, NTSTATUS Status)
         IoStatus->Status = Status;
 }
 
+/* VCB ownership keeps the canonical FCB alive, but paging I/O also uses
+ * Main without the VCB. A tree flush therefore needs the same per-file
+ * writer resource as an ordinary flush before serializing FE/AED state.
+ * Never retain a parent's resource across recursive child traversal. */
+static NTSTATUS
+UDFAcquireMetadataFlushFcb(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO FileInfo, PFCB* Held)
+{
+    PFCB Fcb;
+    *Held = NULL;
+    if (!FileInfo) return STATUS_SUCCESS;
+    if (!FileInfo->Dloc) return STATUS_FILE_INVALID;
+    Fcb = FileInfo->Dloc->CommonFcb;
+    if (!Fcb) return STATUS_SUCCESS; /* private metadata has only VCB ownership */
+    if (Fcb->Vcb != Vcb || !Fcb->FcbNonpaged || !Fcb->FileInfo ||
+        Fcb->FileInfo->Dloc != FileInfo->Dloc)
+        return STATUS_FILE_INVALID;
+    if (ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource))
+        return STATUS_SUCCESS;
+    if (ExIsResourceAcquiredSharedLite(&Fcb->FcbNonpaged->FcbResource))
+        return STATUS_INVALID_DEVICE_STATE; /* never upgrade a borrowed reader */
+    UDFAcquireFcbExclusive(IrpContext, Fcb, FALSE);
+    *Held = Fcb;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+UDFFlushTreeFile(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO FileInfo, ULONG FlushFlags)
+{
+    PFCB Held;
+    NTSTATUS Status = UDFAcquireMetadataFlushFcb(IrpContext, Vcb, FileInfo, &Held);
+    if (!NT_SUCCESS(Status)) return Status;
+    _SEH2_TRY {
+        Status = UDFFlushFile__(IrpContext, Vcb, FileInfo, FlushFlags);
+    } _SEH2_FINALLY {
+        if (Held) UDFReleaseFcb(IrpContext, Held);
+    } _SEH2_END;
+    return Status;
+}
+
 /*************************************************************************
 *
 * Function: UDFCommonFlush()
@@ -110,6 +151,7 @@ UDFCommonFlush(
     BOOLEAN             AcquiredParentFcb = FALSE;
     PFCB                HeldParentFcb = NULL;
     IO_STATUS_BLOCK     FsIoStatus;
+    BOOLEAN             CacheCloseWaited = FALSE, WaitForCacheClose;
 
     PAGED_CODE();
 
@@ -173,25 +215,43 @@ UDFCommonFlush(
         // action we take.
         if ((Fcb == Fcb->Vcb->VolumeDasdFcb) || (Fcb->FcbState & UDF_FCB_ROOT_DIRECTORY)) {
 
+            /* Report an already latched first error before starting more
+             * metadata work. A later explicit flush can attempt repair. */
+            Status = UDFTakeMetadataWritebackError(Vcb);
+            if (!NT_SUCCESS(Status))
+                try_return(Status);
             Status = UDFFspCloseForFlush(Vcb);
             if (!NT_SUCCESS(Status))
                 try_return(Status);
 
-            UDFAcquireVcbExclusive(IrpContext, Vcb, FALSE);
-            AcquiredVCB = TRUE;
-            // The caller wishes to flush all files for the mounted
-            // logical volume. The flush volume routine below should simply
-            // walk through all of the open file streams, acquire the
-            // VCB resource, and request the flush operation from the Cache
-            // Manager. Basically, the sequence of operations listed below
-            // for a single file should be executed on all open files.
-
-            UDFVerifyVcb(IrpContext, Vcb);
-
-            Status = UDFFlushVolume(IrpContext, Vcb, 0);
-
-            UDFReleaseVcb(IrpContext, Vcb);
-            AcquiredVCB = FALSE;
+            for (;;) {
+                IrpContext->DeletedCacheClosePending = FALSE;
+                UDFAcquireVcbExclusive(IrpContext, Vcb, FALSE);
+                AcquiredVCB = TRUE;
+                UDFVerifyVcb(IrpContext, Vcb);
+                Status = UDFFlushVolume(IrpContext, Vcb, 0);
+                WaitForCacheClose = Status == STATUS_DEVICE_BUSY &&
+                    IrpContext->DeletedCacheClosePending && !CacheCloseWaited &&
+                    TypeOfOpen == UserVolumeOpen && IrpContext->TopLevel == IrpContext &&
+                    FlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_TOP_LEVEL) &&
+                    !FlagOn(Irp->Flags, IRP_PAGING_IO);
+                UDFReleaseVcb(IrpContext, Vcb);
+                AcquiredVCB = FALSE;
+                if (!WaitForCacheClose)
+                    break;
+                /* A successful purge may leave Cc's deferred uninitialize
+                 * holding MM's last FILE_OBJECT. Wait with no filesystem
+                 * resources, then consume only already-owned close records.
+                 * One checkpoint retry, never a replay of unlink/decrement
+                 * or an attempt to hide a mapped-user/purge/write failure. */
+                CacheCloseWaited = TRUE;
+                Status = CcWaitForCurrentLazyWriterActivity();
+                if (!NT_SUCCESS(Status))
+                    break;
+                Status = UDFFspCloseForFlush(Vcb);
+                if (!NT_SUCCESS(Status))
+                    break;
+            }
 
             try_return(Status);
         } else
@@ -207,6 +267,8 @@ UDFCommonFlush(
                 UDFAcquireVcbExclusive(IrpContext, Vcb, FALSE);
                 AcquiredVCB = TRUE;
                 UDFRememberFlushStatus(&FsIoStatus, UDFTakeMetadataWritebackError(Vcb));
+                if (!NT_SUCCESS(FsIoStatus.Status))
+                    try_return(Status = FsIoStatus.Status);
                 UDFFlushADirectory(IrpContext, Vcb, Fcb->FileInfo, &FsIoStatus, 0);
                 if (NT_SUCCESS(FsIoStatus.Status))
                     UDFRememberFlushStatus(&FsIoStatus,
@@ -219,6 +281,8 @@ UDFCommonFlush(
             UDFAcquireVcbShared(IrpContext, Vcb, FALSE);
             AcquiredVCB = TRUE;
             UDFRememberFlushStatus(&FsIoStatus, UDFTakeMetadataWritebackError(Vcb));
+            if (!NT_SUCCESS(FsIoStatus.Status))
+                try_return(Status = FsIoStatus.Status);
 
             // Child-first lock ordering
             UDF_CHECK_PAGING_IO_RESOURCE(Fcb);
@@ -231,6 +295,13 @@ UDFCommonFlush(
                 UDFAcquireFcbExclusive(IrpContext, Fcb->FileInfo->ParentFile->Fcb, FALSE);
                 AcquiredParentFcb = TRUE;
                 HeldParentFcb = Fcb->FileInfo->ParentFile->Fcb;
+            }
+
+            if (Fcb->FileInfo && Fcb->FileInfo->Dloc &&
+                !NT_SUCCESS(Fcb->FileInfo->Dloc->ZeroDataError)) {
+                UDFRememberFlushStatus(&FsIoStatus, UDFRetryZeroData(IrpContext, Fcb));
+                if (!NT_SUCCESS(FsIoStatus.Status))
+                    try_return(Status = FsIoStatus.Status);
             }
 
             // Request the Cache Manager to perform a flush operation.
@@ -325,8 +396,8 @@ try_exit:   NOTHING;
 * Return Value: None
 *
 *************************************************************************/
-ULONG
-UDFFlushAFile(
+static ULONG
+UDFFlushAFileInternal(
     IN PIRP_CONTEXT IrpContext,
     IN PFCB                Fcb,
     IN PCCB                Ccb,
@@ -338,18 +409,30 @@ UDFFlushAFile(
     BOOLEAN CacheFlushFailed = FALSE;
 //    BOOLEAN PurgeCache = FALSE;
     ULONG ret_val = 0;
+    PUDF_FILE_INFO FileInfo;
 
     UDFPrint(("UDFFlushAFile: \n"));
     if (!Fcb)
         return 0;
 
+    FileInfo = Ccb && Ccb->FileInfo ? Ccb->FileInfo : Fcb->FileInfo;
+    if (!FileInfo || !FileInfo->Dloc) {
+        UDFRememberFlushStatus(PtrIoStatus, STATUS_FILE_INVALID);
+        return 0;
+    }
+
+    if (!NT_SUCCESS(FileInfo->Dloc->ZeroDataError)) {
+        UDFRememberFlushStatus(PtrIoStatus, FileInfo->Dloc->ZeroDataError);
+        return 0;
+    }
+
     // Flush SDir if any
     _SEH2_TRY {
-        if (UDFHasAStreamDir(Fcb->FileInfo) &&
-           Fcb->FileInfo->Dloc->SDirInfo &&
-           !UDFIsSDirDeleted(Fcb->FileInfo->Dloc->SDirInfo) ) {
+        if (UDFHasAStreamDir(FileInfo) &&
+           FileInfo->Dloc->SDirInfo &&
+           !UDFIsSDirDeleted(FileInfo->Dloc->SDirInfo) ) {
             ret_val |=
-                UDFFlushADirectory(IrpContext, Fcb->Vcb, Fcb->FileInfo->Dloc->SDirInfo, PtrIoStatus, FlushFlags);
+                UDFFlushADirectory(IrpContext, Fcb->Vcb, FileInfo->Dloc->SDirInfo, PtrIoStatus, FlushFlags);
         }
     } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
         BrutePoint();
@@ -381,15 +464,15 @@ UDFFlushAFile(
                     if (Fcb->Vcb->CompatFlags & UDF_VCB_IC_UPDATE_MODIFY_TIME) {
                         LONGLONG NtTime;
                         KeQuerySystemTime((PLARGE_INTEGER)&NtTime);
-                        UDFSetFileXTime(Fcb->FileInfo, NULL, NULL, NULL, &NtTime);
+                        UDFSetFileXTime(FileInfo, NULL, NULL, NULL, &NtTime);
                         Fcb->LastWriteTime.QuadPart = NtTime;
                     }
                     SetArchive = TRUE;
                     Ccb->FileObject->Flags &= ~FO_FILE_MODIFIED;
                 }
                 if (Ccb->FileObject->Flags & FO_FILE_SIZE_CHANGED) {
-                    LONGLONG ASize = UDFGetFileAllocationSize(Fcb->Vcb, Fcb->FileInfo);
-                    UDFSetFileSizeInDirNdx(Fcb->Vcb, Fcb->FileInfo, &ASize);
+                    LONGLONG ASize = UDFGetFileAllocationSize(Fcb->Vcb, FileInfo);
+                    UDFSetFileSizeInDirNdx(Fcb->Vcb, FileInfo, &ASize);
                     Ccb->FileObject->Flags &= ~FO_FILE_SIZE_CHANGED;
                 }
             }
@@ -408,15 +491,23 @@ UDFFlushAFile(
            (Fcb->Vcb->CompatFlags & UDF_VCB_IC_UPDATE_ARCH_BIT)) {
             ULONG Attr;
             PDIR_INDEX_ITEM DirNdx;
-            DirNdx = UDFDirIndex(UDFGetDirIndexByFileInfo(Fcb->FileInfo), Fcb->FileInfo->Index);
+            DIR_INDEX_ITEM AttributesIndex;
+            DirNdx = UDFDirIndex(UDFGetDirIndexByFileInfo(FileInfo), FileInfo->Index);
+            if (!DirNdx) {
+                RtlZeroMemory(&AttributesIndex, sizeof(AttributesIndex));
+                AttributesIndex.FileInfo = FileInfo;
+                AttributesIndex.SysAttr = Fcb->FileAttributes;
+                DirNdx = &AttributesIndex;
+            }
             // Archive bit
-            Attr = UDFAttributesToNT(DirNdx, Fcb->FileInfo->Dloc->FileEntry);
+            Attr = UDFAttributesToNT(DirNdx, FileInfo->Dloc->FileEntry);
             if (!(Attr & FILE_ATTRIBUTE_ARCHIVE))
-                UDFAttributesToUDF(DirNdx, Fcb->FileInfo->Dloc->FileEntry, Attr | FILE_ATTRIBUTE_ARCHIVE);
+                UDFAttributesToUDF(DirNdx, FileInfo->Dloc->FileEntry, Attr | FILE_ATTRIBUTE_ARCHIVE);
+            Fcb->FileAttributes = DirNdx->SysAttr;
         }
 
         UDFRememberFlushStatus(PtrIoStatus,
-            UDFFlushFile__(IrpContext, Fcb->Vcb, Fcb->FileInfo, FlushFlags));
+            UDFFlushFile__(IrpContext, Fcb->Vcb, FileInfo, FlushFlags));
     } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
         BrutePoint();
         UDFRememberFlushStatus(PtrIoStatus, _SEH2_GetExceptionCode());
@@ -433,6 +524,29 @@ UDFFlushAFile(
 
     return ret_val;
 } // end UDFFlushAFile()
+
+ULONG
+UDFFlushAFile(PIRP_CONTEXT IrpContext, PFCB Fcb, PCCB Ccb,
+    PIO_STATUS_BLOCK IoStatus, ULONG FlushFlags)
+{
+    PUDF_FILE_INFO FileInfo;
+    PFCB Held;
+    NTSTATUS Status;
+    ULONG Result = 0;
+    if (!Fcb) return 0;
+    FileInfo = Ccb && Ccb->FileInfo ? Ccb->FileInfo : Fcb->FileInfo;
+    Status = UDFAcquireMetadataFlushFcb(IrpContext, Fcb->Vcb, FileInfo, &Held);
+    if (!NT_SUCCESS(Status)) {
+        UDFRememberFlushStatus(IoStatus, Status);
+        return 0;
+    }
+    _SEH2_TRY {
+        Result = UDFFlushAFileInternal(IrpContext, Fcb, Ccb, IoStatus, FlushFlags);
+    } _SEH2_FINALLY {
+        if (Held) UDFReleaseFcb(IrpContext, Held);
+    } _SEH2_END;
+    return Result;
+}
 
 /*************************************************************************
 *
@@ -502,7 +616,7 @@ UDFFlushADirectory(
                             tempFI->Dloc->FELoc.Modified ||
                             (DI->FI_Flags & UDF_FI_FLAG_FI_MODIFIED)) {
                             UDFRememberFlushStatus(PtrIoStatus,
-                                UDFFlushFile__(IrpContext, Vcb, tempFI,
+                                UDFFlushTreeFile(IrpContext, Vcb, tempFI,
                                                FlushFlags));
                         }
                     } else {
@@ -526,7 +640,7 @@ SkipFlushDir:
     // Flush Dir
     _SEH2_TRY {
         UDFRememberFlushStatus(PtrIoStatus,
-            UDFFlushFile__(IrpContext, Vcb, FI, FlushFlags));
+            UDFFlushTreeFile(IrpContext, Vcb, FI, FlushFlags));
     } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
         BrutePoint();
         UDFRememberFlushStatus(PtrIoStatus, _SEH2_GetExceptionCode());
@@ -568,13 +682,47 @@ UDFFlushVolume(
     IoStatus.Status = STATUS_SUCCESS;
     IoStatus.Information = 0;
 
+    Status = UDFRetryVolumeCreateAborts(IrpContext, Vcb);
+    if (Status != STATUS_SUCCESS) return Status;
     Status = UDFTakeMetadataWritebackError(Vcb);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (InterlockedCompareExchange(&Vcb->RetainedOpenCount, 0, 0))
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (InterlockedCompareExchange(&Vcb->AbortedOpenCount, 0, 0))
+        return STATUS_DEVICE_BUSY;
+    if (InterlockedCompareExchange(&Vcb->FcbTeardownCount, 0, 0))
+        return STATUS_DEVICE_BUSY;
+    Status = UDFRetryVolumeCreateRollbacks(IrpContext, Vcb);
+    if (Status != STATUS_SUCCESS) return Status;
+    if (InterlockedCompareExchange(&Vcb->PendingNamespaceCount, 0, 0))
+        return STATUS_FILE_CORRUPT_ERROR;
+    Status = UDFRetryVolumeZeroData(IrpContext, Vcb);
+    if (!NT_SUCCESS(Status))
+        return Status;
     UDFFspClose(Vcb);
     {
         NTSTATUS current = UDFTakeMetadataWritebackError(Vcb);
         if (NT_SUCCESS(Status))
             Status = current;
     }
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    if (InterlockedCompareExchange(&Vcb->FailedZeroDataCount, 0, 0))
+        return STATUS_IO_DEVICE_ERROR;
+    if (InterlockedCompareExchange(&Vcb->RetainedOpenCount, 0, 0))
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (InterlockedCompareExchange(&Vcb->AbortedOpenCount, 0, 0))
+        return STATUS_DEVICE_BUSY;
+    if (InterlockedCompareExchange(&Vcb->FcbTeardownCount, 0, 0))
+        return STATUS_DEVICE_BUSY;
+    if (InterlockedCompareExchange(&Vcb->PendingNamespaceCount, 0, 0))
+        return STATUS_FILE_CORRUPT_ERROR;
+    Status = UDFRetryVolumeDeletes(IrpContext, Vcb);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = UDFReapFailedFileInfos(IrpContext, Vcb);
     if (!NT_SUCCESS(Status))
         return Status;
 

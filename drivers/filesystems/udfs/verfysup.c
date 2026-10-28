@@ -631,78 +631,54 @@ UDFCheckForDismount(
     IN BOOLEAN Force
     )
 {
-    BOOLEAN UnlockVcb = TRUE;
+    BOOLEAN LockedVcb = FALSE;
     BOOLEAN VcbPresent = TRUE;
     KIRQL SavedIrql;
 
     ASSERT_IRP_CONTEXT(IrpContext);
     ASSERT_VCB(Vcb);
-
     ASSERT_EXCLUSIVE_CDDATA;
-
-    // Acquire and lock this Vcb to check the dismount state.
-
     UDFAcquireVcbExclusive(IrpContext, Vcb, FALSE);
-
-    // Lets get rid of any pending closes for this volume.
-
-    UDFFspClose(Vcb);
-
-    UDFLockVcb(IrpContext, Vcb);
-
-    // If the dismount is not already underway then check if the
-    // user reference count has gone to zero or we are being forced
-    // to disconnect.  If so start the teardown on the Vcb.
-
-    if (Vcb->VcbCondition != VcbDismountInProgress) {
-
-        if (Vcb->VcbUserReference <= Vcb->VcbResidualUserReference || Force) {
-
+    _SEH2_TRY {
+        UDFFspClose(Vcb);
+        UDFLockVcb(IrpContext, Vcb);
+        LockedVcb = TRUE;
+        if (Vcb->VcbCondition != VcbDismountInProgress) {
+            if (Vcb->VcbUserReference <= Vcb->VcbResidualUserReference || Force) {
+                UDFUnlockVcb(IrpContext, Vcb);
+                LockedVcb = FALSE;
+                VcbPresent = UDFDismountVcb(IrpContext, Vcb, Force == FALSE);
+            }
+        } else if (!Vcb->VcbReference && !Vcb->FcbTeardownCount) {
+            /* The inventory acquires Dloc resources and can wait. Do not
+             * hold VcbMutex across that scan; global/VCB resources keep the
+             * volume alive. Revalidate the reference decision afterwards. */
             UDFUnlockVcb(IrpContext, Vcb);
-            UnlockVcb = FALSE;
-            VcbPresent = UDFDismountVcb(IrpContext, Vcb, Force == FALSE);
+            LockedVcb = FALSE;
+            if (UDFHasRetainedDlocs(Vcb))
+                _SEH2_LEAVE;
+            UDFLockVcb(IrpContext, Vcb);
+            LockedVcb = TRUE;
+            if (Vcb->VcbCondition != VcbDismountInProgress ||
+                Vcb->VcbReference || Vcb->FcbTeardownCount)
+                _SEH2_LEAVE;
+            IoAcquireVpbSpinLock(&SavedIrql);
+            if (Vcb->Vpb->ReferenceCount == 1 && UDFTryStopFspPosting(Vcb)) {
+                IoReleaseVpbSpinLock(SavedIrql);
+                UDFUnlockVcb(IrpContext, Vcb);
+                LockedVcb = FALSE;
+                UDFDeleteVCB(IrpContext, Vcb);
+                VcbPresent = FALSE;
+            } else {
+                IoReleaseVpbSpinLock(SavedIrql);
+            }
         }
-
-    //  If the teardown is underway and there are absolutely no references
-    //  remaining then delete the Vcb.  References here include the
-    //  references in the Vcb and Vpb.
-
-    } else if (Vcb->VcbReference == 0) {
-
-        IoAcquireVpbSpinLock( &SavedIrql );
-
-        //  If there are no file objects and no reference counts in the
-        //  Vpb we can delete the Vcb.  Don't forget that we have the
-        //  last reference in the Vpb.
-
-        if (Vcb->Vpb->ReferenceCount == 1) {
-
-            IoReleaseVpbSpinLock(SavedIrql);
+    } _SEH2_FINALLY {
+        if (LockedVcb)
             UDFUnlockVcb(IrpContext, Vcb);
-            UnlockVcb = FALSE;
-            UDFDeleteVCB(IrpContext, Vcb);
-            VcbPresent = FALSE;
-
-        } else {
-
-            IoReleaseVpbSpinLock( SavedIrql );
-        }
-    }
-
-    // Unlock the Vcb if still held.
-
-    if (UnlockVcb) {
-
-        UDFUnlockVcb(IrpContext, Vcb);
-    }
-
-    // Release any resources still acquired.
-
-    if (VcbPresent) {
-
-        UDFReleaseVcb(IrpContext, Vcb);
-    }
-
+        if (VcbPresent)
+            UDFReleaseVcb(IrpContext, Vcb);
+    } _SEH2_END;
     return VcbPresent;
 } // end UDFCheckForDismount()
 
@@ -738,6 +714,7 @@ UDFDismountVcb(
     PVPB OldVpb;
     BOOLEAN VcbPresent = TRUE;
     KIRQL SavedIrql;
+    NTSTATUS Status;
 
     BOOLEAN FinalReference;
 
@@ -750,14 +727,34 @@ UDFDismountVcb(
     //  We should only take this path once.
     ASSERT(Vcb->VcbCondition != VcbDismountInProgress);
 
-    //  Mark the Vcb as DismountInProgress.
-    Vcb->VcbCondition = VcbDismountInProgress;
-
     OldVpb = Vcb->Vpb;
 
-    //  Remove the mount volume reference.
-    UDFCloseResidual(IrpContext, Vcb);
-    // the only residual reference is cleaned above
+    if (Vcb->FcbTeardownCount)
+        return TRUE;
+    if (FlushBeforeDismount && Vcb->VcbCondition == VcbMounted) {
+        Status = UDFFlushVolume(IrpContext, Vcb, 0);
+        if (!NT_SUCCESS(Status)) {
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                        Status, STATUS_SUCCESS);
+            return TRUE;
+        }
+    }
+    /* A residual-release failure leaves a reachable retry owner. It must
+     * not be converted into a freed VCB merely because no VPB handles
+     * remain. Once partial residual disposal starts the volume cannot be
+     * used as a mounted writable volume again. */
+    Status = UDFCloseResidual(IrpContext, Vcb);
+    if (!NT_SUCCESS(Status) || UDFHasRetainedDlocs(Vcb)) {
+        Vcb->VcbCondition = VcbInvalid;
+        /* This can be a still-owned reference, cache event or a GC claim,
+         * not a metadata write failure. Preserve its first diagnostic
+         * without blocking a known-state resume on its own prior BUSY.
+         * Actual write failures retain their independent generation/error. */
+        InterlockedCompareExchange(&Vcb->ResidualCloseError,
+            NT_SUCCESS(Status) ? STATUS_DEVICE_BUSY : Status, STATUS_SUCCESS);
+        return TRUE;
+    }
+    Vcb->VcbCondition = VcbDismountInProgress;
 
     //  Acquire the Vpb spinlock to check for Vpb references.
     IoAcquireVpbSpinLock(&SavedIrql);
@@ -768,6 +765,16 @@ UDFDismountVcb(
     //  than zero then the Io system will be responsible for deleting the
     //  Vpb.
     FinalReference = (BOOLEAN)(OldVpb->ReferenceCount == 1);
+
+    /* The final VPB reference is not the lifetime of an FSP worker. A worker
+     * can still be unwinding after completing the last user IRP. Atomically
+     * close posting only when both inventories are empty, before modifying
+     * VPB ownership. Its last retirement will retry this dismount. */
+    if (FinalReference &&
+        (Vcb->VcbReference || !UDFTryStopFspPosting(Vcb))) {
+        IoReleaseVpbSpinLock(SavedIrql);
+        return TRUE;
+    }
 
     //  There is a reference count in the Vpb and in the Vcb.  We have
     //  incremented the reference count in the Vpb to make sure that
@@ -872,15 +879,116 @@ UDFCompareVcb(
     return STATUS_SUCCESS;
 } // end UDFCompareVcb()
 
+/*
+ * This is a state predicate, not the media-verification operation. Callers
+ * already own the FCB resource; acquiring the VCB here or issuing a blocking
+ * check-verify IOCTL would invert their lock order. IRP callers expect an
+ * exception on failure. Fast metadata queries pass no context and must test
+ * the returned NTSTATUS instead.
+ */
 NTSTATUS
 UDFVerifyFcbOperation (
     IN PIRP_CONTEXT IrpContext OPTIONAL,
     IN PFCB Fcb,
-    IN PCCB Ccb
+    IN PCCB Ccb OPTIONAL
     )
 {
-    //TODO: impl
-    return STATUS_SUCCESS;
+    NTSTATUS Status = STATUS_SUCCESS;
+    PVCB Vcb;
+    PDEVICE_OBJECT RealDevice = NULL;
+    PIRP Irp = IrpContext ? IrpContext->Irp : NULL;
+    BOOLEAN MarkVerifyDevice = FALSE;
+
+    if (!Fcb || !Fcb->Vcb || Fcb->TeardownInProgress ||
+        (Ccb && Ccb->Fcb != Fcb)) {
+        Status = STATUS_FILE_INVALID;
+        goto VerifyDone;
+    }
+    Vcb = Fcb->Vcb;
+
+    if (Irp) {
+        PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
+        PFILE_OBJECT FileObject = IrpSp->FileObject;
+
+        /* Cleanup consumes the handle's FI hold, not MM/CC's object lifetime.
+           Paging I/O and MDL completion may therefore still be legitimate. */
+        if (((FileObject && FlagOn(FileObject->Flags, FO_CLEANUP_COMPLETE)) ||
+             (Ccb && FlagOn(Ccb->Flags, UDF_CCB_CLEANED))) &&
+            !FlagOn(Irp->Flags, IRP_PAGING_IO) &&
+            IrpSp->MajorFunction != IRP_MJ_CLOSE &&
+            IrpSp->MajorFunction != IRP_MJ_QUERY_INFORMATION &&
+            !(IrpSp->MajorFunction == IRP_MJ_READ &&
+              FlagOn(IrpSp->MinorFunction, IRP_MN_COMPLETE))) {
+            Status = STATUS_FILE_CLOSED;
+            goto VerifyDone;
+        }
+    }
+
+    if (Vcb->VcbCondition == VcbInvalid ||
+        Vcb->VcbCondition == VcbDismountInProgress) {
+        Status = FlagOn(Vcb->VcbState, VCB_STATE_DISMOUNT_IN_PROGRESS) ?
+                     STATUS_VOLUME_DISMOUNTED : STATUS_FILE_INVALID;
+        goto VerifyDone;
+    }
+    if (!Vcb->Vpb || !Vcb->Vpb->RealDevice) {
+        Status = STATUS_FILE_INVALID;
+        goto VerifyDone;
+    }
+    RealDevice = Vcb->Vpb->RealDevice;
+
+    if (UDFRealDevNeedsVerify(RealDevice)) {
+        Status = STATUS_VERIFY_REQUIRED;
+        MarkVerifyDevice = TRUE;
+        goto VerifyDone;
+    }
+
+    switch (Vcb->VcbCondition) {
+    case VcbMounted:
+    case VcbMountInProgress:
+        break;
+    case VcbNotMounted:
+        Status = STATUS_WRONG_VOLUME;
+        MarkVerifyDevice = TRUE;
+        break;
+    default:
+        Status = STATUS_FILE_INVALID;
+        break;
+    }
+
+    if (NT_SUCCESS(Status) && Fcb->FileInfo && Fcb->FileInfo->Dloc &&
+        (Fcb->FileInfo->Dloc->AllocationReleaseActive ||
+         !NT_SUCCESS(Fcb->FileInfo->Dloc->AllocationReleaseError))) {
+        PIO_STACK_LOCATION ReleaseSp = Irp ? IoGetCurrentIrpStackLocation(Irp) : NULL;
+        if (!ReleaseSp || (ReleaseSp->MajorFunction != IRP_MJ_CLEANUP &&
+                           ReleaseSp->MajorFunction != IRP_MJ_CLOSE &&
+                           !((ReleaseSp->MajorFunction == IRP_MJ_READ ||
+                              ReleaseSp->MajorFunction == IRP_MJ_WRITE) &&
+                             FlagOn(ReleaseSp->MinorFunction, IRP_MN_COMPLETE))))
+            Status = !NT_SUCCESS(Fcb->FileInfo->Dloc->AllocationReleaseError) ?
+                Fcb->FileInfo->Dloc->AllocationReleaseError : STATUS_DEVICE_BUSY;
+    }
+
+    if (NT_SUCCESS(Status) && Fcb->FileInfo && Fcb->FileInfo->Dloc &&
+        !NT_SUCCESS(Fcb->FileInfo->Dloc->CacheSizeError) &&
+        !UDFIsZeroDataRetry(Fcb->FileInfo->Dloc)) {
+        PIO_STACK_LOCATION SizeSp = Irp ? IoGetCurrentIrpStackLocation(Irp) : NULL;
+        /* Metadata queries and lifetime/MDL completion still have work to
+         * do. New data I/O and section/fast-I/O admission cannot use a cache
+         * whose accepted sizes have not completed their explicit repair. */
+        if (!SizeSp ||
+            ((SizeSp->MajorFunction == IRP_MJ_READ || SizeSp->MajorFunction == IRP_MJ_WRITE) &&
+             !FlagOn(SizeSp->MinorFunction, IRP_MN_COMPLETE)))
+            Status = (NTSTATUS)Fcb->FileInfo->Dloc->CacheSizeError;
+    }
+
+VerifyDone:
+    if (!NT_SUCCESS(Status) && IrpContext) {
+        if (Irp && MarkVerifyDevice) {
+            IoSetHardErrorOrVerifyDevice(Irp, RealDevice);
+        }
+        UDFRaiseStatus(IrpContext, Status);
+    }
+    return Status;
 }
 
 BOOLEAN

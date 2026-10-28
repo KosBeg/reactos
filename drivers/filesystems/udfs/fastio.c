@@ -188,7 +188,7 @@ UDFFastIoQueryBasicInfo(
         if (FcbAcquired) {
 
             // Verify FCB operation
-            if (UDFVerifyFcbOperation(NULL, Fcb, Ccb)) {
+            if (NT_SUCCESS(UDFVerifyFcbOperation(NULL, Fcb, Ccb))) {
 
                 ReturnedStatus =
                     ((Status = UDFGetBasicInformation(FileObject, Fcb, Buffer, &Length)) == STATUS_SUCCESS);
@@ -274,10 +274,10 @@ UDFFastIoQueryStdInfo(
         if (FcbAcquired) {
 
             // Verify FCB operation
-            if (UDFVerifyFcbOperation(NULL, Fcb, Ccb)) {
+            if (NT_SUCCESS(UDFVerifyFcbOperation(NULL, Fcb, Ccb))) {
 
                 ReturnedStatus =
-                    ((Status = UDFGetStandardInformation(Fcb, Buffer, &Length)) == STATUS_SUCCESS);
+                    ((Status = UDFGetStandardInformation(Fcb, Ccb, Buffer, &Length)) == STATUS_SUCCESS);
 
                 IoStatus->Status = Status;
 
@@ -310,33 +310,54 @@ UDFFilterCallbackAcquireForCreateSection(
     IN PVOID *CompletionContext
     )
 {
-    UNREFERENCED_PARAMETER(CompletionContext);	
+    PFILE_OBJECT FileObject = CallbackData->FileObject;
+    PFCB Fcb = (PFCB)FileObject->FsContext;
+    NTSTATUS Status = STATUS_SUCCESS;
+    ULONG Protection;
 
+    if (CompletionContext)
+        *CompletionContext = NULL;
     NT_ASSERT(CallbackData->Operation == FS_FILTER_ACQUIRE_FOR_SECTION_SYNCHRONIZATION);
     NT_ASSERT(CallbackData->SizeOfFsFilterCallbackData == sizeof(FS_FILTER_CALLBACK_DATA));
-
     MmPrint(("  AcqForCreateSection()\n"));
 
-    PFCB Fcb = (PFCB)CallbackData->FileObject->FsContext;
-
-    // Acquire the MainResource exclusively for the file stream
     UDFAcquireResourceExclusive(&Fcb->FcbNonpaged->FcbResource, TRUE);
-
-    // Return the appropriate status based on the type of synchronization and whether anyone
-    // has write access to this file.
-
-    if (CallbackData->Parameters.AcquireForSectionSynchronization.SyncType != SyncTypeCreateSection) {
-
+    /* Cache-manager synchronization is not admission of a user mapping and
+     * cannot fail. It must not recursively initialize data during its drain. */
+    if (CallbackData->Parameters.AcquireForSectionSynchronization.SyncType != SyncTypeCreateSection)
         return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 
-    } else if (Fcb->ShareAccess.Writers == 0) {
-
-        return STATUS_FILE_LOCKED_WITH_ONLY_READERS;
-
-    } else {
-
-        return STATUS_FILE_LOCKED_WITH_WRITERS;
+    Protection = CallbackData->Parameters.AcquireForSectionSynchronization.PageProtection;
+    _SEH2_TRY {
+        /* The private bitmap cache is a kernel stream, not admission of a
+         * user mapping. Its FCB deliberately has no namespace FileInfo/VDL
+         * owner. Cache Manager may create its section during initialization
+         * or while finishing uninitialization on an invalidated volume. */
+        if (FileObject->FsContext2 == (PVOID)(ULONG_PTR)StreamFileOpen) {
+            Status = Fcb == Fcb->Vcb->BitmapFcb && !Fcb->Vcb->BitmapIoStopped &&
+                (Fcb->Vcb->BitmapCacheState == UdfBitmapCacheActive ||
+                 Fcb->Vcb->BitmapCacheState == UdfBitmapCacheQuiescing ||
+                 Fcb->Vcb->BitmapCacheState == UdfBitmapCacheUninitializing) ?
+                    STATUS_SUCCESS : STATUS_FILE_CLOSED;
+        } else {
+            Status = UDFVerifyFcbOperation(NULL, Fcb, NULL);
+            if (Status == STATUS_SUCCESS &&
+                FlagOn(Protection, PAGE_READWRITE | PAGE_EXECUTE_READWRITE))
+                Status = UDFInitializeWritableSection(FileObject, Fcb);
+        }
+    } _SEH2_EXCEPT(UDFExceptionFilter(NULL, _SEH2_GetExceptionInformation())) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    if (Status != STATUS_SUCCESS) {
+        /* On failure MM will not call our release callback. Do not retain
+         * the resource on the rejected mapping, and do not report it locked. */
+        UDFReleaseResource(&Fcb->FcbNonpaged->FcbResource);
+        return NT_SUCCESS(Status) ? STATUS_IO_DEVICE_ERROR : Status;
     }
+
+    /* Successful admission keeps Main held until UDFFastIoRelCreateSec. */
+    return Fcb->ShareAccess.Writers == 0 ? STATUS_FILE_LOCKED_WITH_ONLY_READERS :
+                                         STATUS_FILE_LOCKED_WITH_WRITERS;
 }
 
 /*************************************************************************
@@ -604,7 +625,7 @@ UDFFastIoQueryNetInfo(
         if (FcbAcquired) {
 
             // Verify FCB operation
-            if (UDFVerifyFcbOperation(NULL, Fcb, Ccb)) {
+            if (NT_SUCCESS(UDFVerifyFcbOperation(NULL, Fcb, Ccb))) {
 
                 ReturnedStatus =
                     ((Status = UDFGetNetworkInformation(Fcb, Buffer, &Length)) == STATUS_SUCCESS);

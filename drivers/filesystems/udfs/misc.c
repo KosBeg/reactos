@@ -81,18 +81,12 @@ UDFExceptionFilter(
     }
 
     // check if we should propagate this exception or not
-    if (!(FsRtlIsNtstatusExpected(ExceptionCode))) {
-
-        // better free up the IrpContext now ...
-        if (IrpContext) {
-            UDFPrint(("    UDF Driver internal error\n"));
-            BrutePoint();
-        } else {
-            // we are not ok, propagate this exception.
-            //  NOTE: we will bring down the machine ...
-            //ReturnCode = EXCEPTION_CONTINUE_SEARCH;
-            BrutePoint();
-        }
+    if (!FsRtlIsNtstatusExpected(ExceptionCode)) {
+        /* A fault in our own pointers/instructions is not an I/O error we
+         * can complete and continue from. Leave normal exception handling
+         * in control instead of resuming a potentially destructive teardown. */
+        UDFPrint(("UDF: unexpected kernel exception %08lx\n", ExceptionCode));
+        return EXCEPTION_CONTINUE_SEARCH;
     }
 
     return EXCEPTION_EXECUTE_HANDLER;
@@ -840,6 +834,15 @@ UDFAddToWorkque(
 
         KeAcquireSpinLock(&Vdo->OverflowQueueSpinLock, &SavedIrql);
 
+        if (Vdo->FspPostingClosed) {
+            KeReleaseSpinLock(&Vdo->OverflowQueueSpinLock, SavedIrql);
+            /* PrePost already marked this IRP pending and restored its
+             * thread context. Complete it once; FsdPost still returns PENDING.
+             * Do not publish work against a final-disposal VCB. */
+            Irp->IoStatus.Information = 0;
+            UDFCompleteRequest(IrpContext, Irp, STATUS_VOLUME_DISMOUNTED);
+            return;
+        }
         if (Vdo->PostedRequestCount > FSP_PER_DEVICE_THRESHOLD) {
 
             // We cannot currently respond to this IRP so we'll just enqueue it
@@ -942,6 +945,92 @@ Return Value:
 * Return Value: None
 *
 *************************************************************************/
+/* The last worker cannot wait for itself during final VCB disposal.
+ * Keep its count until global dismount ownership has been acquired, then
+ * recheck overflow and retire exactly one worker. The old request/context
+ * may have been completed/freed, so this pass owns a separate stack context. */
+static PLIST_ENTRY
+UDFRetireFspWorker(PVOLUME_DEVICE_OBJECT Vdo)
+{
+    KIRQL SavedIrql;
+    PLIST_ENTRY Entry = NULL;
+    BOOLEAN LastCandidate = FALSE, LastWorker = FALSE, GlobalAcquired = FALSE;
+    struct IRP_CONTEXT Context = {0};
+    struct THREAD_CONTEXT ThreadContext = {0};
+
+    KeAcquireSpinLock(&Vdo->OverflowQueueSpinLock, &SavedIrql);
+    NT_ASSERT(Vdo->PostedRequestCount > 0 && !Vdo->FspPostingClosed);
+    if (Vdo->OverflowQueueCount) {
+        Vdo->OverflowQueueCount--;
+        Entry = RemoveHeadList(&Vdo->OverflowQueue);
+    } else if (Vdo->PostedRequestCount > 1) {
+        Vdo->PostedRequestCount--;
+    } else {
+        LastCandidate = TRUE;
+    }
+    KeReleaseSpinLock(&Vdo->OverflowQueueSpinLock, SavedIrql);
+    if (!LastCandidate)
+        return Entry; /* no access to Vdo after dropping a non-last count */
+
+    Context.NodeIdentifier.NodeTypeCode = UDF_NODE_TYPE_IRP_CONTEXT;
+    Context.NodeIdentifier.NodeByteSize = sizeof(Context);
+    Context.Flags = IRP_CONTEXT_FLAG_ON_STACK | IRP_CONTEXT_FSP_FLAGS |
+                    IRP_CONTEXT_FLAG_METADATA_WRITER;
+    Context.MajorFunction = IRP_MJ_CLOSE;
+    Context.Vcb = &Vdo->Vcb;
+    Context.RealDevice = Vdo->Vcb.Vpb ? Vdo->Vcb.Vpb->RealDevice : NULL;
+    FsRtlEnterFileSystem();
+    UDFSetThreadContext(&Context, &ThreadContext);
+    _SEH2_TRY {
+        _SEH2_TRY {
+            /* No queue lock is held while waiting. The still-counted worker
+             * prevents the final posting gate from admitting deletion. */
+            UDFAcquireUdfData(&Context);
+            GlobalAcquired = TRUE;
+            KeAcquireSpinLock(&Vdo->OverflowQueueSpinLock, &SavedIrql);
+            NT_ASSERT(Vdo->PostedRequestCount > 0 && !Vdo->FspPostingClosed);
+            if (Vdo->OverflowQueueCount) {
+                Vdo->OverflowQueueCount--;
+                Entry = RemoveHeadList(&Vdo->OverflowQueue);
+            } else {
+                Vdo->PostedRequestCount--;
+                LastWorker = Vdo->PostedRequestCount == 0;
+            }
+            KeReleaseSpinLock(&Vdo->OverflowQueueSpinLock, SavedIrql);
+            if (LastWorker) {
+                UDFCheckForDismount(&Context, &Vdo->Vcb, FALSE);
+                /* That call may delete the VDO. Never read it afterwards. */
+            }
+        } _SEH2_EXCEPT(UDFExceptionFilter(&Context, _SEH2_GetExceptionInformation())) {
+            NTSTATUS Failure = Context.ExceptionStatus;
+            NTSTATUS ReportStatus = Failure == STATUS_CANT_WAIT ?
+                                        STATUS_DEVICE_BUSY : Failure;
+            /* The old IRP is already complete. Keep the actual first error
+             * on the still-live volume rather than losing it in a log only.
+             * Final memory disposal clears Context.Vcb before it can vanish. */
+            if (Context.Vcb) {
+                /* CANT_WAIT is an internal replay token. This maintenance
+                 * pass has no user request left to replay. Keep the raw code
+                 * in the log and report its operational BUSY result. */
+                InterlockedCompareExchange(&Context.Vcb->MetadataWritebackError,
+                                            ReportStatus, STATUS_SUCCESS);
+                InterlockedOr((PLONG)&Context.Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY);
+                if (GlobalAcquired && Context.Vcb->VcbCondition != VcbDismountInProgress)
+                    Context.Vcb->VcbCondition = VcbInvalid;
+            }
+            UDFPrint(("UDF: deferred FSP dismount exception %08lx\n", Failure));
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (GlobalAcquired)
+            UDFReleaseUdfData(&Context);
+        if (Context.ThreadContext) {
+            UDFRestoreThreadContext(&Context);
+        }
+        FsRtlExitFileSystem();
+    } _SEH2_END;
+    return Entry;
+}
+
 VOID
 NTAPI
 UDFFspDispatch(
@@ -1105,46 +1194,9 @@ UDFFspDispatch(
 
         if (VolDo != NULL) {
 
-            KIRQL SavedIrql;
-            PVOID Entry = NULL;
-
-            //
-            //  We have a volume device object so see if there is any work
-            //  left to do in its overflow queue.
-            //
-
-            KeAcquireSpinLock(&VolDo->OverflowQueueSpinLock, &SavedIrql);
-
-            if (VolDo->OverflowQueueCount > 0) {
-
-                //
-                //  There is overflow work to do in this volume so we'll
-                //  decrement the Overflow count, dequeue the IRP, and release
-                //  the Event
-                //
-
-                VolDo->OverflowQueueCount -= 1;
-
-                Entry = RemoveHeadList(&VolDo->OverflowQueue);
-
-            }
-            else {
-
-                VolDo->PostedRequestCount -= 1;
-
-                Entry = NULL;
-            }
-
-            KeReleaseSpinLock(&VolDo->OverflowQueueSpinLock, SavedIrql);
-
-            //
-            //  There wasn't an entry, break out of the loop and return to
-            //  the Ex Worker thread.
-            //
-
+            PLIST_ENTRY Entry = UDFRetireFspWorker(VolDo);
             if (Entry == NULL) {
-
-                break;
+                break; /* VolDo may already have been deleted by the last worker. */
             }
 
             //
@@ -1280,66 +1332,75 @@ UDFGetRegParameter(
     return DefValue;
 } // end UDFGetRegParameter()
 
+BOOLEAN
+UDFTryStopFspPosting(IN PVCB Vcb)
+{
+    PVOLUME_DEVICE_OBJECT Vdo = CONTAINING_RECORD(Vcb,
+        struct VOLUME_DEVICE_OBJECT, Vcb);
+    KIRQL SavedIrql;
+    BOOLEAN Stopped = FALSE;
+
+    /* Called at final disposal, possibly under the VPB spin lock: read only
+     * inline/nonpaged close inventory here, never wait for Cache Manager. */
+    if (Vcb->BitmapFcb || Vcb->BitmapStreamFileObject || Vcb->BitmapBcb ||
+        Vcb->BitmapIoCount || Vcb->BitmapCloseThread ||
+        Vcb->BitmapCacheState != UdfBitmapCacheAbsent ||
+        Vcb->NonAllocFileInfo || Vcb->NonAllocCheckpointFileInfo ||
+        Vcb->UniqueIDMapFileInfo || Vcb->SysSDirFileInfo || Vcb->VatFileInfo ||
+        Vcb->MetadataFileInfo || Vcb->MetadataMirrorFileInfo ||
+        Vcb->MetadataBitmapFileInfo || Vcb->PreallocCache || Vcb->PreallocCacheMaxSize)
+        return FALSE;
+    KeAcquireSpinLock(&Vdo->OverflowQueueSpinLock, &SavedIrql);
+    if (!Vdo->PostedRequestCount && !Vdo->OverflowQueueCount &&
+        IsListEmpty(&Vdo->OverflowQueue)) {
+        Vdo->FspPostingClosed = TRUE;
+        Stopped = TRUE;
+    }
+    KeReleaseSpinLock(&Vdo->OverflowQueueSpinLock, SavedIrql);
+    return Stopped;
+}
+
 VOID
 UDFDeleteVCB(
     PIRP_CONTEXT IrpContext,
     PVCB  Vcb
     )
 {
-    LARGE_INTEGER delay;
+    PVOLUME_DEVICE_OBJECT Vdo = CONTAINING_RECORD(Vcb,
+        struct VOLUME_DEVICE_OBJECT, Vcb);
     UDFPrint(("UDFDeleteVCB\n"));
 
-    PVOLUME_DEVICE_OBJECT Vdo = (PVOLUME_DEVICE_OBJECT)CONTAINING_RECORD(Vcb,
-                                                                         struct VOLUME_DEVICE_OBJECT,
-                                                                         Vcb);
+    NT_ASSERT(!Vcb->FailedAllocations && !Vcb->FailedAllocationCount &&
+              !Vcb->ActiveAllocationLeases && !Vcb->ActiveAllocationLeaseCount &&
+              !Vcb->PendingExtentRetirements &&
+              NT_SUCCESS(UDFAllocationFailureStatus(Vcb)));
+    /* Both final VPB paths close admission under the queue spin lock before
+     * changing VPB ownership. Never wait here for a worker that may itself
+     * be invoking this close, or for a worker needing our dismount locks. */
+    NT_ASSERT(Vdo->FspPostingClosed && !Vdo->PostedRequestCount &&
+              !Vdo->OverflowQueueCount && IsListEmpty(&Vdo->OverflowQueue));
+    /* This request no longer owns a usable volume after final disposal
+     * begins. Deferred error handling must not dereference its freed VCB. */
+    if (IrpContext && IrpContext->Vcb == Vcb)
+        IrpContext->Vcb = NULL;
 
-    delay.QuadPart = -500000; // 0.05 sec
-    while(Vdo->PostedRequestCount) {
-        UDFPrint(("UDFDeleteVCB: PostedRequestCount = %d\n", Vdo->PostedRequestCount));
-        // spin until all queues IRPs are processed
-        KeDelayExecutionThread(KernelMode, FALSE, &delay);
-        delay.QuadPart -= 500000; // grow delay 0.05 sec
-    }
-
-#ifdef UDF_DBG
-    _SEH2_TRY {
-        if (!ExIsResourceAcquiredShared(&UdfData.GlobalDataResource)) {
-            UDFPrint(("UDF: attempt to access to not protected data\n"));
-            UDFPrint(("UDF: UDFGlobalData\n"));
-            BrutePoint();
-        }
-    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
-        BrutePoint();
-    } _SEH2_END;
-#endif
-
-    _SEH2_TRY {
-        RemoveEntryList(&(Vcb->VcbLinks));
-    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
-        BrutePoint();
-    } _SEH2_END;
-
-    _SEH2_TRY {
-        UDFPrint(("UDF: Delete resources\n"));
-        UDFDeleteResource(&(Vcb->VcbResource));
-        UDFDeleteResource(&(Vcb->BitMapResource1));
-
-        UDFDeleteResource(&(Vcb->DlocResource));
-        UDFDeleteResource(&(Vcb->DlocResource2));
-        UDFDeleteResource(&(Vcb->FlushResource));
-        UDFDeleteResource(&(Vcb->PreallocResource));
-    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
-        BrutePoint();
-    } _SEH2_END;
-
-    _SEH2_TRY {
-        UDFPrint(("UDF: Cleanup VCB\n"));
-        ASSERT(IsListEmpty(&(Vcb->NextNotifyIRP)));
-        FsRtlNotifyUninitializeSync(&Vcb->NotifySync);
-        UDFCleanupVCB(Vcb);
-    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
-        BrutePoint();
-    } _SEH2_END;
+    ASSERT_EXCLUSIVE_CDDATA;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    NT_ASSERT(!Vcb->BitmapFcb && !Vcb->BitmapStreamFileObject &&
+              Vcb->BitmapCacheState == UdfBitmapCacheAbsent && !Vcb->BitmapIoCount);
+    /* There is no fallible cache shutdown left in this phase. A programming
+     * fault in memory disposal must propagate, not be caught and followed by
+     * destruction of the remaining ownership graph. */
+    RemoveEntryList(&Vcb->VcbLinks);
+    ASSERT(IsListEmpty(&Vcb->NextNotifyIRP));
+    FsRtlNotifyUninitializeSync(&Vcb->NotifySync);
+    UDFCleanupVCB(Vcb);
+    UDFDeleteResource(&Vcb->VcbResource);
+    UDFDeleteResource(&Vcb->BitMapResource1);
+    UDFDeleteResource(&Vcb->DlocResource);
+    UDFDeleteResource(&Vcb->DlocResource2);
+    UDFDeleteResource(&Vcb->FlushResource);
+    UDFDeleteResource(&Vcb->PreallocResource);
 
     // Chuck the backpocket Vpb we kept just in case.
     UDFFreePool((PVOID*)&Vcb->SwapVpb);
@@ -1853,3 +1914,49 @@ UDFWaitForIoAtEof(
 
 #include "Include/regtools.c"
 
+
+/* Keep an actual lower-stack failure distinct from a filesystem allocator's
+ * identical NTSTATUS. A device can also return DISK_FULL/NO_MEMORY/BUSY. */
+VOID
+UDFRecordLowerIoError(PIRP_CONTEXT IrpContext, NTSTATUS Status)
+{
+    if (Status == STATUS_SUCCESS)
+        return;
+    if (NT_SUCCESS(Status))
+        Status = STATUS_IO_DEVICE_ERROR;
+    if (!IrpContext)
+        IrpContext = UDFCurrentIrpContextForLowerError();
+    if (!IrpContext)
+        return;
+    InterlockedCompareExchange(&IrpContext->FirstLowerIoError, Status, STATUS_SUCCESS);
+    if (IrpContext->TopLevel && IrpContext->TopLevel != IrpContext)
+        InterlockedCompareExchange(&IrpContext->TopLevel->FirstLowerIoError,
+                                    Status, STATUS_SUCCESS);
+}
+
+/* Only a stack-bounded UDFS thread context may supply a missing context to
+ * a synchronous device barrier. Foreign FSRTL sentinels are not pointers.
+ * Completion callers pass their explicit still-live synchronous context. */
+PIRP_CONTEXT
+UDFCurrentIrpContextForLowerError(VOID)
+{
+    PTHREAD_CONTEXT Context = (PTHREAD_CONTEXT)IoGetTopLevelIrp();
+    ULONG_PTR Address = (ULONG_PTR)Context;
+#ifdef __REACTOS__
+    ULONG_PTR Low, High;
+#endif
+    PAGED_CODE();
+    if (!Context || (Address & 3))
+        return NULL;
+#ifdef __REACTOS__
+    IoGetStackLimits(&Low, &High);
+    if (High < sizeof(*Context) || Address <= Low || Address > High - sizeof(*Context))
+        return NULL;
+#else
+    if (!IoWithinStackLimits(Address, sizeof(*Context)))
+        return NULL;
+#endif
+    if (Context->Udfs != 0x53464444)
+        return NULL;
+    return Context->TopLevelIrpContext;
+}

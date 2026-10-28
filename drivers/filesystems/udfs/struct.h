@@ -101,6 +101,11 @@ struct UDF_IO_CONTEXT {
     BOOLEAN AllocatedContext;
     /* Physical transfer length; independent of the logical async result. */
     ULONG ExpectedByteCount;
+    struct IRP_CONTEXT* SynchronousIrpContext; // valid only until the sync event
+    /* Locked system address of a noncached read's invalid-data tail.
+     * Async completion clears it AFTER lower I/O and before user completion. */
+    PVOID ZeroReadBuffer;
+    ULONG ZeroReadLength;
 
     union {
 
@@ -172,6 +177,21 @@ struct CCB {
 
     struct FCB* Fcb;
 
+    // Exact FI reference acquired by this open, consumed once by cleanup.
+    // FCB.FileInfo is the stable shared-data representative, not this hold.
+    PUDF_FILE_INFO FileInfo;
+
+    // Failed CREATE inventory keeps this CCB/FO alive across cache callbacks.
+    LIST_ENTRY AbortLinks;
+    ULONG AbortFlags;
+    NTSTATUS AbortFirstError;
+    ULONG AbortFileObjectFlags; // cache-count receipt, no borrowed rejected FO
+    SHARE_ACCESS OpenShareAccess; // exact counter contribution accepted at CREATE
+    PCACHE_UNINITIALIZE_EVENT AbortCacheEvent; // separately allocated NonPagedPool
+
+    // Preallocated delete-on-close owner, separate from this CCB's FI hold.
+    struct _UDF_DELETE_REQUEST* DeleteOnCloseRequest;
+
     // Lcb for the file being opened.
 
     struct LCB* Lcb;
@@ -194,6 +214,15 @@ struct CCB {
     HASH_ENTRY                          hashes;
 };
 typedef struct CCB* PCCB;
+
+#define UDF_CCB_ABORT_LINKED             0x00000001
+#define UDF_CCB_ABORT_CACHE_STARTED      0x00000002
+#define UDF_CCB_ABORT_COUNTS_STARTED     0x00000004
+#define UDF_CCB_ABORT_COUNTS_DONE        0x00000008
+#define UDF_CCB_ABORT_DETACHED           0x00000010
+#define UDF_CCB_ABORT_COUNTED            0x00000020
+#define UDF_CCB_ABORT_RUNNING            0x00000040
+#define UDF_CCB_ABORT_CACHE_DONE         0x00000080
 
 #define CCB_FLAG_IGNORE_CASE                    (0x00000004)
 // the CCB has had an IRP_MJ_CLEANUP issued on it.
@@ -339,6 +368,20 @@ struct FCB {
     //  be non-zero.
     ULONG                              FcbReference;
     ULONG                              FcbCleanup;
+    // Exact requested-link owners; protected by this FCB resource.
+    LIST_ENTRY PendingDeleteQueue;
+    LIST_ENTRY AbortedOpenQueue;       // failed CREATE CCB/FO owners, Main held
+    BOOLEAN ProcessingDeletes;
+    /* The indexed identity remains present through its final FI cleanup.
+     * Protected by FcbTableMutex and VcbMutex; no user reference may enter. */
+    BOOLEAN                            TeardownInProgress;
+    BOOLEAN TeardownRetryPending;     // indexed closed-FCB retry inventory
+    struct _UDF_TEARDOWN_PLAN* TeardownPlan; // owns pins on an uncertain GC
+    PFILE_OBJECT ZeroDataFileObject;   // one referenced zero-operation owner
+    PVOID ZeroDataRetryThread;         // exact explicit retry owner, never a global bypass
+    BOOLEAN SystemReferenceHeld;       // VCB hold acquired for root/DASD FCB
+    BOOLEAN SystemUserReferenceHeld;   // DASD user-count component
+    BOOLEAN SystemOpenReleased;        // residual FCB counts consumed once
     ULONG                              CachedOpenHandleCount;
     ULONG FcbUserReference;
 
@@ -439,7 +482,6 @@ typedef struct FCB* PFCB;
 #define     FCB_STATE_INITIALIZED                       (0x00020000)
 #define     FCB_STATE_IN_FCB_TABLE                      (0x00040000)
 
-#define     UDF_FCB_DELETE_PARENT                       (0x10000000)
 #define     FCB_STATE_TEMPORARY                         (0x80000000)
 
 /**************************************************************************
@@ -473,73 +515,121 @@ enum UDFFSD_MEDIA_TYPE {
     This prevents partial creates from being visible in directory lookups.
 */
 struct LCB {
-    struct UDFIdentifier NodeIdentifier;      // +0x00 Node type = UDFS_NTC_LCB
+    struct UDFIdentifier NodeIdentifier;      // Node type = UDFS_NTC_LCB
 
-    UCHAR Reserved1[4];                // +0x04 Padding for alignment
+    UCHAR Reserved1[4];                // Padding for alignment
 
     // Links in parent FCB's ChildLcbQueue
-    LIST_ENTRY ParentFcbLinks;         // +0x08 Links in parent FCB list
+    LIST_ENTRY ParentFcbLinks;         // Links in parent FCB list
 
     // Parent directory FCB
-    PFCB ParentFcb;                    // +0x18 Pointer to parent FCB
+    PFCB ParentFcb;                    // Pointer to parent FCB
 
     // Links in child FCB's ParentLcbQueue
-    LIST_ENTRY ChildFcbLinks;          // +0x20 Links in child FCB list
+    LIST_ENTRY ChildFcbLinks;          // Links in child FCB list
 
     // Child file FCB
-    PFCB ChildFcb;                     // +0x30 Pointer to child FCB
+    PFCB ChildFcb;                     // Pointer to child FCB
+
+    // Namespace identity borrowed from ChildFcb's attached FI ring. The
+    // backpointer remains attached until every parent LCB is removed.
+    PUDF_FILE_INFO LinkFileInfo;
+
+    // Exact parent FI referenced when this LCB was created or moved.
+    PUDF_FILE_INFO ParentFileInfo;
 
     // Initial directory offset (for hard links and directory entries)
-    ULONGLONG InitialOffset;           // +0x38 Initial offset
+    ULONGLONG InitialOffset;           // Initial offset
 
-    // Reference count (incremented by CCB, decremented on cleanup)
-    ULONG Reference;                   // +0x40 Reference count
+    // Uncleaned CCB holds plus exact pending-delete/reservation pins.
+    // A committed name can leave this structure alive until all pins leave.
+    ULONG Reference;                   // Reference count
 
     // LCB flags
-    ULONG Flags;                       // +0x44 LCB flags
+    ULONG Flags;                       // LCB flags
 
     // File attributes from directory entry
-    ULONG FileAttributes;              // +0x48 File attributes
+    ULONG FileAttributes;              // File attributes
 
-    UCHAR Reserved2[4];                // +0x4C Padding
+    UCHAR Reserved2[4];                // Padding
 
     // ANSI name (for compatibility)
-    STRING Name;                       // +0x50 ANSI name (size 0x10)
+    STRING Name;                       // ANSI name (size 0x10)
 
-    UCHAR Reserved3[8];                // +0x60 Padding
+    UCHAR Reserved3[8];                // Padding
 
     // Splay tree links for exact case name matching
-    RTL_SPLAY_LINKS ExactCaseLinks;    // +0x68 Exact case splay links
+    RTL_SPLAY_LINKS ExactCaseLinks;    // Exact case splay links
 
     // Exact case name (preserves original case from disk)
-    UNICODE_STRING ExactCaseLinkName;  // +0x80 Exact case link name
+    UNICODE_STRING ExactCaseLinkName;  // Exact case link name
 
     // Splay tree links for case-insensitive name matching
-    RTL_SPLAY_LINKS IgnoreCaseLinks;   // +0x90 Ignore case splay links
+    RTL_SPLAY_LINKS IgnoreCaseLinks;   // Ignore case splay links
 
     // Case-insensitive name (uppercased for fast comparison)
-    UNICODE_STRING IgnoreCaseLinkName; // +0xA8 Ignore case link name
+    UNICODE_STRING IgnoreCaseLinkName; // Ignore case link name
 
     // Splay tree links for short (8.3) name matching
-    RTL_SPLAY_LINKS ShortNameLinks;    // +0xB8 Short name splay links
+    RTL_SPLAY_LINKS ShortNameLinks;    // Short name splay links
 
     // Short (8.3) name for DOS compatibility
-    UNICODE_STRING ShortName;          // +0xD0 Short name
+    UNICODE_STRING ShortName;          // Short name
 
     // Buffer pointer for dynamically allocated name data
     // Points to memory immediately after LCB structure in most cases
-    PVOID NameBuffer;                  // +0xE0 Buffer pointer
+    PVOID NameBuffer;                  // Buffer pointer
 
     // Full file name (component name, not full path)
-    UNICODE_STRING FileName;           // +0xE8 File name
+    UNICODE_STRING FileName;           // File name
 };
 
 typedef struct LCB* PLCB;
 
+/* One accepted namespace request owns one exact FI, plus an LCB pin when
+ * named by a user CCB. A FILE_DELETE_ON_CLOSE record is allocated before
+ * create succeeds and transferred here at cleanup; it never borrows the
+ * last CCB's identity. Held FI/Dloc objects prevent LBA-generation reuse. */
+typedef struct _UDF_DELETE_REQUEST {
+    LIST_ENTRY FcbLinks;
+    PFCB Fcb;
+    PUDF_FILE_INFO FileInfo;
+    PUDF_DATALOC_INFO ParentDloc;
+    uint_di Index;
+    PLCB Lcb;
+    NTSTATUS FirstError;
+    NTSTATUS LastStatus;
+    BOOLEAN FileReferenceOwned;
+    BOOLEAN FileReleaseStarted; // ambiguous raised decrement must not be replayed
+    BOOLEAN LcbReferenceOwned;
+    BOOLEAN Active;      // membership in PendingDeleteQueue, including cancelled owners
+    BOOLEAN Retained;
+    BOOLEAN CancelOnly;  // consume saved holds only; never an unlink intention
+    BOOLEAN NamespaceCommitted;
+    BOOLEAN NamespaceTouched;
+    BOOLEAN RemovalReported;
+} UDF_DELETE_REQUEST, *PUDF_DELETE_REQUEST;
+
+/* Prepared before a namespace rename. Names and the exact new-parent hold
+ * are either transferred to the LCB once, or released by the abort path. */
+typedef struct _UDF_PREFIX_RENAME_PLAN {
+    PLCB Lcb;
+    PUDF_FILE_INFO LinkFileInfo;
+    PFCB OldParentFcb;
+    PUDF_FILE_INFO OldParentFileInfo;
+    PFCB NewParentFcb;
+    PUDF_FILE_INFO NewParentFileInfo;
+    UNICODE_STRING FileName;
+    UNICODE_STRING IgnoreCaseName;
+    BOOLEAN ParentFileReferenceOwned;
+    BOOLEAN ParentFcbReferenceOwned;
+    BOOLEAN Prepared;
+    BOOLEAN Applied;
+} UDF_PREFIX_RENAME_PLAN, *PUDF_PREFIX_RENAME_PLAN;
+
 // LCB Flags
 #define UDF_LCB_FLAG_POOL_ALLOCATED         0x00000001  // Allocated from pool (not lookaside)
 #define UDF_LCB_FLAG_LINK_DELETED           0x00000002  // Link has been deleted
-#define UDF_LCB_FLAG_HAS_NAME_BUFFER        0x00000004  // Name buffer needs freeing (separately allocated)
 #define UDF_LCB_FLAG_DELETE_ON_CLEANUP      0x00000008  // Delete file on cleanup
 #define UDF_LCB_FLAG_EXACT_CASE_IN_TREE     0x00000010  // In exact case splay tree
 #define UDF_LCB_FLAG_IGNORE_CASE_IN_TREE    0x00000020  // In ignore case splay tree
@@ -567,6 +657,63 @@ enum VCB_CONDITION {
     VcbInvalid,
     VcbDismountInProgress
 };
+
+enum UDF_BITMAP_CACHE_STATE {
+    UdfBitmapCacheAbsent = 0,
+    UdfBitmapCacheActive,
+    UdfBitmapCacheQuiescing,
+    UdfBitmapCacheUninitializing,
+    UdfBitmapCacheUninitialized,
+    UdfBitmapCacheDisposing,
+    UdfBitmapCacheQuarantined
+};
+
+/* Preallocated before the first bitmap claim. Mapping coordinates stay
+ * immutable during rollback; an unresolved attempt remains a VCB owner,
+ * independent of a caller-local EXTENT_INFO and any FI/FCB lifetime. */
+typedef struct _UDF_ALLOCATION_FAILURE {
+    struct _UDF_ALLOCATION_FAILURE* Next;
+    PEXTENT_MAP Mapping;
+    ULONG MappingBytes;
+    ULONG PartRef;
+    ULONG PartitionRoot;
+    ULONG PartitionLength;
+    ULONG SourceId;
+    ULONG SourceLine;
+    NTSTATUS FirstError;
+    NTSTATUS RollbackError;
+    BOOLEAN HasClaims;
+    BOOLEAN ClaimInProgress;
+    BOOLEAN Uncertain;
+    BOOLEAN Leased;
+    BOOLEAN Published;
+    BOOLEAN Metadata;
+    ULONG MetadataFirstBit;
+    ULONG MetadataBitCount;
+} UDF_ALLOCATION_FAILURE, *PUDF_ALLOCATION_FAILURE;
+
+/* Caller-private lease set. Each VCB lease retains its own immutable claim
+ * map; the work EXTENT_INFO is a separately allocated mutable copy. */
+typedef struct _UDF_PRIVATE_ALLOCATION {
+    struct _UDF_PRIVATE_ALLOCATION* Next;
+    PUDF_ALLOCATION_FAILURE Lease;
+} UDF_PRIVATE_ALLOCATION, *PUDF_PRIVATE_ALLOCATION;
+
+/* Independent, immutable copies of both metadata mappings. One publication
+ * reference belongs to the VCB; readers keep their own reference across I/O.
+ * Neither releasing a view nor reading it requires any Dloc/bitmap resource. */
+typedef struct _UDF_METADATA_VIEW {
+    volatile LONG References;
+    ULONG SectorSize;
+    ULONG SectorShift;
+    ULONG MainCount;
+    ULONG MirrorCount;
+    ULONG MainBlocks;
+    ULONG MirrorBlocks;
+    UCHAR Flags;
+    const EXTENT_MAP* MainMap;
+    const EXTENT_MAP* MirrorMap;
+} UDF_METADATA_VIEW, *PUDF_METADATA_VIEW;
 
 struct VCB {
 
@@ -660,6 +807,20 @@ struct VCB {
     // Lock ordering: FcbTableMutex (outer) before VcbMutex (inner).
 
     FAST_MUTEX FcbTableMutex;
+    LONG FcbTeardownCount;             // outstanding indexed cleanup owners
+    LONG ClosedFcbRetryCount;          // deferred GC, not an extra open reference
+    LONG RetainedOpenCount;           // failed exact CREATE-reference consumption
+    LONG AbortedOpenCount;             // retained CCB/cache aborts, no false CLOSED
+    LONG FailedZeroDataCount;         // exact failed initialization owners; no CLOSED
+    LONG PendingNamespaceCount;       // retained scratch generations; cannot close LVID
+    LIST_ENTRY CreateRollbackQueue;   // inline FI owners, DlocResource2 protects links
+    LONG CreateRollbackCount;
+    LONG PendingDeleteCount;           // active exact-link requests, no false CLOSED
+    LONG RetainedDeleteCount;          // failed exact-link requests; cannot close LVID
+    BOOLEAN ResidualCloseStarted;     // mount residual reference consumed once
+    BOOLEAN ResidualCheckpointComplete; // post-root-GC generation is durable
+    BOOLEAN ResidualRetirementStarted;  // no writeback/reopening after this point
+    LONG ResidualCloseError;            // first reported close-attempt status
     PVOID FcbTableLockThread;
 
     //---------------
@@ -671,6 +832,9 @@ struct VCB {
 
     ULONG SessionStartLba;
     ULONG SessionEndLba;
+    /* Device capacity before TOC/session/fixed-packet logical adjustments. */
+    ULONG PhysicalLastLba;
+    BOOLEAN PhysicalLastLbaKnown;
 
     // Number of last session
     ULONG           LastSession;
@@ -728,6 +892,8 @@ struct VCB {
     // Pointer to partition structures
     PUDFPartMap     Partitions;
     struct LogicalVolIntegrityDesc* LVid;
+    PCHAR           LoadedLvd;         // immutable mount-selection receipt; owns exact descriptor bytes
+    ULONG           LoadedLvdLength;
     uint32          IntegrityType;
     uint32          origIntegrityType;
     /* First OPEN write can finish before its device barrier. Other writers
@@ -752,8 +918,14 @@ struct VCB {
     // VAT
     uint32          InitVatCount;
     uint32          VatCount;
-    uint32*         Vat;
+    uint32          VatCapacity;       // immutable allocated entry count while Vat is live
+    uint32*         Vat;               // published last; immutable until final VCB disposal
     uint32          VatPartNdx;
+    uint32          VatPhysPartNdx;
+    uint32          VatPartitionRoot;
+    uint32          VatPartitionLength;
+    uint16          VatPartitionNumber;
+    uint16          VatVolumeSequence;
     PUDF_FILE_INFO  VatFileInfo;
     uint32          MetadataRef;            
     uint32          MetadataPhysRef;        
@@ -766,6 +938,8 @@ struct VCB {
     PUDF_FILE_INFO  MetadataFileInfo;
     PUDF_FILE_INFO  MetadataMirrorFileInfo;
     PUDF_FILE_INFO  MetadataBitmapFileInfo;
+    KSPIN_LOCK      MetadataViewLock;       // pointer/ref acquisition only, never I/O
+    PUDF_METADATA_VIEW MetadataView;
     PCHAR           MetadataBitmap;         
     PCHAR           MetadataPendingAlloc;  // bits allocated since last successful bitmap flush
     uint32          MetadataBitmapByteCount;
@@ -778,8 +952,15 @@ struct VCB {
     // sparing table
     ULONG           SparingCountFree;
     ULONG           SparingCount;
+    ULONG           SparingCapacity;       // allocated entry count; immutable
     ULONG           SparingBlockSize;
     struct _SparingEntry* SparingTable;
+    USHORT          SparingPartitionNumber;
+    USHORT          SparingVolumeSequence;
+    ULONG           SparingSequence;
+    ULONG           SparingPartitionRoot;
+    ULONG           SparingPartitionLength;
+    LONG            SparingReady;          // publish once, before namespace users
 #define MAX_SPARING_TABLE_LOCATIONS 32
     uint32          SparingTableLoc[MAX_SPARING_TABLE_LOCATIONS];
     uint32          SparingTableCount;
@@ -805,6 +986,14 @@ struct VCB {
     ULONG           TruncateTxnCount;
     ULONG           TruncateTxnCapacity;
     NTSTATUS        TruncateTxnError;
+    /* Protected by BitMapResource1; error/count are published atomically.
+     * No new allocation is admitted after an unresolved receipt exists. */
+    PUDF_ALLOCATION_FAILURE FailedAllocations;
+    LONG            FailedAllocationCount;
+    LONG            FailedAllocationError;
+    PUDF_ALLOCATION_FAILURE ActiveAllocationLeases;
+    LONG            ActiveAllocationLeaseCount;
+    LONG            PendingExtentRetirements;
     ULONG           BitmapModified;
     LONG            DirectoryAppendBytes; // bounded pending-directory buffers
     LONG            DirectoryFECheckpointBytes; // bounded successful-FE proofs
@@ -820,6 +1009,17 @@ struct VCB {
     // Bitmap cache stream (per-page CcPinRead)
     PFCB                BitmapFcb;              // FCB for bitmap internal stream
     PFILE_OBJECT        BitmapStreamFileObject;  // Internal FileObject for bitmap
+    enum UDF_BITMAP_CACHE_STATE BitmapCacheState;
+    CACHE_UNINITIALIZE_EVENT BitmapUninitEvent; // VCB lifetime, survives a timeout
+    KEVENT BitmapIoDrained;
+    KSPIN_LOCK BitmapIoLock;
+    LONG BitmapIoCount;
+    LONG BitmapIoError; // first write failure in the current checked flush
+    BOOLEAN BitmapIoStopped;
+    BOOLEAN BitmapCacheInitialized;
+    BOOLEAN BitmapHeaderAccepted;
+    NTSTATUS BitmapCloseError;
+    PVOID BitmapCloseThread; // one active close attempt, persistent phase is separate
     struct FCB_NONPAGED        BitmapNonpaged;          // Nonpaged data (inline in VCB)
     LARGE_MCB           BitmapMcb;               // VBN -> PSN mapping for bitmap extents
     PVOID               BitmapBcb;               // BCB of currently pinned page (NULL = none)
@@ -845,6 +1045,9 @@ struct VCB {
     PUDF_FILE_INFO  SysSDirFileInfo;
     // Non-alloc space
     PUDF_FILE_INFO  NonAllocFileInfo;
+    /* Independent FI/Dloc hold; no weak ParentFile into the retired root.
+     * Owns only checkpoint access, not another namespace link or FCB. */
+    PUDF_FILE_INFO  NonAllocCheckpointFileInfo;
     // Unique ID Mapping
     PUDF_FILE_INFO  UniqueIDMapFileInfo;
     // Saved location of Primary Vol Descr (used for setting Label)
@@ -910,13 +1113,13 @@ struct VOLUME_DEVICE_OBJECT {
 
     DEVICE_OBJECT DeviceObject;
 
-    // The following field tells how many requests for this volume have
-    // either been enqueued to ExWorker threads or are currently being
-    // serviced by ExWorker threads.  If the number goes above
-    // a certain threshold, put the request on the overflow queue to be
-    // executed later.
-
+    // Number of queued/running ExWorker instances. A worker keeps its
+    // count while draining overflow; this is not one count per IRP.
+    // The count also protects the volume until that worker has retired.
     __volatile ULONG PostedRequestCount;
+    // Final deletion closes admission only with zero workers/overflow.
+    // Protected by OverflowQueueSpinLock; never reopened on this VDO.
+    BOOLEAN FspPostingClosed;
 
     // The following field indicates the number of IRP's waiting
     // to be serviced in the overflow queue.
@@ -982,6 +1185,8 @@ struct IRP_CONTEXT {
     PDEVICE_OBJECT                  RealDevice;
     // if an exception occurs, we will store the code here
     NTSTATUS                        ExceptionStatus;
+    volatile LONG FirstLowerIoError; // actual completed lower failure, not allocator status
+    BOOLEAN DeletedCacheClosePending; // this flush purged a committed deleted cache
     // For queued close operation we save Fcb
     PFCB                            Fcb;
 

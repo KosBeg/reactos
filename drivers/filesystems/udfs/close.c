@@ -489,7 +489,10 @@ Return Value:
     // and let our caller know he should post the request to the async
     // queue.
 
-    if (UDFAcquireVcbShared(IrpContext, Vcb, FromFsd)) {
+    /* Last-close GC follows weak FI cache edges. Take its exclusive VCB
+     * domain before the child resource; an FSD caller that cannot enter
+     * posts the existing close record without consuming its counts. */
+    if (UDFAcquireVcbExclusive(IrpContext, Vcb, FromFsd)) {
 
         if (!UDFAcquireFcbExclusive(IrpContext, Fcb, FromFsd)) {
 
@@ -690,10 +693,8 @@ Return Value:
 
             _Analysis_assume_(CurrentVcb != NULL);
             
-            if (AllowBatch)
-                UDFAcquireVcbExclusive(IrpContext, CurrentVcb, FALSE);
-            else
-                UDFAcquireVcbShared(IrpContext, CurrentVcb, FALSE);
+            /* Both batch and ordinary close may run final FI/LCB GC. */
+            UDFAcquireVcbExclusive(IrpContext, CurrentVcb, FALSE);
 
             VcbHoldCount = 0;
 

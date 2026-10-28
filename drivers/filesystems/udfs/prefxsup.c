@@ -245,6 +245,7 @@ UDFInsertPrefix(
     IN PIRP_CONTEXT IrpContext,
     IN PFCB ParentFcb,
     IN PFCB ChildFcb,
+    IN PUDF_FILE_INFO LinkFileInfo, // exact parent holds already acquired
     IN PUNICODE_STRING FileName OPTIONAL,
     IN PUNICODE_STRING CaseFileName OPTIONAL,
     IN PUNICODE_STRING ShortName OPTIONAL,
@@ -253,7 +254,7 @@ UDFInsertPrefix(
 {
     PLCB Lcb;
     ULONG Flags = 0;
-    USHORT NameLength = 0;
+    ULONG NameLength = 0;
     ULONG AllocationSize;
     PWCHAR NameBuffer;
 
@@ -261,21 +262,30 @@ UDFInsertPrefix(
 
     ASSERT(ParentFcb);
     ASSERT(ChildFcb);
+    if (!ParentFcb || !ChildFcb || !LinkFileInfo ||
+        !LinkFileInfo->ParentFile || LinkFileInfo->Fcb != ChildFcb ||
+        LinkFileInfo->ParentFile->Fcb != ParentFcb)
+        return NULL;
 
-    //
-    // Calculate required allocation size for names
-    // Layout: FileName + padding(0x18) + CaseFileName + ShortName
-    //
-    if (FileName != NULL && FileName->Length > 0) {
-        // Size = FileName->Length + alignment(0x18) + CaseFileName->Length + ShortName->Length
+    /* NodeByteSize and UNICODE_STRING lengths are USHORT. Do not wrap
+     * their combined backing allocation when multiple names are present. */
+    if ((FileName && (FileName->Length % sizeof(WCHAR) ||
+                      FileName->Length > FileName->MaximumLength ||
+                      (FileName->Length && !FileName->Buffer))) ||
+        (CaseFileName && (CaseFileName->Length % sizeof(WCHAR) ||
+                          CaseFileName->Length > CaseFileName->MaximumLength ||
+                          (CaseFileName->Length && !CaseFileName->Buffer))) ||
+        (ShortName && (ShortName->Length % sizeof(WCHAR) ||
+                      ShortName->Length > ShortName->MaximumLength ||
+                      (ShortName->Length && !ShortName->Buffer))))
+        return NULL;
+    if (FileName && FileName->Length) {
         NameLength = FileName->Length + 0x18;
-        if (CaseFileName != NULL && CaseFileName->Length > 0) {
-            NameLength += CaseFileName->Length;
-        }
-        if (ShortName != NULL && ShortName->Length > 0) {
-            NameLength += ShortName->Length;
-        }
+        if (CaseFileName) NameLength += CaseFileName->Length;
+        if (ShortName) NameLength += ShortName->Length;
     }
+    if (NameLength > MAXUSHORT - UDF_LCB_BASE_SIZE)
+        return NULL;
 
     AllocationSize = UDF_LCB_BASE_SIZE + NameLength;
 
@@ -319,6 +329,8 @@ UDFInsertPrefix(
     // Set up FCB pointers
     Lcb->ParentFcb = ParentFcb;
     Lcb->ChildFcb = ChildFcb;
+    Lcb->LinkFileInfo = LinkFileInfo;
+    Lcb->ParentFileInfo = LinkFileInfo->ParentFile;
     Lcb->InitialOffset = InitialOffset;
 
     // Set flags
@@ -349,7 +361,7 @@ UDFInsertPrefix(
 
             // Mirror the exact-case component name. It aliases the same
             // embedded buffer (never freed separately), consistent with
-            // UDFRenameMovePrefix. Change-notify offset computation and
+            // UDFApplyPrefixRename. Change-notify offset computation and
             // full-path building read ExactCaseLinkName; without this it
             // stayed zero-length on freshly created links, which forced a
             // TargetNameOffset of 0 in UDFNotifyReportChange — so FsRtl saw
@@ -443,16 +455,24 @@ UDFRemovePrefix(
     InitializeListHead(&Lcb->ChildFcbLinks);
 
     //
-    // Free name buffer if separately allocated
-    // This flag indicates the NameBuffer was allocated independently,
-    // not as part of the LCB structure
+    // NameBuffer is embedded in the LCB allocated by UDFInsertPrefix.
+    // Never pass this interior LCB pointer to a pool free routine.
     //
-    if (FlagOn(Lcb->Flags, UDF_LCB_FLAG_HAS_NAME_BUFFER)) {
-        if (Lcb->NameBuffer != NULL) {
-            ExFreePool(Lcb->NameBuffer);
-            Lcb->NameBuffer = NULL;
-        }
-    }
+    Lcb->NameBuffer = NULL;
+
+    /* Rename may allocate these two names outside the LCB. Their embedded
+     * forms and ExactCaseLinkName (an alias of FileName) own no allocation. */
+    if (Lcb->IgnoreCaseLinkName.Buffer &&
+        Lcb->IgnoreCaseLinkName.Buffer != Lcb->FileName.Buffer &&
+        ((PUCHAR)Lcb->IgnoreCaseLinkName.Buffer < (PUCHAR)Lcb ||
+         (PUCHAR)Lcb->IgnoreCaseLinkName.Buffer >= (PUCHAR)Lcb + Lcb->NodeIdentifier.NodeByteSize))
+        ExFreePool(Lcb->IgnoreCaseLinkName.Buffer);
+    if (Lcb->ShortName.Buffer &&
+        Lcb->ShortName.Buffer != Lcb->FileName.Buffer &&
+        Lcb->ShortName.Buffer != Lcb->IgnoreCaseLinkName.Buffer &&
+        ((PUCHAR)Lcb->ShortName.Buffer < (PUCHAR)Lcb ||
+         (PUCHAR)Lcb->ShortName.Buffer >= (PUCHAR)Lcb + Lcb->NodeIdentifier.NodeByteSize))
+        ExFreePool(Lcb->ShortName.Buffer);
 
     //
     // Free FileName.Buffer if it was separately allocated (e.g., after rename)
@@ -530,70 +550,123 @@ UDFFindPrefix(
 
 /*
     This routine acquires or creates an LCB linking the parent FCB to child FCB.
-    If LCB already exists, increments its Reference count.
-    If new LCB is created:
-    - Increments parent FCB's FcbReference
-    - Increments parent's FileInfo->RefCount (if available)
+    An existing LCB keeps its cache ownership; this call acquires no CCB pin.
+    A new LCB consumes one checked exact-parent FI and FCB hold, acquired
+    before publication. UDFCompleteFcbOpen adds the separate successful CCB pin.
 
     This is the primary function to call when establishing a parent-child
     relationship during file open.
 
-    Returns the LCB (existing or newly created), or NULL on allocation failure.
+    Returns the exact status and LCB output; a new LCB consumes pre-acquired
+    exact-parent FI/FCB holds. Failure rolls private holds back without I/O.
 */
-PLCB
+NTSTATUS
 UDFAcquirePrefix(
     IN PIRP_CONTEXT IrpContext,
     IN PFCB ParentFcb,
     IN PFCB ChildFcb,
+    IN PUDF_FILE_INFO LinkFileInfo,
     IN PUNICODE_STRING FileName OPTIONAL,
     IN PUNICODE_STRING CaseFileName OPTIONAL,
     IN PUNICODE_STRING ShortName OPTIONAL,
-    IN ULONGLONG InitialOffset
+    IN ULONGLONG InitialOffset,
+    OUT PLCB* Result
     )
 {
+    PLIST_ENTRY Entry;
+    PVCB Vcb;
+    _SEH2_VOLATILE PUDF_FILE_INFO ParentReference = NULL;
+    _SEH2_VOLATILE BOOLEAN ParentAcquired = FALSE, ParentPinned = FALSE;
+    _SEH2_VOLATILE BOOLEAN Transferred = FALSE;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
     PLCB Lcb;
-
-    UNREFERENCED_PARAMETER(IrpContext);
-
-    ASSERT(ParentFcb);
-    ASSERT(ChildFcb);
-
-    //
-    // First try to find existing LCB
-    //
-    Lcb = UDFFindPrefix(IrpContext, ParentFcb, ChildFcb);
-
-    if (Lcb) {
-        //
-        // Found existing LCB - return it as-is.
-        return Lcb;
-    }
-
-    //
-    // Need to create new LCB with dynamic names
-    //
-    Lcb = UDFInsertPrefix(IrpContext, ParentFcb, ChildFcb,
-                          FileName, CaseFileName, ShortName, InitialOffset);
-
-    if (Lcb) {
-        //
-        // New LCB created - Reference=0 and stays 0.
-        // Lcb->Reference is only used for temporary lock protection,
-        // not for counting opens. Teardown checks Reference==0 before removal.
-        //
-        Lcb->Reference = 0;
-
-        //
-        // Increment parent refs immediately after LCB creation.
-        // These will be decremented in UDFTeardownStructures when LCB is removed.
-        //
-        InterlockedIncrement((PLONG)&ParentFcb->FcbReference);
-        if (ParentFcb->FileInfo) {
-            UDFReferenceFile__(ParentFcb->FileInfo);
+    if (!Result) return STATUS_INVALID_PARAMETER;
+    *Result = NULL;
+    if (!ParentFcb || !ChildFcb || !LinkFileInfo ||
+        ParentFcb->Vcb != ChildFcb->Vcb || ParentFcb == ChildFcb ||
+        !LinkFileInfo->Dloc || LinkFileInfo->Fcb != ChildFcb ||
+        LinkFileInfo->Dloc->CommonFcb != ChildFcb ||
+        !LinkFileInfo->ParentFile || !LinkFileInfo->ParentFile->Dloc ||
+        LinkFileInfo->ParentFile->Fcb != ParentFcb)
+        return STATUS_FILE_INVALID;
+    Vcb = ChildFcb->Vcb;
+    ASSERT_EXCLUSIVE_FCB(ChildFcb);
+    if (ChildFcb->TeardownInProgress || ParentFcb->TeardownInProgress)
+        return STATUS_FILE_CORRUPT_ERROR;
+    for (Entry = ChildFcb->ParentLcbQueue.Flink;
+         Entry != &ChildFcb->ParentLcbQueue; Entry = Entry->Flink) {
+        PLCB Candidate = CONTAINING_RECORD(Entry, struct LCB, ChildFcbLinks);
+        if (Candidate->ParentFcb == ParentFcb && Candidate->LinkFileInfo == LinkFileInfo &&
+            !(Candidate->Flags & UDF_LCB_FLAG_LINK_DELETED)) {
+            if (Candidate->ParentFileInfo != LinkFileInfo->ParentFile)
+                return STATUS_FILE_CORRUPT_ERROR;
+            *Result = Candidate;
+            return STATUS_SUCCESS; /* existing cache owner, no new references */
         }
     }
-
-    return Lcb;
+    /* A new name mutates the parent's cache. Never wait/upgrade upwards
+     * from child Main; existing LCB lookup above needs only child Main. */
+    if (!ExIsResourceAcquiredExclusiveLite(&ParentFcb->FcbNonpaged->FcbResource)) {
+        if (ExIsResourceAcquiredSharedLite(&ParentFcb->FcbNonpaged->FcbResource) ||
+            !UDFAcquireFcbExclusive(IrpContext, ParentFcb, TRUE))
+            return STATUS_DEVICE_BUSY;
+        ParentAcquired = TRUE;
+    }
+    _SEH2_TRY {
+        /* Acquire the exact FI first, with no fast mutex held. Reserve the
+         * corresponding FCB hold before allocating/publishing the LCB. */
+        Status = UDFReferenceFileChecked(Vcb, LinkFileInfo->ParentFile);
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        ParentReference = LinkFileInfo->ParentFile;
+        UDFLockVcb(IrpContext, Vcb);
+        _SEH2_TRY {
+            if (ParentFcb->FcbReference == MAXULONG || ParentFcb->TeardownInProgress)
+                Status = STATUS_FILE_CORRUPT_ERROR;
+            else {
+                ParentFcb->FcbReference++;
+                ParentPinned = TRUE;
+            }
+        } _SEH2_FINALLY {
+            UDFUnlockVcb(IrpContext, Vcb);
+        } _SEH2_END;
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        Lcb = UDFInsertPrefix(IrpContext, ParentFcb, ChildFcb, LinkFileInfo,
+                              FileName, CaseFileName, ShortName, InitialOffset);
+        if (!Lcb) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            _SEH2_LEAVE;
+        }
+        /* Exact FI/parent fields were initialized before queue/name-tree
+         * publication. No fallible work remains before this transfer. */
+        Transferred = TRUE;
+        *Result = Lcb;
+    } _SEH2_FINALLY {
+        _SEH2_TRY {
+            if (!Transferred && ParentReference) {
+                NTSTATUS ReleaseStatus = UDFReleaseCreateReference(IrpContext, Vcb,
+                    (PUDF_FILE_INFO*)&ParentReference, FALSE);
+                if (Status == STATUS_SUCCESS) Status = ReleaseStatus;
+            }
+        } _SEH2_FINALLY {
+            if (!Transferred && ParentPinned) {
+                UDFLockVcb(IrpContext, Vcb);
+                _SEH2_TRY {
+                    ASSERT(ParentFcb->FcbReference);
+                    ParentFcb->FcbReference--;
+                    if (!ParentFcb->FcbReference &&
+                        FlagOn(ParentFcb->FcbState, FCB_STATE_IN_FCB_TABLE) &&
+                        !ParentFcb->TeardownRetryPending) {
+                        ParentFcb->TeardownRetryPending = TRUE;
+                        InterlockedIncrement(&Vcb->ClosedFcbRetryCount);
+                    }
+                } _SEH2_FINALLY {
+                    UDFUnlockVcb(IrpContext, Vcb);
+                } _SEH2_END;
+            }
+            if (ParentAcquired) UDFReleaseFcb(IrpContext, ParentFcb);
+        } _SEH2_END;
+    } _SEH2_END;
+    return Status;
 } // end UDFAcquirePrefix()
 
 
@@ -623,253 +696,142 @@ UDFReleasePrefix(
 } // end UDFReleasePrefix()
 
 
-/*
-    Builds full path from LCB chain with caching support.
+/* A full path is a caller-owned snapshot, never an LCB lookup key.
+ * Acquire ancestors without waiting: callers may already hold a child FCB,
+ * so blocking upwards would invert rename's parent-before-child order.
+ * Keep every acquired FCB until both sizing and copying are complete. */
+typedef struct _UDF_PATH_COMPONENT {
+    struct _UDF_PATH_COMPONENT *Next;
+    PFCB Fcb;
+    PLCB Lcb;
+    BOOLEAN Acquired;
+} UDF_PATH_COMPONENT, *PUDF_PATH_COMPONENT;
 
-    Builds path by walking up the parent LCB chain from current LCB to root.
-
-    Caching strategy:
-    - If Lcb->FileName.Buffer already contains full path → use cached value
-    - Otherwise, build path recursively and optionally cache it
-    - Uses FcbLockThread/FcbLockCount/FcbFastMutex for synchronization
-
-    Parameters:
-        IrpContext - IRP context
-        Lcb - LCB to build path for (starting point)
-        FullPath - Output UNICODE_STRING for full path
-        CachePath - If TRUE, cache the built path in LCB->FileName
-
-    Returns:
-        STATUS_SUCCESS - Path built successfully
-        STATUS_INSUFFICIENT_RESOURCES - Memory allocation failed
-*/
 NTSTATUS
 UDFBuildFullPathFromLcb(
     IN PIRP_CONTEXT IrpContext,
     IN PLCB Lcb,
-    OUT PUNICODE_STRING FullPath,
-    IN BOOLEAN CachePath
+    OUT PUNICODE_STRING FullPath
     )
 {
+    _SEH2_VOLATILE PUDF_PATH_COMPONENT Components = NULL;
+    PUDF_PATH_COMPONENT Component, Previous;
+    PFCB CurrentFcb, ParentFcb;
     PLCB CurrentLcb;
-    PFCB CurrentFcb;
-    PFCB Fcb;
-    USHORT TotalLength = 0;
-    USHORT ComponentLength;
+    PLIST_ENTRY Link;
+    ULONG TotalLength = 0;
     _SEH2_VOLATILE PWCHAR Buffer = NULL;
-    PWCHAR CurrentPosition;
-    PKTHREAD CurrentThread;
-    _SEH2_VOLATILE BOOLEAN CacheLockAcquired = FALSE;
-    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    PWCHAR Position;
+    NTSTATUS Status = STATUS_SUCCESS;
+    PVCB Vcb;
+    UNREFERENCED_PARAMETER(IrpContext);
 
-    if (!Lcb) {
+    RtlZeroMemory(FullPath, sizeof(*FullPath));
+    if (!Lcb || !Lcb->ChildFcb)
         return STATUS_INVALID_PARAMETER;
-    }
-
     CurrentFcb = Lcb->ChildFcb;
-    if (!CurrentFcb) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    Fcb = CurrentFcb;
+    CurrentLcb = Lcb;
+    Vcb = CurrentFcb->Vcb;
+    if (!ExAcquireResourceSharedLite(&Vcb->VcbResource, FALSE))
+        return STATUS_SHARING_VIOLATION;
 
     _SEH2_TRY {
-
-        // Check if path is already cached in this LCB
-        CurrentThread = KeGetCurrentThread();
-
-        if (CurrentThread != Fcb->FcbLockThread) {
-            ExAcquireFastMutex(&Fcb->FcbNonpaged->FcbFastMutex);
-            Fcb->FcbLockThread = CurrentThread;
-        }
-
-        Fcb->FcbLockCount++;
-        CacheLockAcquired = TRUE;
-
-        // Check if FileName contains cached full path (set by CachePath=TRUE)
-        if (FlagOn(Lcb->Flags, UDF_LCB_FLAG_HAS_NAME_BUFFER) &&
-            Lcb->FileName.Buffer != NULL && Lcb->FileName.Length > 0) {
-            // Cached full path exists - use it
-            FullPath->Length = Lcb->FileName.Length;
-            FullPath->MaximumLength = Lcb->FileName.MaximumLength;
-            FullPath->Buffer = (PWCHAR)ExAllocatePoolWithTag(PagedPool,
-                                                             FullPath->MaximumLength,
-                                                             TAG_FILE_NAME);
-            if (!FullPath->Buffer) {
+        for (;;) {
+            Component = ExAllocatePoolWithTag(PagedPool, sizeof(*Component), TAG_FILE_NAME);
+            if (!Component) {
                 Status = STATUS_INSUFFICIENT_RESOURCES;
                 _SEH2_LEAVE;
             }
-
-            RtlCopyMemory(FullPath->Buffer, Lcb->FileName.Buffer, Lcb->FileName.Length);
-            _SEH2_LEAVE;
-        }
-
-        // Release cache lock before building path
-        Fcb->FcbLockCount--;
-        if (Fcb->FcbLockCount == 0) {
-            Fcb->FcbLockThread = NULL;
-            ExReleaseFastMutex(&Fcb->FcbNonpaged->FcbFastMutex);
-        }
-        CacheLockAcquired = FALSE;
-
-        //
-        // No cached path - build it from LCB chain
-        //
-
-        // Calculate total path length by walking up parent chain
-        CurrentLcb = Lcb;
-        while (CurrentLcb) {
-            // Add component length + separator
-            if (CurrentLcb->FileName.Buffer && CurrentLcb->FileName.Length > 0) {
-                ComponentLength = CurrentLcb->FileName.Length;
-            } else if (CurrentLcb->ExactCaseLinkName.Buffer && CurrentLcb->ExactCaseLinkName.Length > 0) {
-                ComponentLength = CurrentLcb->ExactCaseLinkName.Length;
-            } else {
-                ComponentLength = 0;
+            RtlZeroMemory(Component, sizeof(*Component));
+            Component->Fcb = CurrentFcb;
+            Component->Next = Components;
+            Components = Component;
+            if (!ExAcquireResourceSharedLite(&CurrentFcb->FcbNonpaged->FcbResource, FALSE)) {
+                Status = STATUS_SHARING_VIOLATION;
+                _SEH2_LEAVE;
             }
-
-            if (ComponentLength > 0) {
-                TotalLength += ComponentLength + sizeof(WCHAR); // +1 for backslash
-            }
-
-            // Move to parent
-            CurrentFcb = CurrentLcb->ParentFcb;
-            if (!CurrentFcb || (CurrentFcb->FcbState & UDF_FCB_ROOT_DIRECTORY)) {
+            Component->Acquired = TRUE;
+            if (FlagOn(CurrentFcb->FcbState, UDF_FCB_ROOT_DIRECTORY))
                 break;
+
+            if (!CurrentLcb) {
+                for (Link = CurrentFcb->ParentLcbQueue.Flink;
+                     Link != &CurrentFcb->ParentLcbQueue; Link = Link->Flink) {
+                    PLCB Candidate = CONTAINING_RECORD(Link, struct LCB, ChildFcbLinks);
+                    if (!FlagOn(Candidate->Flags, UDF_LCB_FLAG_LINK_DELETED)) {
+                        CurrentLcb = Candidate;
+                        break;
+                    }
+                }
             }
-
-            // Find parent LCB
-            if (!IsListEmpty(&CurrentFcb->ParentLcbQueue)) {
-                PLIST_ENTRY ListEntry = CurrentFcb->ParentLcbQueue.Flink;
-                CurrentLcb = CONTAINING_RECORD(ListEntry, struct LCB, ChildFcbLinks);
-            } else {
-                break;
+            if (!CurrentLcb || CurrentLcb->ChildFcb != CurrentFcb ||
+                FlagOn(CurrentLcb->Flags, UDF_LCB_FLAG_LINK_DELETED) ||
+                !CurrentLcb->ExactCaseLinkName.Buffer || !CurrentLcb->ExactCaseLinkName.Length ||
+                CurrentLcb->ExactCaseLinkName.Length % sizeof(WCHAR) ||
+                CurrentLcb->ExactCaseLinkName.Length > CurrentLcb->ExactCaseLinkName.MaximumLength) {
+                Status = STATUS_FILE_INVALID;
+                _SEH2_LEAVE;
             }
+            Component->Lcb = CurrentLcb;
+            /* UNICODE_STRING's terminator must fit too. Use a wide sum,
+             * then narrow only after the complete locked chain is known. */
+            if (TotalLength + CurrentLcb->ExactCaseLinkName.Length + sizeof(WCHAR) >
+                MAXUSHORT - sizeof(WCHAR)) {
+                Status = STATUS_NAME_TOO_LONG;
+                _SEH2_LEAVE;
+            }
+            TotalLength += CurrentLcb->ExactCaseLinkName.Length + sizeof(WCHAR);
+            ParentFcb = CurrentLcb->ParentFcb;
+            if (!ParentFcb || ParentFcb->Vcb != CurrentFcb->Vcb) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            /* A corrupt parent cycle must neither loop nor recursively
+             * acquire the same resource an unbounded number of times. */
+            for (Previous = Components; Previous; Previous = Previous->Next) {
+                if (Previous->Fcb == ParentFcb) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+            }
+            CurrentFcb = ParentFcb;
+            CurrentLcb = NULL;
         }
-
-        // Add root backslash
-        if (TotalLength == 0) {
-            TotalLength = sizeof(WCHAR);
-        }
-
-        // Allocate buffer for full path
-        Buffer = (PWCHAR)ExAllocatePoolWithTag(PagedPool, TotalLength + sizeof(WCHAR), TAG_FILE_NAME);
+        if (!TotalLength)
+            TotalLength = sizeof(WCHAR); /* root */
+        Buffer = ExAllocatePoolWithTag(PagedPool, TotalLength + sizeof(WCHAR), TAG_FILE_NAME);
         if (!Buffer) {
             Status = STATUS_INSUFFICIENT_RESOURCES;
             _SEH2_LEAVE;
         }
-
-        // Build path backwards (from end to beginning)
-        CurrentPosition = (PWCHAR)((PUCHAR)Buffer + TotalLength);
-        *CurrentPosition = 0; // Null terminator
-
-        // Walk up chain again and copy names
-        CurrentLcb = Lcb;
-        while (CurrentLcb) {
-            PUNICODE_STRING ComponentName;
-
-            if (CurrentLcb->FileName.Buffer && CurrentLcb->FileName.Length > 0) {
-                ComponentName = &CurrentLcb->FileName;
-            } else if (CurrentLcb->ExactCaseLinkName.Buffer && CurrentLcb->ExactCaseLinkName.Length > 0) {
-                ComponentName = &CurrentLcb->ExactCaseLinkName;
-            } else {
-                ComponentName = NULL;
-            }
-
-            if (ComponentName && ComponentName->Length > 0) {
-                // Prepend "\<component>". The buffer is filled back-to-front,
-                // so write the name first, then the separator immediately in
-                // front of it. (Writing the separator after the name would
-                // produce "<component>\" with no leading backslash — a
-                // relative, malformed path that no registered notify matches.)
-                CurrentPosition -= (ComponentName->Length / sizeof(WCHAR));
-                RtlCopyMemory(CurrentPosition, ComponentName->Buffer, ComponentName->Length);
-
-                CurrentPosition--;
-                *CurrentPosition = L'\\';
-            }
-
-            // Move to parent
-            CurrentFcb = CurrentLcb->ParentFcb;
-            if (!CurrentFcb || (CurrentFcb->FcbState & UDF_FCB_ROOT_DIRECTORY)) {
-                break;
-            }
-
-            // Find parent LCB
-            if (!IsListEmpty(&CurrentFcb->ParentLcbQueue)) {
-                PLIST_ENTRY ListEntry = CurrentFcb->ParentLcbQueue.Flink;
-                CurrentLcb = CONTAINING_RECORD(ListEntry, struct LCB, ChildFcbLinks);
-            } else {
-                break;
+        Position = Buffer;
+        for (Component = Components; Component; Component = Component->Next) {
+            if (Component->Lcb) {
+                PUNICODE_STRING Name = &Component->Lcb->ExactCaseLinkName;
+                *Position++ = L'\\';
+                RtlCopyMemory(Position, Name->Buffer, Name->Length);
+                Position += Name->Length / sizeof(WCHAR);
             }
         }
-
-        // Add leading backslash if not already there
-        if (CurrentPosition > Buffer) {
-            CurrentPosition--;
-            *CurrentPosition = L'\\';
-        }
-
-        // Set output string
+        if (Position == Buffer)
+            *Position++ = L'\\';
+        *Position = 0;
         FullPath->Buffer = Buffer;
-        FullPath->Length = (USHORT)((PUCHAR)Buffer + TotalLength - (PUCHAR)CurrentPosition);
-        FullPath->MaximumLength = TotalLength + sizeof(WCHAR);
-
-        // Move string to beginning of buffer if needed
-        if (CurrentPosition != Buffer) {
-            RtlMoveMemory(Buffer, CurrentPosition, FullPath->Length + sizeof(WCHAR));
-            FullPath->Length = (USHORT)((PUCHAR)Buffer + TotalLength - (PUCHAR)CurrentPosition);
-        }
-
-        // Optionally cache the path in LCB
-        if (CachePath && NT_SUCCESS(Status)) {
-            CurrentThread = KeGetCurrentThread();
-            Fcb = Lcb->ChildFcb;
-
-            if (CurrentThread != Fcb->FcbLockThread) {
-                ExAcquireFastMutex(&Fcb->FcbNonpaged->FcbFastMutex);
-                Fcb->FcbLockThread = CurrentThread;
-            }
-
-            Fcb->FcbLockCount++;
-            CacheLockAcquired = TRUE;
-
-            // Check if cache is still empty
-            if (Lcb->FileName.Buffer == NULL) {
-                // Allocate separate buffer for cache
-                PWCHAR CacheBuffer = (PWCHAR)ExAllocatePoolWithTag(PagedPool,
-                                                                    FullPath->Length + sizeof(WCHAR),
-                                                                    TAG_FILE_NAME);
-                if (CacheBuffer) {
-                    RtlCopyMemory(CacheBuffer, FullPath->Buffer, FullPath->Length + sizeof(WCHAR));
-                    Lcb->FileName.Buffer = CacheBuffer;
-                    Lcb->FileName.Length = FullPath->Length;
-                    Lcb->FileName.MaximumLength = FullPath->Length + sizeof(WCHAR);
-
-                    // Set flag indicating separate buffer needs freeing
-                    SetFlag(Lcb->Flags, UDF_LCB_FLAG_HAS_NAME_BUFFER);
-                }
-            }
-        }
-
+        FullPath->Length = (USHORT)TotalLength;
+        FullPath->MaximumLength = (USHORT)(TotalLength + sizeof(WCHAR));
+        Buffer = NULL;
     } _SEH2_FINALLY {
-
-        if (CacheLockAcquired) {
-            Fcb->FcbLockCount--;
-            if (Fcb->FcbLockCount == 0) {
-                Fcb->FcbLockThread = NULL;
-                ExReleaseFastMutex(&Fcb->FcbNonpaged->FcbFastMutex);
-            }
-        }
-
-        if (!NT_SUCCESS(Status) && Buffer) {
+        if (Buffer)
             ExFreePool(Buffer);
-            FullPath->Buffer = NULL;
-            FullPath->Length = 0;
-            FullPath->MaximumLength = 0;
+        while (Components) {
+            Component = Components;
+            Components = Component->Next;
+            if (Component->Acquired)
+                ExReleaseResourceLite(&Component->Fcb->FcbNonpaged->FcbResource);
+            ExFreePool(Component);
         }
+        ExReleaseResourceLite(&Vcb->VcbResource);
     } _SEH2_END;
-
     return Status;
 } // end UDFBuildFullPathFromLcb()
 
@@ -925,7 +887,7 @@ UDFReleasePrefixImmediate(
     // Reference is now 0 - remove LCB and decrement parent refs
     //
     ParentFcb = Lcb->ParentFcb;
-    ParentFileInfo = ParentFcb ? ParentFcb->FileInfo : NULL;
+    ParentFileInfo = Lcb->ParentFileInfo;
     Vcb = ParentFcb ? ParentFcb->Vcb : NULL;
 
     //
@@ -944,7 +906,8 @@ UDFReleasePrefixImmediate(
         // Close parent's FileInfo if requested
         //
         if (CloseParentFileInfo && ParentFileInfo && Vcb) {
-            UDFCloseFile__(IrpContext, Vcb, ParentFileInfo);
+            NTSTATUS Status = UDFCloseFile__(IrpContext, Vcb, ParentFileInfo);
+            UDFRememberMetadataWritebackError(IrpContext, Vcb, ParentFileInfo, Status);
         }
     }
 
@@ -996,6 +959,7 @@ UDFFindPathPrefix(
 {
     PLCB CurrentLcb = NULL;
     PLCB MatchLcb;
+    BOOLEAN ComponentShortName;
     UNICODE_STRING LocalRemainingName;
     UNICODE_STRING ComponentName;
     WCHAR UpcaseBuffer[256];
@@ -1061,6 +1025,7 @@ UDFFindPathPrefix(
         // *CurrentFcb is held exclusive, so trees and queue are safe.
         //
         MatchLcb = NULL;
+        ComponentShortName = FALSE;
 
         // Splay tree search: try IgnoreCase or ExactCase tree
         if (IgnoreCase && (*CurrentFcb)->IgnoreCaseRoot != NULL) {
@@ -1098,7 +1063,7 @@ UDFFindPathPrefix(
                                             FIELD_OFFSET(struct LCB, ShortNameLinks),
                                             FIELD_OFFSET(struct LCB, ShortName));
                 if (MatchLcb) {
-                    *ShortNameMatch = TRUE;
+                    ComponentShortName = TRUE;
                 }
             }
         }
@@ -1136,11 +1101,19 @@ UDFFindPathPrefix(
                 if (Lcb->ShortName.Buffer && Lcb->ShortName.Length > 0 &&
                     RtlEqualUnicodeString(&ComponentName, &Lcb->ShortName, TRUE)) {
                     MatchLcb = Lcb;
-                    *ShortNameMatch = TRUE;
+                    ComponentShortName = TRUE;
                     break;
                 }
             }
         }
+
+        /* An uncertain final GC keeps its prefix structures as exact
+         * owners, but their borrowed FI may already be partly retired.
+         * Do not descend/reopen through a name-table bypass of the gated
+         * FCB table entry, and do not reinterpret this as a missing name. */
+        if (MatchLcb && MatchLcb->ChildFcb &&
+            MatchLcb->ChildFcb->TeardownInProgress)
+            UDFRaiseStatus(IrpContext, STATUS_FILE_CORRUPT_ERROR);
 
         //
         // Validate the match: skip deleted links and deleted FCBs.
@@ -1163,38 +1136,32 @@ UDFFindPathPrefix(
             return CurrentLcb;
         }
 
-        // Found a match. Descend into child FCB with proper locking:
-        // acquire child exclusive, then release parent.
+        PFCB ParentFcb = *CurrentFcb;
+        PFCB ChildFcb = MatchLcb->ChildFcb;
+        /* Every traversed LCB must describe the exact retained namespace
+         * edge, not merely a matching string in a stale name tree. */
+        if (!ChildFcb || !MatchLcb->LinkFileInfo ||
+            !MatchLcb->LinkFileInfo->Dloc ||
+            MatchLcb->LinkFileInfo->Fcb != ChildFcb ||
+            MatchLcb->LinkFileInfo->Dloc->CommonFcb != ChildFcb ||
+            MatchLcb->ParentFcb != ParentFcb || !MatchLcb->ParentFileInfo ||
+            MatchLcb->LinkFileInfo->ParentFile != MatchLcb->ParentFileInfo ||
+            MatchLcb->ParentFileInfo->Fcb != ParentFcb)
+            UDFRaiseStatus(IrpContext, STATUS_FILE_CORRUPT_ERROR);
+        if (ChildFcb == ParentFcb) return CurrentLcb;
+        UDF_CHECK_PAGING_IO_RESOURCE(ChildFcb);
+        /* Prefix lookup is an optimization. On contention keep the current
+         * directory resource and unmatched name; ordinary traversal owns
+         * the blocking FI/FCB handoff. No temporary cache pin or wait here. */
+        if (ExIsResourceAcquiredSharedLite(&ChildFcb->FcbNonpaged->FcbResource) &&
+            !ExIsResourceAcquiredExclusiveLite(&ChildFcb->FcbNonpaged->FcbResource))
+            return CurrentLcb;
+        if (!UDFAcquireFcbExclusive(IrpContext, ChildFcb, TRUE)) return CurrentLcb;
+        *CurrentFcb = ChildFcb; /* authoritative caller slot, before next work */
+        UDFReleaseFcb(IrpContext, ParentFcb);
         CurrentLcb = MatchLcb;
         *RemainingName = LocalRemainingName;
-
-        PFCB ChildFcb = MatchLcb->ChildFcb;
-
-        UDF_CHECK_PAGING_IO_RESOURCE(ChildFcb);
-        if (!UDFAcquireFcbExclusive(IrpContext, ChildFcb, TRUE)) {
-            // Try-lock failed. Bump references to keep child alive,
-            // release parent, then wait-acquire child.
-            PVCB Vcb = (PVCB)IrpContext->Vcb;
-
-            UDFLockVcb(IrpContext, Vcb);
-            ChildFcb->FcbReference += 1;
-            MatchLcb->Reference += 1;
-            UDFUnlockVcb(IrpContext, Vcb);
-
-            UDFReleaseFcb(IrpContext, *CurrentFcb);
-
-            UDFAcquireFcbExclusive(IrpContext, ChildFcb, FALSE);
-
-            UDFLockVcb(IrpContext, Vcb);
-            ChildFcb->FcbReference -= 1;
-            MatchLcb->Reference -= 1;
-            UDFUnlockVcb(IrpContext, Vcb);
-        } else {
-            // Try-lock succeeded. Release parent.
-            UDFReleaseFcb(IrpContext, *CurrentFcb);
-        }
-
-        *CurrentFcb = ChildFcb;
+        *ShortNameMatch = *ShortNameMatch || ComponentShortName;
     }
 
     return CurrentLcb;
@@ -1204,148 +1171,190 @@ UDFFindPathPrefix(
 /*
     Atomically rename an LCB and optionally move it to a new parent directory.
     Updates the file name, moves between parent ChildLcbQueue lists,
-    and adjusts parent reference counts — all in one call.
-
-    NewParentFcb = NULL for same-directory rename (name change only).
+    The prepare/apply/discard protocol reserves names and exact parent
+    references before namespace mutation, then transfers or releases them.
 */
 NTSTATUS
-UDFRenameMovePrefix(
+UDFPreparePrefixRename(
     IN PIRP_CONTEXT IrpContext,
     IN PLCB Lcb,
     IN PUNICODE_STRING NewName,
-    IN PFCB NewParentFcb OPTIONAL
+    IN PUDF_FILE_INFO NewParentFileInfo,
+    OUT PUDF_PREFIX_RENAME_PLAN Plan
     )
 {
-    PWCHAR NewBuffer;
-    USHORT NewLength;
-    BOOLEAN OldBufferEmbedded;
-
-    if (!Lcb || !NewName || NewName->Length == 0) {
+    NTSTATUS Status;
+    USHORT Bytes;
+    RtlZeroMemory(Plan, sizeof(*Plan));
+    if (!Lcb || !NewName || !NewName->Buffer || !NewName->Length ||
+        NewName->Length % sizeof(WCHAR) ||
+        NewName->Length > MAXUSHORT - sizeof(WCHAR) ||
+        !NewParentFileInfo || !NewParentFileInfo->Fcb ||
+        !Lcb->LinkFileInfo || !Lcb->ParentFcb || !Lcb->ParentFileInfo ||
+        Lcb->LinkFileInfo->ParentFile != Lcb->ParentFileInfo ||
+        NewParentFileInfo->Fcb->Vcb != Lcb->ParentFcb->Vcb)
         return STATUS_INVALID_PARAMETER;
-    }
 
-    ASSERT(Lcb->NodeIdentifier.NodeTypeCode == UDF_NODE_TYPE_LCB);
-
-    NewLength = NewName->Length;
-
-    // Allocate new buffer for the name
-    NewBuffer = (PWCHAR)MyAllocatePool__(NonPagedPool, NewLength + sizeof(WCHAR));
-    if (!NewBuffer) {
+    ASSERT_EXCLUSIVE_FCB(Lcb->ChildFcb);
+    ASSERT_EXCLUSIVE_FCB(Lcb->ParentFcb);
+    ASSERT_EXCLUSIVE_FCB(NewParentFileInfo->Fcb);
+    Plan->Lcb = Lcb;
+    Plan->LinkFileInfo = Lcb->LinkFileInfo;
+    Plan->OldParentFcb = Lcb->ParentFcb;
+    Plan->OldParentFileInfo = Lcb->ParentFileInfo;
+    Plan->NewParentFcb = NewParentFileInfo->Fcb;
+    Plan->NewParentFileInfo = NewParentFileInfo;
+    Bytes = NewName->Length + sizeof(WCHAR);
+    Plan->FileName.Buffer = MyAllocatePool__(NonPagedPool, Bytes);
+    if (!Plan->FileName.Buffer)
         return STATUS_INSUFFICIENT_RESOURCES;
+    Plan->FileName.Length = NewName->Length;
+    Plan->FileName.MaximumLength = Bytes;
+    RtlCopyMemory(Plan->FileName.Buffer, NewName->Buffer, NewName->Length);
+    Plan->FileName.Buffer[NewName->Length / sizeof(WCHAR)] = 0;
+    Plan->IgnoreCaseName.Buffer = ExAllocatePoolWithTag(PagedPool, Bytes, TAG_FILE_NAME);
+    if (!Plan->IgnoreCaseName.Buffer)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    Plan->IgnoreCaseName.Length = 0;
+    Plan->IgnoreCaseName.MaximumLength = Bytes;
+    Status = RtlUpcaseUnicodeString(&Plan->IgnoreCaseName, &Plan->FileName, FALSE);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Plan->IgnoreCaseName.Buffer[NewName->Length / sizeof(WCHAR)] = 0;
+
+    if (Plan->NewParentFileInfo != Plan->OldParentFileInfo ||
+        Plan->NewParentFcb != Plan->OldParentFcb) {
+        Status = UDFReferenceFileChecked(Plan->NewParentFcb->Vcb, NewParentFileInfo);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        /* No I/O or allocation while the scalar FCB count is protected. */
+        UDFLockVcb(IrpContext, Plan->NewParentFcb->Vcb);
+        InterlockedIncrement((PLONG)&Plan->NewParentFcb->FcbReference);
+        UDFUnlockVcb(IrpContext, Plan->NewParentFcb->Vcb);
+        Plan->ParentFileReferenceOwned = TRUE;
+        Plan->ParentFcbReferenceOwned = TRUE;
     }
+    Plan->Prepared = TRUE;
+    return STATUS_SUCCESS;
+}
 
-    RtlCopyMemory(NewBuffer, NewName->Buffer, NewLength);
-    NewBuffer[NewLength / sizeof(WCHAR)] = 0;
+NTSTATUS
+UDFDiscardPrefixRename(
+    IN PIRP_CONTEXT IrpContext,
+    IN OUT PUDF_PREFIX_RENAME_PLAN Plan,
+    IN BOOLEAN FlushParent
+    )
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    _SEH2_TRY {
+        if (Plan->ParentFileReferenceOwned) {
+            Status = UDFDereferenceFileChecked(Plan->NewParentFcb->Vcb,
+                                                Plan->NewParentFileInfo);
+            if (NT_SUCCESS(Status))
+                Plan->ParentFileReferenceOwned = FALSE;
+        }
+        if (FlushParent && NT_SUCCESS(Status) && Plan->ParentFcbReferenceOwned)
+            Status = UDFCompleteFileClose(IrpContext, Plan->NewParentFcb->Vcb,
+                                           Plan->NewParentFileInfo);
+    } _SEH2_FINALLY {
+        if (Plan->ParentFcbReferenceOwned && !Plan->ParentFileReferenceOwned) {
+            PVCB Vcb = Plan->NewParentFcb->Vcb;
+            UDFLockVcb(IrpContext, Vcb);
+            ASSERT(Plan->NewParentFcb->FcbReference);
+            InterlockedDecrement((PLONG)&Plan->NewParentFcb->FcbReference);
+            UDFUnlockVcb(IrpContext, Vcb);
+            Plan->ParentFcbReferenceOwned = FALSE;
+        }
+        if (Plan->FileName.Buffer) {
+            MyFreePool__(Plan->FileName.Buffer);
+            RtlZeroMemory(&Plan->FileName, sizeof(Plan->FileName));
+        }
+        if (Plan->IgnoreCaseName.Buffer) {
+            ExFreePool(Plan->IgnoreCaseName.Buffer);
+            RtlZeroMemory(&Plan->IgnoreCaseName, sizeof(Plan->IgnoreCaseName));
+        }
+        Plan->Prepared = FALSE;
+    } _SEH2_END;
+    return Status;
+}
 
-    // Remove from current parent's splay trees before changing names.
-    // Caller must hold ParentFcb exclusive (enforced in fileinfo.cpp).
-    if (Lcb->ParentFcb) {
-        UdfRemoveNameLinks(Lcb->ParentFcb, Lcb);
-    }
+NTSTATUS
+UDFApplyPrefixRename(
+    IN PIRP_CONTEXT IrpContext,
+    IN OUT PUDF_PREFIX_RENAME_PLAN Plan,
+    IN BOOLEAN FlushParent
+    )
+{
+    PLCB Lcb = Plan->Lcb;
+    NTSTATUS Status = STATUS_SUCCESS;
+    BOOLEAN Embedded;
+    if (!Plan->Prepared || Plan->Applied || !Lcb ||
+        Lcb->ParentFcb != Plan->OldParentFcb ||
+        Lcb->ParentFileInfo != Plan->OldParentFileInfo ||
+        Lcb->LinkFileInfo != Plan->LinkFileInfo ||
+        Lcb->LinkFileInfo->ParentFile != Plan->NewParentFileInfo)
+        return STATUS_FILE_INVALID;
 
-    // Check if old buffer was embedded in LCB structure
-    // or separately allocated. Only free if separately allocated.
-    OldBufferEmbedded = (Lcb->FileName.Buffer != NULL &&
-                         (PUCHAR)Lcb->FileName.Buffer >= (PUCHAR)Lcb &&
-                         (PUCHAR)Lcb->FileName.Buffer < (PUCHAR)Lcb + Lcb->NodeIdentifier.NodeByteSize);
-
-    if (Lcb->FileName.Buffer && !OldBufferEmbedded) {
+    /* Both parent resources and the source FCB remain acquired by the
+     * caller. Names and new-parent holds were prepared before the move;
+     * old-parent writeback follows the completed tree/queue update. */
+    UdfRemoveNameLinks(Plan->OldParentFcb, Lcb);
+    Embedded = Lcb->FileName.Buffer &&
+        (PUCHAR)Lcb->FileName.Buffer >= (PUCHAR)Lcb &&
+        (PUCHAR)Lcb->FileName.Buffer < (PUCHAR)Lcb + Lcb->NodeIdentifier.NodeByteSize;
+    if (Lcb->FileName.Buffer && !Embedded) {
         MyFreePool__(Lcb->FileName.Buffer);
     }
-
-    // Set new name (component name, not cached full path)
-    Lcb->FileName.Buffer = NewBuffer;
-    Lcb->FileName.Length = NewLength;
-    Lcb->FileName.MaximumLength = NewLength + sizeof(WCHAR);
-
-    // Clear cached full path flag — FileName now holds component name only
-    ClearFlag(Lcb->Flags, UDF_LCB_FLAG_HAS_NAME_BUFFER);
-
-    // Also update ExactCaseLinkName to point to same buffer
+    if (Lcb->IgnoreCaseLinkName.Buffer &&
+        !((PUCHAR)Lcb->IgnoreCaseLinkName.Buffer >= (PUCHAR)Lcb &&
+          (PUCHAR)Lcb->IgnoreCaseLinkName.Buffer < (PUCHAR)Lcb + Lcb->NodeIdentifier.NodeByteSize))
+        ExFreePool(Lcb->IgnoreCaseLinkName.Buffer);
+    if (Lcb->ShortName.Buffer &&
+        !((PUCHAR)Lcb->ShortName.Buffer >= (PUCHAR)Lcb &&
+          (PUCHAR)Lcb->ShortName.Buffer < (PUCHAR)Lcb + Lcb->NodeIdentifier.NodeByteSize))
+        ExFreePool(Lcb->ShortName.Buffer);
+    RtlZeroMemory(&Lcb->ShortName, sizeof(Lcb->ShortName));
+    ClearFlag(Lcb->Flags, UDF_LCB_FLAG_SHORT_NAME_CREATED);
+    Lcb->FileName = Plan->FileName;
     Lcb->ExactCaseLinkName = Lcb->FileName;
+    Lcb->IgnoreCaseLinkName = Plan->IgnoreCaseName;
+    RtlZeroMemory(&Plan->FileName, sizeof(Plan->FileName));
+    RtlZeroMemory(&Plan->IgnoreCaseName, sizeof(Plan->IgnoreCaseName));
 
-    // Free old IgnoreCaseLinkName if separately allocated
-    if (Lcb->IgnoreCaseLinkName.Buffer != NULL) {
-        BOOLEAN IgnoreCaseEmbedded = ((PUCHAR)Lcb->IgnoreCaseLinkName.Buffer >= (PUCHAR)Lcb &&
-                                      (PUCHAR)Lcb->IgnoreCaseLinkName.Buffer < (PUCHAR)Lcb + Lcb->NodeIdentifier.NodeByteSize);
-        if (!IgnoreCaseEmbedded) {
-            ExFreePool(Lcb->IgnoreCaseLinkName.Buffer);
+    if (Plan->ParentFileReferenceOwned && Plan->ParentFcbReferenceOwned) {
+        if (Plan->NewParentFcb != Plan->OldParentFcb) {
+            RemoveEntryList(&Lcb->ParentFcbLinks);
+            InsertHeadList(&Plan->NewParentFcb->ChildLcbQueue, &Lcb->ParentFcbLinks);
+        }
+        Lcb->ParentFcb = Plan->NewParentFcb;
+        Lcb->ParentFileInfo = Plan->NewParentFileInfo;
+        Plan->ParentFileReferenceOwned = FALSE; /* transferred into the LCB */
+        Plan->ParentFcbReferenceOwned = FALSE;
+    }
+    Lcb->InitialOffset = Lcb->LinkFileInfo->Index;
+    UdfInsertNameLinks(Lcb->ParentFcb, Lcb);
+    Plan->Applied = TRUE;
+
+    if (Plan->NewParentFileInfo != Plan->OldParentFileInfo ||
+        Plan->NewParentFcb != Plan->OldParentFcb) {
+        /* Finish publishing the new trees/queues before the old parent's
+         * last close can flush and fail. An error never leaves an old name
+         * attached to an FI that already moved to the new parent. */
+        Status = UDFDereferenceFileChecked(Plan->OldParentFcb->Vcb,
+                                            Plan->OldParentFileInfo);
+        if (NT_SUCCESS(Status)) {
+            _SEH2_TRY {
+                if (FlushParent)
+                    Status = UDFCompleteFileClose(IrpContext, Plan->OldParentFcb->Vcb,
+                                                   Plan->OldParentFileInfo);
+            } _SEH2_FINALLY {
+                UDFLockVcb(IrpContext, Plan->OldParentFcb->Vcb);
+                ASSERT(Plan->OldParentFcb->FcbReference);
+                InterlockedDecrement((PLONG)&Plan->OldParentFcb->FcbReference);
+                UDFUnlockVcb(IrpContext, Plan->OldParentFcb->Vcb);
+            } _SEH2_END;
         }
     }
+    return Status;
+}
 
-    // Rebuild IgnoreCaseLinkName — upcased version of new name.
-    // Required for IgnoreCase splay tree lookup (Windows opens case-insensitive).
-    {
-        PWCHAR UpcaseBuffer = (PWCHAR)ExAllocatePoolWithTag(PagedPool,
-                                                             NewLength + sizeof(WCHAR),
-                                                             TAG_FILE_NAME);
-        if (UpcaseBuffer) {
-            Lcb->IgnoreCaseLinkName.Buffer = UpcaseBuffer;
-            Lcb->IgnoreCaseLinkName.Length = NewLength;
-            Lcb->IgnoreCaseLinkName.MaximumLength = NewLength + sizeof(WCHAR);
-            RtlCopyMemory(UpcaseBuffer, NewBuffer, NewLength);
-            UpcaseBuffer[NewLength / sizeof(WCHAR)] = 0;
-            RtlUpcaseUnicodeString(&Lcb->IgnoreCaseLinkName, &Lcb->IgnoreCaseLinkName, FALSE);
-        } else {
-            // Allocation failed — clear IgnoreCaseLinkName.
-            // File will still be findable via list fallback.
-            Lcb->IgnoreCaseLinkName.Buffer = NULL;
-            Lcb->IgnoreCaseLinkName.Length = 0;
-            Lcb->IgnoreCaseLinkName.MaximumLength = 0;
-        }
-    }
-
-    // Clear stale ShortName — old 8.3 name is invalid after rename.
-    // The embedded buffer data stays in LCB allocation but won't be used.
-    // Short name will be regenerated on next open if needed.
-    if (Lcb->ShortName.Buffer != NULL) {
-        BOOLEAN ShortNameEmbedded = ((PUCHAR)Lcb->ShortName.Buffer >= (PUCHAR)Lcb &&
-                                     (PUCHAR)Lcb->ShortName.Buffer < (PUCHAR)Lcb + Lcb->NodeIdentifier.NodeByteSize);
-        if (!ShortNameEmbedded) {
-            ExFreePool(Lcb->ShortName.Buffer);
-        }
-        Lcb->ShortName.Buffer = NULL;
-        Lcb->ShortName.Length = 0;
-        Lcb->ShortName.MaximumLength = 0;
-    }
-
-    // Move LCB to new parent directory if specified (cross-directory rename)
-    if (NewParentFcb && NewParentFcb != Lcb->ParentFcb) {
-
-        PFCB OldParentFcb = Lcb->ParentFcb;
-        PUDF_FILE_INFO OldParentFileInfo = OldParentFcb ? OldParentFcb->FileInfo : NULL;
-
-        // Remove from old parent's ChildLcbQueue
-        RemoveEntryList(&Lcb->ParentFcbLinks);
-
-        // Insert into new parent's ChildLcbQueue
-        InsertHeadList(&NewParentFcb->ChildLcbQueue, &Lcb->ParentFcbLinks);
-
-        // Update LCB to point to new parent
-        Lcb->ParentFcb = NewParentFcb;
-
-        // Adjust reference counts
-        if (OldParentFcb) {
-            ASSERT(OldParentFcb->FcbReference > 0);
-            InterlockedDecrement((PLONG)&OldParentFcb->FcbReference);
-
-            if (OldParentFileInfo && OldParentFcb->Vcb) {
-                UDFCloseFile__(IrpContext, OldParentFcb->Vcb, OldParentFileInfo);
-            }
-        }
-
-        InterlockedIncrement((PLONG)&NewParentFcb->FcbReference);
-
-        if (NewParentFcb->FileInfo) {
-            UDFReferenceFile__(NewParentFcb->FileInfo);
-        }
-    }
-
-    // Re-insert into splay trees of (possibly new) parent.
-    // Caller must hold the (new) ParentFcb exclusive.
-    if (Lcb->ParentFcb) {
-        UdfInsertNameLinks(Lcb->ParentFcb, Lcb);
-    }
-
-    return STATUS_SUCCESS;
-} // end UDFRenameMovePrefix()

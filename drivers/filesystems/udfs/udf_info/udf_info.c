@@ -15,6 +15,7 @@
 */
 
 #include "udf.h"
+#include <udf_descriptor.h>
 
 #define         UDF_BUG_CHECK_ID                UDF_FILE_UDF_INFO
 
@@ -126,17 +127,24 @@ UDFDecompressUnicode(
     OUT uint16* valueCRC
     )
 {
-    uint16 compID = CS0[0];
+    uint16 compID;
     uint32 unicodeIndex = 0;
     uint32 byteIndex = 1;
     PWCHAR buff;
-    uint8* _CS0 = CS0+1;
+    uint8* _CS0;
 
-    if (!Length) goto return_empty_str;
+    if (!UName) return;
+    RtlZeroMemory(UName, sizeof(*UName));
+    if (valueCRC) *valueCRC = 0;
+    if (!CS0 || !Length) return;
+    compID = CS0[0];
+    _CS0 = CS0 + 1;
     // First check for valid compID.
     switch(compID) {
     case UDF_COMP_ID_8: {
 
+        /* UNICODE_STRING includes the terminating WCHAR in MaximumLength. */
+        if (Length > MAXUSHORT / sizeof(WCHAR)) goto return_empty_str;
         buff = (PWCHAR)MyAllocatePoolTag__(UDF_FILENAME_MT, (Length)*sizeof(WCHAR), MEM_FNAME_TAG);
         if (!buff) goto return_empty_str;
         UName->Buffer = buff;
@@ -153,6 +161,10 @@ UDFDecompressUnicode(
     }
     case UDF_COMP_ID_16: {
 
+        /* The compression byte is followed by complete big-endian pairs.
+         * Reject an odd payload before the loop can read its missing byte. */
+        if (!(Length & 1) || Length > MAXUSHORT - sizeof(WCHAR))
+            goto return_empty_str;
         buff = (PWCHAR)MyAllocatePoolTag__(UDF_FILENAME_MT, (Length-1)+sizeof(WCHAR), MEM_FNAME16_TAG);
         if (!buff) goto return_empty_str;
         UName->Buffer = buff;
@@ -250,6 +262,87 @@ NTSTATUS UDFFindFile__(IN PVCB Vcb,
                                 IN PUDF_FILE_INFO DirInfo)
           see 'Udf_info.h'
 */
+
+/* File IDs encode a physical ICB within this mount. A virtual partition has
+ * no arithmetic inverse. Read its actual tag, authenticate the descriptor,
+ * then prove that the tag's virtual slot maps back to this exact sector.
+ * Called without the FCB-table FAST_MUTEX; no FI/Dloc owner is acquired here. */
+NTSTATUS
+UDFResolvePhysicalIcbAddress(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                             uint32 Physical, lb_addr* Address)
+{
+    uint32 Ref, Logical, Slot;
+    uint32* Vat;
+    int8* Sector = NULL;
+    NTSTATUS Status = STATUS_FILE_CORRUPT_ERROR;
+    if (!Address || !Vcb->Partitions || Physical >= LBA_OUT_OF_EXTENT ||
+        Physical > Vcb->SessionEndLba)
+        return STATUS_INVALID_PARAMETER;
+    Vat = (uint32*)InterlockedCompareExchangePointer((PVOID volatile*)&Vcb->Vat, NULL, NULL);
+    if (!Vat) {
+        Ref = UDFGetRefPartNumByPhysLba(Vcb, Physical);
+        if (Ref >= Vcb->PartitionMaps || Ref > MAXUSHORT)
+            return STATUS_INVALID_PARAMETER;
+        Logical = UDFPhysLbaToPart(Vcb, Ref, Physical);
+        if (Logical == LBA_OUT_OF_EXTENT)
+            return STATUS_INVALID_PARAMETER;
+        Address->partitionReferenceNum = (uint16)Ref;
+        Address->logicalBlockNum = Logical;
+        return UDFPartLbaToPhys(Vcb, Address) == Physical ?
+               STATUS_SUCCESS : STATUS_FILE_CORRUPT_ERROR;
+    }
+    if (Vcb->VatPartNdx >= Vcb->PartitionMaps || Vcb->VatPartNdx > MAXUSHORT ||
+        Vcb->VatPhysPartNdx >= Vcb->PartitionMaps || Vcb->VatPhysPartNdx > MAXUSHORT ||
+        !Vcb->VatCapacity || Vcb->VatCapacity > MAXULONG / sizeof(uint32) ||
+        Vcb->VatCount > Vcb->VatCapacity || Physical < Vcb->VatPartitionRoot ||
+        Physical - Vcb->VatPartitionRoot >= Vcb->VatPartitionLength ||
+        Vcb->SectorSize < 512 || Vcb->SectorSize > 0x10000 || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift))
+        return STATUS_FILE_CORRUPT_ERROR;
+    Sector = (int8*)MyAllocatePoolTag__(NonPagedPool, Vcb->SectorSize, MEM_FE_TAG);
+    if (!Sector)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    _SEH2_TRY {
+        uint16 Ident;
+        Status = UDFReadSectors(IrpContext, Vcb, FALSE, Physical, 1, FALSE, Sector);
+        if (Status != STATUS_SUCCESS) {
+            if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+            _SEH2_LEAVE;
+        }
+        Ident = UdfDescriptorRead16((const unsigned char*)Sector);
+        Slot = UdfDescriptorRead32((const unsigned char*)Sector + 12);
+        if (Ident != TID_FILE_ENTRY && Ident != TID_EXTENDED_FILE_ENTRY) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
+        }
+        if (!UdfValidateDescriptor((const unsigned char*)Sector, Vcb->SectorSize, Ident, Slot)) {
+            Status = STATUS_CRC_ERROR;
+            _SEH2_LEAVE;
+        }
+        if (Slot < Vcb->VatCount && Vat[Slot] != UDF_VAT_FREE_ENTRY &&
+            Vat[Slot] < Vcb->VatPartitionLength &&
+            (uint64)Vcb->VatPartitionRoot + Vat[Slot] == Physical) {
+            Address->partitionReferenceNum = (uint16)Vcb->VatPartNdx;
+            Address->logicalBlockNum = Slot;
+        } else {
+            /* Physical ICBs (including the VAT's own ICB) remain distinct
+             * from virtual slots, even if their numeric LBNs coincide. */
+            Ref = Vcb->VatPhysPartNdx;
+            Logical = UDFPhysLbaToPart(Vcb, Ref, Physical);
+            if (Logical == LBA_OUT_OF_EXTENT || Logical != Slot) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            Address->partitionReferenceNum = (uint16)Ref;
+            Address->logicalBlockNum = Logical;
+        }
+        Status = UDFPartLbaToPhys(Vcb, Address) == Physical ?
+                 STATUS_SUCCESS : STATUS_WRONG_VOLUME;
+    } _SEH2_FINALLY {
+        MyFreePool__(Sector);
+    } _SEH2_END;
+    return Status;
+}
 
 /*
     This routine reads (Extended)FileEntry according to FileDesc
@@ -856,9 +949,14 @@ UDFSetUpTag(
          Tag->tagSerialNum, Tag->descCRCLength, Tag->descCRC, Tag->tagChecksum));
 } // end UDFSetUpTag()
 
+static VOID
+UDFRetainFailedCreateConstruction(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                                 PUDF_FILE_INFO Parent, NTSTATUS Error);
+
 /*
     This routine builds FileEntry & associated AllocDescs for specified
-    extent.
+    extent. Before Dloc publication, all buffers and bitmap claims are
+    private; the VCB lease owns the claims even if this stack unwinds.
  */
 NTSTATUS
 UDFBuildFileEntry(
@@ -872,48 +970,58 @@ UDFBuildFileEntry(
     IN BOOLEAN Extended
     )
 {
-    PFILE_ENTRY FileEntry;
-    NTSTATUS status;
+    _SEH2_VOLATILE PFILE_ENTRY FileEntry = NULL;
+    _SEH2_VOLATILE PEXTENT_MAP WorkMap = NULL;
+    _SEH2_VOLATILE PUDF_ALLOCATION_FAILURE Lease = NULL;
+    _SEH2_VOLATILE NTSTATUS status = STATUS_UNSUCCESSFUL;
     EntityID* eID;
-    uint32 l;
-    EXTENT_INFO _FEExtInfo;
+    uint32 l, feAllocLen, MapBytes;
+    EXTENT_INFO Borrowed, Work;
     uint16* lcp;
 
+    if (!Vcb || !Vcb->Partitions || PartNum >= Vcb->PartitionMaps ||
+        !FileInfo || FileInfo->Dloc || FileInfo->RefCount || FileInfo->Constructing)
+        return STATUS_INVALID_PARAMETER;
     ASSERT(PartNum < Vcb->PartitionMaps);
     ASSERT(!ExtAttrSz);
     // calculate the length required
-    l = (Extended ? sizeof(EXTENDED_FILE_ENTRY) : sizeof(FILE_ENTRY)) + ExtAttrSz;
-    if (l > Vcb->SectorSize) return STATUS_INVALID_PARAMETER;
-    // allocate block for FE
-    if (!NT_SUCCESS(status = UDFAllocateFESpace(IrpContext, Vcb, DirInfo, PartNum, &_FEExtInfo, l) ))
-        return status;
-    // Allocate buffer for full sector to avoid stale in-ICB data
-    // when FE block is reused after FreeFESpace
-    uint32 feAllocLen = max(l, Vcb->SectorSize);
-    // remember FE location for future hard link creation
-#ifdef UDF_DBG
-    // Must acquire DlocResource before calling UDFFindDloc to prevent race conditions
-    UDFAcquireResourceExclusive(&Vcb->DlocResource, TRUE);
-    ASSERT(UDFFindDloc(Vcb, _FEExtInfo.Mapping[0].extLocation) == (-1));
-    UDFReleaseResource(&Vcb->DlocResource);
-#endif
-    if (!NT_SUCCESS(status = UDFStoreDloc(Vcb, FileInfo, _FEExtInfo.Mapping[0].extLocation))) {
-        ASSERT(status != STATUS_SHARING_PAUSED);
-        UDFFreeFESpace(Vcb, DirInfo, &_FEExtInfo); // free
-        MyFreePool__(_FEExtInfo.Mapping);
-        return status;
-    }
+    l = Extended ? sizeof(EXTENDED_FILE_ENTRY) : sizeof(FILE_ENTRY);
+    if (l > Vcb->SectorSize || ExtAttrSz > Vcb->SectorSize - l)
+        return STATUS_INVALID_PARAMETER;
+    l += ExtAttrSz;
+    feAllocLen = Vcb->SectorSize;
+    RtlZeroMemory(&Borrowed, sizeof(Borrowed));
+    RtlZeroMemory(&Work, sizeof(Work));
+    _SEH2_TRY {
+    _SEH2_TRY {
+    /* Do every fallible buffer allocation before indexing a constructor.
+     * In particular no empty Dloc needs a guessed successful-open hold
+     * merely because the FE buffer allocation failed. */
     FileEntry = (PFILE_ENTRY)MyAllocatePoolTag__(NonPagedPool, feAllocLen, MEM_FE_TAG);
     if (!FileEntry) {
-        UDFRemoveDloc(Vcb, FileInfo->Dloc);
-        FileInfo->Dloc = NULL;
-        UDFFreeFESpace(Vcb, DirInfo, &_FEExtInfo); // free
-        MyFreePool__(_FEExtInfo.Mapping);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        _SEH2_LEAVE;
     }
-    FileInfo->Dloc->FELoc = _FEExtInfo;
-
     RtlZeroMemory((int8*)FileEntry, feAllocLen);
+    status = UDFAllocateFESpaceLease(IrpContext, Vcb, DirInfo, PartNum,
+                                    &Borrowed, l, (PUDF_ALLOCATION_FAILURE*)&Lease);
+    if (status != STATUS_SUCCESS) _SEH2_LEAVE;
+    if (!Lease || !Borrowed.Mapping ||
+        !Borrowed.Mapping[0].extLocation ||
+        (uint64)UDFGetExtentLength(Borrowed.Mapping) != Vcb->SectorSize) {
+        status = STATUS_FILE_CORRUPT_ERROR;
+        _SEH2_LEAVE;
+    }
+    status = UDFGetMappingByteCount(Borrowed.Mapping, &MapBytes);
+    if (status != STATUS_SUCCESS) _SEH2_LEAVE;
+    WorkMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, MapBytes, MEM_EXTMAP_TAG);
+    if (!WorkMap) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        _SEH2_LEAVE;
+    }
+    RtlCopyMemory(WorkMap, Borrowed.Mapping, MapBytes);
+    Work = Borrowed;
+    Work.Mapping = WorkMap;
     // set up in-memory FE structure
     FileEntry->icbTag.flags = AllocMode;
     FileEntry->icbTag.fileType = UDF_FILE_TYPE_REGULAR;
@@ -922,7 +1030,7 @@ UDFBuildFileEntry(
     FileEntry->icbTag.strategyType = 4;
 //    FileEntry->icbTag.strategyParameter = 0;
     FileEntry->descTag.tagIdent = Extended ? TID_EXTENDED_FILE_ENTRY : TID_FILE_ENTRY;
-    FileEntry->descTag.tagLocation = UDFPhysLbaToPart(Vcb, PartNum, _FEExtInfo.Mapping[0].extLocation);
+    FileEntry->descTag.tagLocation = UDFPhysLbaToPart(Vcb, PartNum, WorkMap[0].extLocation);
     FileEntry->uid = -1;
     FileEntry->gid = -1;
 
@@ -940,12 +1048,77 @@ UDFBuildFileEntry(
 
     *lcp = 0;
 
+    /* Require-new checks uniqueness under the same resource that publishes
+     * the Dloc; a separate Debug search provides no additional invariant. */
+    status = UDFCreateDloc(Vcb, FileInfo, WorkMap[0].extLocation);
+    if (status != STATUS_SUCCESS) {
+        /* A cached generation at a supposedly free LBA contradicts bitmap
+         * ownership. Do not return that possibly live block to free space. */
+        if (status == STATUS_FILE_CORRUPT_ERROR) Lease->Uncertain = TRUE;
+        _SEH2_LEAVE;
+    }
+    FileInfo->Dloc->FELoc = Work;
+    WorkMap = NULL; /* only the indexed Dloc owns this mutable map */
     FileInfo->Dloc->FileEntry = (tag*)FileEntry;
+    FileEntry = NULL;
+    FileInfo->Dloc->FileEntryCapacity = feAllocLen;
     FileInfo->Dloc->FileEntryLen = l;
 
     FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
 
-    return STATUS_SUCCESS;
+    status = UDFPublishAllocationLease(Vcb, Lease);
+    if (status == STATUS_SUCCESS)
+        status = UDFCommitAllocationLease(Vcb, (PUDF_ALLOCATION_FAILURE*)&Lease);
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        BOOLEAN Abnormal = _SEH2_AbnormalTermination();
+        _SEH2_TRY {
+            if ((Abnormal || status != STATUS_SUCCESS) && FileInfo->Dloc) {
+                /* Publication may have completed inside CreateDloc before
+                 * an exception was returned. Attach the prepared buffers,
+                 * retain the real constructor, and never roll its blocks
+                 * back behind an indexed generation. No namespace I/O has
+                 * been performed by this constructor. */
+                if (WorkMap && !FileInfo->Dloc->FELoc.Mapping) {
+                    FileInfo->Dloc->FELoc = Work;
+                    WorkMap = NULL;
+                }
+                if (FileEntry && !FileInfo->Dloc->FileEntry) {
+                    FileInfo->Dloc->FileEntry = (tag*)FileEntry;
+                    FileInfo->Dloc->FileEntryCapacity = feAllocLen;
+                    FileInfo->Dloc->FileEntryLen = l;
+                    FileEntry = NULL;
+                }
+                if (Lease) Lease->Uncertain = TRUE;
+                UDFRetainFailedCreateConstruction(Vcb, FileInfo, DirInfo,
+                    Abnormal ? STATUS_UNSUCCESSFUL : status);
+            }
+        } _SEH2_FINALLY {
+            _SEH2_TRY {
+                if (Lease) {
+                    NTSTATUS AbortStatus = UDFAbortAllocationLease(Vcb,
+                        (PUDF_ALLOCATION_FAILURE*)&Lease,
+                        Abnormal ? STATUS_UNSUCCESSFUL : status);
+                    if (!Abnormal && status == STATUS_SUCCESS && AbortStatus != STATUS_SUCCESS)
+                        status = AbortStatus;
+                    if (Lease) {
+                        /* A refused inventory lookup does not transfer or
+                         * free the VCB's still-active claim owner. */
+                        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                        InterlockedCompareExchange(&Vcb->FailedAllocationError,
+                            STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+                    }
+                }
+            } _SEH2_FINALLY {
+                if (WorkMap) MyFreePool__(WorkMap);
+                if (FileEntry) MyFreePool__(FileEntry);
+            } _SEH2_END;
+        } _SEH2_END;
+    } _SEH2_END;
+    return status;
 } // end UDFBuildFileEntry()
 
 /*
@@ -958,35 +1131,14 @@ UDFLoadExtInfo(
     IN PVCB Vcb,
     IN PFILE_ENTRY fe,
     IN PLONG_AD fe_loc,
-    IN OUT PEXTENT_INFO FExtInfo,  // user data
-    IN OUT PEXTENT_INFO AExtInfo   // alloc descs
+    IN OUT PEXTENT_INFO FExtInfo,
+    IN OUT PEXTENT_INFO AExtInfo
     )
 {
-    EXTENT_AD TmpExt;
-
-    UDFPrint(("  UDFLoadExtInfo:\n"));
-    FExtInfo->Mapping = UDFReadMappingFromXEntry(IrpContext, Vcb, fe_loc->extLocation.partitionReferenceNum,
-                                       (tag*)fe, &FExtInfo->Offset, AExtInfo);
-    if (!(FExtInfo->Mapping)) {
-        if (!(FExtInfo->Offset))
-            return STATUS_UNSUCCESSFUL;
-        TmpExt.extLength = fe_loc->extLength;
-        TmpExt.extLocation = UDFPartLbaToPhys(Vcb, &(fe_loc->extLocation));
-        if (TmpExt.extLocation == LBA_OUT_OF_EXTENT)
-            return STATUS_FILE_CORRUPT_ERROR;
-        FExtInfo->Mapping = UDFExtentToMapping(&TmpExt);
-    }
-    if (fe->descTag.tagIdent == TID_FILE_ENTRY) {
-//        UDFPrint(("Standard FileEntry\n"));
-        FExtInfo->Length = fe->informationLength;
-    } else /*if (fe->descTag.tagIdent == TID_EXTENDED_FILE_ENTRY) */ {
-        FExtInfo->Length = ((PEXTENDED_FILE_ENTRY)fe)->informationLength;
-    }
-    UDFPrint(("  FExtInfo->Length %x\n", FExtInfo->Length));
-    ASSERT(FExtInfo->Length <= UDFGetExtentLength(FExtInfo->Mapping));
-    FExtInfo->Modified = FALSE;
-
-    return STATUS_SUCCESS;
+    /* The parser owns all temporary data/AED buffers until success. Keep
+     * its I/O/CRC/resource/unsupported status instead of a generic failure. */
+    return UDFReadMappingFromXEntry(IrpContext, Vcb, fe_loc, (const tag*)fe,
+                                    FExtInfo, AExtInfo);
 } // end UDFLoadExtInfo()
 
 /*
@@ -1012,6 +1164,11 @@ UDFBuildFileIdent(
     uint8* CS0;
     SIZE_T Nlen;
     uint32 l;
+    *_FileId = NULL;
+    *FileIdLen = 0;
+    if (!fn || !FileEntryIcb || ImpUseLen > MAXUSHORT ||
+        (fn->Length && !fn->Buffer) || fn->Length % sizeof(WCHAR))
+        return STATUS_INVALID_PARAMETER;
     // prepare filename
     UDFCompressUnicode(fn, &CS0, &Nlen);
     if (!CS0) return STATUS_INSUFFICIENT_RESOURCES;
@@ -1020,6 +1177,10 @@ UDFBuildFileIdent(
     } else
     if (Nlen > UDF_NAME_LEN) {
         if (CS0) MyFreePool__(CS0);
+        return STATUS_OBJECT_NAME_INVALID;
+    }
+    if (ImpUseLen > MAXUSHORT - sizeof(FILE_IDENT_DESC) - Nlen - 3) {
+        MyFreePool__(CS0);
         return STATUS_OBJECT_NAME_INVALID;
     }
     // allocate memory for FI
@@ -1043,6 +1204,26 @@ UDFBuildFileIdent(
     if (CS0) MyFreePool__(CS0);
     return STATUS_SUCCESS;
 } // end UDFBuildFileIdent()
+
+/* Only the creating thread can serialize its prepared generations. The
+ * base's temporary parent-link update cannot escape before its child is
+ * durable and its complete streamDirectoryICB is ready. A failed context
+ * preserves its original error instead of allowing cleanup to publish it. */
+static NTSTATUS
+UDFStreamCreateWriteStatus(PUDF_FILE_INFO FileInfo)
+{
+    PUDF_STREAM_CREATE_CONTEXT Context;
+    if (!FileInfo || !FileInfo->Dloc) return STATUS_FILE_INVALID;
+    Context = FileInfo->Dloc->StreamCreate;
+    if (!Context) return STATUS_SUCCESS;
+    if (!NT_SUCCESS(Context->FirstError)) return Context->FirstError;
+    if (Context->Thread != PsGetCurrentThread()) return STATUS_DEVICE_BUSY;
+    if (Context->Child && Context->Child->Dloc == FileInfo->Dloc &&
+        Context->Phase >= UdfStreamCreateChildOpen) return STATUS_SUCCESS;
+    if (Context->BaseFile && Context->BaseFile->Dloc == FileInfo->Dloc &&
+        Context->Phase >= UdfStreamCreateBasePrepared) return STATUS_SUCCESS;
+    return STATUS_DEVICE_BUSY;
+}
 
 static
 void
@@ -1193,37 +1374,80 @@ UDFGetFileSizeFromDirNdx(
 /*
     This routine sets lengthAllocDesc field in (Ext)FileEntry
  */
-void
-UDFSetAllocDescLen(
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO FileInfo
-    )
+NTSTATUS
+UDFValidateFileEntryBuffer(PVCB Vcb, PUDF_FILE_INFO FileInfo, uint32* HeaderLength)
 {
+    PUDF_DATALOC_INFO Dloc;
+    uint32 Minimum, Attributes;
     uint16 Ident;
-
-    ValidateFileInfo(FileInfo);
-
-    FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
-    Ident = FileInfo->Dloc->FileEntry->tagIdent;
+    if (!HeaderLength) return STATUS_INVALID_PARAMETER;
+    *HeaderLength = 0;
+    if (!Vcb || !FileInfo || !(Dloc = FileInfo->Dloc) || !Dloc->FileEntry ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) ||
+        Dloc->FileEntryCapacity < Vcb->SectorSize || Dloc->FileEntryCapacity < sizeof(tag))
+        return STATUS_FILE_CORRUPT_ERROR;
+    Ident = Dloc->FileEntry->tagIdent;
     if (Ident == TID_FILE_ENTRY) {
-        PFILE_ENTRY fe = (PFILE_ENTRY)(FileInfo->Dloc->FileEntry);
-        if (FileInfo->Dloc->AllocLoc.Length) {
-            fe->lengthAllocDescs = min(FileInfo->Dloc->AllocLoc.Mapping[0].extLength -
-                                       FileInfo->Dloc->AllocLoc.Offset,
-                                       (uint32)(FileInfo->Dloc->AllocLoc.Length));
-        } else {
-            fe->lengthAllocDescs = (uint32)(FileInfo->Dloc->DataLoc.Length);
-        }
+        Minimum = sizeof(FILE_ENTRY);
+        if (Minimum > Vcb->SectorSize) return STATUS_FILE_CORRUPT_ERROR;
+        Attributes = ((PFILE_ENTRY)Dloc->FileEntry)->lengthExtendedAttr;
     } else if (Ident == TID_EXTENDED_FILE_ENTRY) {
-        PEXTENDED_FILE_ENTRY fe = (PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry);
-        if (FileInfo->Dloc->AllocLoc.Length) {
-            fe->lengthAllocDescs = min(FileInfo->Dloc->AllocLoc.Mapping[0].extLength -
-                                       FileInfo->Dloc->AllocLoc.Offset,
-                                       (uint32)(FileInfo->Dloc->AllocLoc.Length));
-        } else {
-            fe->lengthAllocDescs = (uint32)(FileInfo->Dloc->DataLoc.Length);
-        }
+        Minimum = sizeof(EXTENDED_FILE_ENTRY);
+        if (Minimum > Vcb->SectorSize) return STATUS_FILE_CORRUPT_ERROR;
+        Attributes = ((PEXTENDED_FILE_ENTRY)Dloc->FileEntry)->lengthExtendedAttr;
+    } else {
+        return STATUS_FILE_CORRUPT_ERROR;
     }
+    if (Attributes > Vcb->SectorSize - Minimum ||
+        Dloc->FileEntryLen != Minimum + Attributes)
+        return STATUS_FILE_CORRUPT_ERROR;
+    *HeaderLength = Minimum + Attributes;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+UDFSetAllocDescLen(PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    PUDF_DATALOC_INFO Dloc;
+    uint32 Header, Width, Available, Value;
+    uint32 Previous;
+    uint16 Mode;
+    NTSTATUS Status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+    if (!NT_SUCCESS(Status)) return Status;
+    Dloc = FileInfo->Dloc;
+    Mode = ((PFILE_ENTRY)Dloc->FileEntry)->icbTag.flags & ICB_FLAG_ALLOC_MASK;
+    if (Mode == ICB_FLAG_AD_IN_ICB) {
+        if (Dloc->DataLoc.Length < 0 || Dloc->DataLoc.Offset != Header ||
+            (uint64)Dloc->DataLoc.Length > Vcb->SectorSize - Header ||
+            Dloc->AllocLoc.Mapping || Dloc->AllocLoc.Length || Dloc->AllocLoc.Offset)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Value = (uint32)Dloc->DataLoc.Length;
+    } else if (Mode == ICB_FLAG_AD_SHORT || Mode == ICB_FLAG_AD_LONG) {
+        Width = Mode == ICB_FLAG_AD_SHORT ? sizeof(SHORT_AD) : sizeof(LONG_AD);
+        if (!Dloc->AllocLoc.Mapping || !Dloc->FELoc.Mapping ||
+            Dloc->AllocLoc.Length < 0 || (uint64)Dloc->AllocLoc.Length > MAXULONG ||
+            Dloc->AllocLoc.Offset != Header ||
+            Dloc->AllocLoc.Mapping[0].extLocation != Dloc->FELoc.Mapping[0].extLocation ||
+            (Dloc->AllocLoc.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) < Vcb->SectorSize ||
+            (Dloc->AllocLoc.Mapping[0].extLength >> 30) > EXTENT_NOT_RECORDED_ALLOCATED)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Available = (Vcb->SectorSize - Header) / Width * Width;
+        Value = (uint32)min((uint64)Available, (uint64)Dloc->AllocLoc.Length);
+        if (Value % Width || ((uint64)Dloc->AllocLoc.Length > Available && Available < Width))
+            return STATUS_FILE_CORRUPT_ERROR;
+    } else {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (Dloc->FileEntry->tagIdent == TID_FILE_ENTRY) {
+        Previous = ((PFILE_ENTRY)Dloc->FileEntry)->lengthAllocDescs;
+        ((PFILE_ENTRY)Dloc->FileEntry)->lengthAllocDescs = Value;
+    } else {
+        Previous = ((PEXTENDED_FILE_ENTRY)Dloc->FileEntry)->lengthAllocDescs;
+        ((PEXTENDED_FILE_ENTRY)Dloc->FileEntry)->lengthAllocDescs = Value;
+    }
+    if (Previous != Value) Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+    return STATUS_SUCCESS;
 } // end UDFSetAllocDescLen()
 
 /*
@@ -1568,12 +1792,214 @@ UDFWriteFileData(
     OUT PSIZE_T WrittenBytes
 );
 
-/*
-    This routine writes data to file & increases it if necessary.
-    In case of increasing AllocDescs will be rebuilt & flushed to disc
-    (via driver's cache, of cource). Free space map will be updated only
-    durring global media flush.
- */
+/* Prepare the complete inline-to-external write in an unpublished extent.
+ * The old inline bytes/size/map remain authoritative on every preparation
+ * refusal. The caller already owns Main (or VCB for an internal FI); cached
+ * data must have been drained before its Paging acquisition. */
+static NTSTATUS
+UDFPromoteInlineWrite(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO FileInfo, uint32 PartNum, uint32 DataPartNum,
+    int64 Offset, SIZE_T Length, int8* Buffer, PSIZE_T WrittenBytes)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    PFCB Fcb = Dloc->CommonFcb;
+    EXTENT_INFO Candidate, AllocPlan;
+    PUDF_PRIVATE_ALLOCATION Claims = NULL;
+    PEXTENT_MAP OldMap = NULL;
+    uint32 Header;
+    int64 NewLength = Offset + Length;
+    SIZE_T Completed = 0;
+    NTSTATUS Status, LeaseStatus;
+    BOOLEAN PagingAcquired = FALSE, LiveChanged = FALSE, Installed = FALSE;
+
+    RtlZeroMemory(&Candidate, sizeof(Candidate));
+    RtlZeroMemory(&AllocPlan, sizeof(AllocPlan));
+    Status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+    if (!NT_SUCCESS(Status)) return Status;
+    if (PartNum >= Vcb->PartitionMaps || DataPartNum >= Vcb->PartitionMaps ||
+        Dloc->DataLoc.Length < 0 || Dloc->DataLoc.Offset != Header ||
+        (uint64)Dloc->DataLoc.Length > Vcb->SectorSize - Header ||
+        NewLength <= (int64)(Vcb->SectorSize - Header) ||
+        !Dloc->DataLoc.Mapping || !Dloc->FELoc.Mapping || Dloc->FELoc.Offset ||
+        Dloc->DataLoc.Mapping == Dloc->FELoc.Mapping ||
+        Dloc->FELoc.Mapping[0].extLength != Vcb->SectorSize || Dloc->FELoc.Mapping[1].extLength ||
+        Dloc->DataLoc.Mapping[0].extLength != Vcb->SectorSize || Dloc->DataLoc.Mapping[1].extLength ||
+        Dloc->DataLoc.Mapping[0].extLocation != Dloc->FELoc.Mapping[0].extLocation ||
+        Dloc->AllocLoc.Mapping || Dloc->AllocLoc.Length || Dloc->AllocLoc.Offset)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Vcb->Vat || Vcb->CDR_Mode || (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    if (Dloc->FE_Flags & UDF_FE_FLAG_CACHED_DATA_PENDING)
+        return STATUS_INVALID_DEVICE_STATE; /* never call Cc while Paging is held */
+    if (Fcb) {
+        if ((FileInfo->Fcb && FileInfo->Fcb != Fcb) || !Fcb->FcbNonpaged ||
+            !Fcb->FileInfo || Fcb->FileInfo->Dloc != Dloc ||
+            Fcb->Header.PagingIoResource != &Fcb->FcbNonpaged->FcbPagingIoResource ||
+            !ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource) ||
+            (ExIsResourceAcquiredSharedLite(&Fcb->FcbNonpaged->FcbPagingIoResource) &&
+             !ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbPagingIoResource)))
+            return STATUS_INVALID_DEVICE_STATE;
+    } else if (FileInfo->Fcb || !ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource)) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    _SEH2_TRY {
+    _SEH2_TRY {
+        if (Fcb && !ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbPagingIoResource)) {
+            UDFAcquirePagingIoExclusive(IrpContext, Fcb);
+            PagingAcquired = TRUE;
+        }
+        Status = UDFFlushDirectoryAppend(IrpContext, Vcb, FileInfo);
+        if (!NT_SUCCESS(Status)) goto promotion_exit;
+        Status = UDFPreparePrivateExtent(IrpContext, Vcb, DataPartNum, NewLength,
+                                          EXTENT_FLAG_ALLOC_STD, &Candidate, &Claims);
+        if (!NT_SUCCESS(Status)) goto promotion_exit;
+        AllocPlan.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                                                       2 * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+        if (!AllocPlan.Mapping) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            goto promotion_exit;
+        }
+        RtlZeroMemory(AllocPlan.Mapping, 2 * sizeof(EXTENT_MAP));
+        AllocPlan.Mapping[0] = Dloc->FELoc.Mapping[0];
+        AllocPlan.Offset = Header;
+        AllocPlan.Modified = TRUE;
+        if (Dloc->DataLoc.Length) {
+            Status = UDFWriteExtent(IrpContext, Vcb, &Candidate, 0,
+                (SIZE_T)Dloc->DataLoc.Length, FALSE, (int8*)Dloc->FileEntry + Header, &Completed);
+            if (NT_SUCCESS(Status) && Completed != (SIZE_T)Dloc->DataLoc.Length)
+                Status = STATUS_IO_DEVICE_ERROR;
+            if (!NT_SUCCESS(Status)) goto promotion_exit;
+        }
+        Completed = 0;
+        Status = UDFWriteExtent(IrpContext, Vcb, &Candidate, Offset, Length, FALSE, Buffer, &Completed);
+        if (NT_SUCCESS(Status) && Completed != Length) Status = STATUS_IO_DEVICE_ERROR;
+        if (!NT_SUCCESS(Status)) goto promotion_exit;
+        /* Untouched new sectors remain unrecorded (logical zero), while
+         * partial recorded sector padding was initialized by WriteExtent. */
+        Status = UDFPublishPrivateExtent(Vcb, Claims);
+        if (!NT_SUCCESS(Status)) goto promotion_exit;
+        LiveChanged = TRUE;
+        OldMap = Dloc->DataLoc.Mapping;
+        Dloc->DataLoc = Candidate;
+        Candidate.Mapping = NULL;
+        Dloc->AllocLoc = AllocPlan;
+        AllocPlan.Mapping = NULL;
+        ((PFILE_ENTRY)Dloc->FileEntry)->icbTag.flags &= ~ICB_FLAG_ALLOC_MASK;
+        ((PFILE_ENTRY)Dloc->FileEntry)->icbTag.flags |=
+            PartNum == DataPartNum ? ICB_FLAG_AD_SHORT : ICB_FLAG_AD_LONG;
+        if (Dloc->FileEntry->tagIdent == TID_FILE_ENTRY)
+            ((PFILE_ENTRY)Dloc->FileEntry)->lengthAllocDescs = 0;
+        else
+            ((PEXTENDED_FILE_ENTRY)Dloc->FileEntry)->lengthAllocDescs = 0;
+        UDFSetFileSize(FileInfo, NewLength);
+        if (Fcb) Fcb->FcbState &= ~UDF_FCB_EMBEDDED_DATA;
+        Installed = TRUE;
+promotion_exit:
+        NOTHING;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) Status = STATUS_FILE_CORRUPT_ERROR;
+        LeaseStatus = UDFCompletePrivateExtent(Vcb, &Claims,
+            Installed && !_SEH2_AbnormalTermination(), Status);
+        if (NT_SUCCESS(Status) && !NT_SUCCESS(LeaseStatus)) Status = LeaseStatus;
+        if (OldMap) MyFreePool__(OldMap);
+        if (Candidate.Mapping) MyFreePool__(Candidate.Mapping);
+        if (AllocPlan.Mapping) MyFreePool__(AllocPlan.Mapping);
+        if (LiveChanged && !NT_SUCCESS(Status)) {
+            Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, Status);
+        }
+        if (PagingAcquired) UDFReleasePagingIo(IrpContext, Fcb);
+    } _SEH2_END;
+    if (NT_SUCCESS(Status)) *WrittenBytes = Length;
+    return Status;
+}
+
+/* Allocation capacity is not logical EOF. Retain any newly owned tail as
+ * preallocation while preparing the gap and payload, then publish only the
+ * initialized/accepted logical range. No best-effort free/resize rollback. */
+static NTSTATUS
+UDFWriteExternalExtension(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO FileInfo, uint32 DataPartNum, int64 Offset, SIZE_T Length,
+    BOOLEAN Direct, int8* Buffer, PSIZE_T WrittenBytes)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    int64 OldLength = Dloc->DataLoc.Length, End = Offset + Length;
+    int64 Position = OldLength, VisibleEnd;
+    int64 Allocated = UDFGetExtentLength(Dloc->DataLoc.Mapping);
+    SIZE_T Chunk, Zeroed;
+    NTSTATUS Status = STATUS_SUCCESS;
+    BOOLEAN PayloadStarted = FALSE, Exceptional = FALSE;
+
+    if (Dloc->DataLoc.Offset || Allocated < OldLength || End <= OldLength)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Direct && End > Allocated) return STATUS_INVALID_PARAMETER;
+    _SEH2_TRY {
+    _SEH2_TRY {
+        if (End > Allocated) {
+            Status = UDFResizeExtent(IrpContext, Vcb, FileInfo, DataPartNum,
+                                      End, FALSE, &Dloc->DataLoc);
+            if (!NT_SUCCESS(Status)) goto external_exit;
+            /* Private growth has transferred a complete owned map, but it
+             * must not publish the requested full logical length yet. */
+            Dloc->DataLoc.Length = OldLength;
+            Dloc->DataLoc.Modified = TRUE;
+        }
+        while (Position < Offset) {
+            /* Bound the SIZE_T call on i386. Full unrecorded/new sectors
+             * already read zero; recorded gaps become unrecorded, and only
+             * partial recorded sector tails need actual zero writes. */
+            Chunk = (SIZE_T)min((uint64)(Offset - Position), (uint64)(16 * 1024 * 1024));
+            Zeroed = 0;
+            Status = UDFZeroExtent(IrpContext, Vcb, &Dloc->DataLoc, Position,
+                                   Chunk, FALSE, Direct, &Zeroed);
+            if (Status == STATUS_SUCCESS && Zeroed != Chunk) Status = STATUS_IO_DEVICE_ERROR;
+            if (Status != STATUS_SUCCESS) goto external_exit;
+            Position += Chunk;
+        }
+        PayloadStarted = TRUE;
+        Status = UDFWriteFileData(IrpContext, Vcb, FileInfo, Offset, Length,
+                                   Direct, Buffer, WrittenBytes);
+        if (Status == STATUS_SUCCESS && *WrittenBytes != Length) Status = STATUS_IO_DEVICE_ERROR;
+external_exit:
+        if (Status != STATUS_SUCCESS && NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+        Exceptional = TRUE;
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            Exceptional = TRUE;
+        }
+        if (*WrittenBytes > Length) {
+            *WrittenBytes = 0;
+            Status = STATUS_IO_DEVICE_ERROR;
+            Exceptional = TRUE;
+        }
+        VisibleEnd = OldLength;
+        if (Status == STATUS_SUCCESS)
+            VisibleEnd = End; /* includes a successful zero-length resize */
+        else if (PayloadStarted && *WrittenBytes)
+            VisibleEnd = max(OldLength, Offset + (int64)*WrittenBytes);
+        Dloc->DataLoc.Length = VisibleEnd;
+        Dloc->DataLoc.Modified = TRUE;
+        Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+        UDFSetFileSize(FileInfo, VisibleEnd);
+        if (Exceptional) Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        if (!NT_SUCCESS(Status))
+            UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, Status);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Grow metadata only after a complete private inline promotion, or retain
+ * the existing external extent owner on a later payload failure. */
 NTSTATUS
 UDFWriteFile__(
     IN PIRP_CONTEXT IrpContext,
@@ -1586,139 +2012,58 @@ UDFWriteFile__(
     OUT PSIZE_T WrittenBytes
     )
 {
-    int64 t, elen;
-    NTSTATUS status;
-    int8* OldInIcb = NULL;
-    ValidateFileInfo(FileInfo);
-    SIZE_T _WrittenBytes;
+    int64 End;
+    uint32 PartNum, DataPartNum, Header;
+    uint16 Mode;
     PUDF_DATALOC_INFO Dloc;
-    // unwind staff
-    BOOLEAN WasInIcb = FALSE;
-    uint64 OldLen;
+    NTSTATUS Status;
+    BOOLEAN Handled;
 
-//    ASSERT(FileInfo->RefCount >= 1);
-
-    Dloc = FileInfo->Dloc;
-    ASSERT(Dloc->FELoc.Mapping[0].extLocation);
-    uint32 PartNum = UDFGetRefPartNumByPhysLba(Vcb, Dloc->FELoc.Mapping[0].extLocation);
-    uint32 DataPartNum = PartNum;
-    if (Vcb->MetadataFileInfo && PartNum == Vcb->MetadataRef &&
-        !UDFIsADirectory(FileInfo))
+    if (WrittenBytes) *WrittenBytes = 0;
+    if (!IrpContext || !Vcb || !FileInfo || !(Dloc = FileInfo->Dloc) ||
+        !WrittenBytes || Offset < 0 || (uint64)Length > (uint64)MAXLONGLONG - (uint64)Offset ||
+        (Length && !Buffer) || !Dloc->FELoc.Mapping || !Dloc->DataLoc.Mapping ||
+        !Vcb->Partitions || !Vcb->PartitionMaps || Dloc->DataLoc.Length < 0)
+        return STATUS_INVALID_PARAMETER;
+    Status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+    if (!NT_SUCCESS(Status)) return Status;
+    PartNum = UDFGetRefPartNumByPhysLba(Vcb, Dloc->FELoc.Mapping[0].extLocation);
+    if (PartNum >= Vcb->PartitionMaps) return STATUS_FILE_CORRUPT_ERROR;
+    DataPartNum = PartNum;
+    if (Vcb->MetadataFileInfo && PartNum == Vcb->MetadataRef && !UDFIsADirectory(FileInfo))
         DataPartNum = Vcb->MetadataPhysRef;
-    (*WrittenBytes) = 0;
-
-    {
-        BOOLEAN handled;
-        status = UDFTryDirectoryAppend(IrpContext, Vcb, FileInfo, Offset,
-                                      Length, Direct, Buffer, WrittenBytes, &handled);
-        if (!NT_SUCCESS(status) || handled)
-            return status;
+    if (DataPartNum >= Vcb->PartitionMaps) return STATUS_FILE_CORRUPT_ERROR;
+    End = Offset + Length;
+    Mode = ((PFILE_ENTRY)Dloc->FileEntry)->icbTag.flags & ICB_FLAG_ALLOC_MASK;
+    if ((Length || End > Dloc->DataLoc.Length) &&
+        (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    Status = UDFTryDirectoryAppend(IrpContext, Vcb, FileInfo, Offset,
+                                  Length, Direct, Buffer, WrittenBytes, &Handled);
+    if (!NT_SUCCESS(Status) || Handled) return Status;
+    if (End <= Dloc->DataLoc.Length)
+        return UDFWriteFileData(IrpContext, Vcb, FileInfo, Offset, Length, Direct, Buffer, WrittenBytes);
+    if (Mode == ICB_FLAG_AD_IN_ICB && (uint64)End > Vcb->SectorSize - Header) {
+        if (Direct) return STATUS_INVALID_PARAMETER;
+        return UDFPromoteInlineWrite(IrpContext, Vcb, FileInfo, PartNum, DataPartNum,
+                                     Offset, Length, Buffer, WrittenBytes);
     }
-
-    AdPrint(("UDFWriteFile__ FE %x, FileInfo %x, ExtInfo %x, Mapping %x\n",
-        Dloc->FELoc.Mapping[0].extLocation, FileInfo, &(Dloc->DataLoc), Dloc->DataLoc.Mapping));
-
-    t = Offset + Length;
-//    UDFUpdateModifyTime(Vcb, FileInfo);
-    if (t <= Dloc->DataLoc.Length) {
-        // write Alloc-Rec area
-        ExtPrint(("  WAlloc-Rec: %I64x <= %I64x\n", t, Dloc->DataLoc.Length));
-        status = UDFWriteFileData(IrpContext, Vcb, FileInfo, Offset, Length, Direct, Buffer, WrittenBytes);
-        return status;
-    }
-    elen = UDFGetExtentLength(Dloc->DataLoc.Mapping);
-    ExtPrint(("  DataLoc Offs %x, Len %I64x\n",
-        Dloc->DataLoc.Offset, Dloc->DataLoc.Length));
-    if (t <= (elen - Dloc->DataLoc.Offset)) {
-        // write Alloc-Not-Rec area
-        ExtPrint(("  WAlloc-Not-Rec: %I64x <= %I64x (%I64x - %I64x)\n",
-            t, elen - Dloc->DataLoc.Offset - Dloc->DataLoc.Length,
-            elen - Dloc->DataLoc.Offset,
-            Dloc->DataLoc.Length));
-        UDFSetFileSize(FileInfo, t);
+    if (Mode == ICB_FLAG_AD_IN_ICB) {
+        if (Dloc->DataLoc.Offset != Header ||
+            (uint64)Dloc->DataLoc.Length > Vcb->SectorSize - Header ||
+            (uint64)End > Vcb->SectorSize - Header)
+            return STATUS_FILE_CORRUPT_ERROR;
+        RtlZeroMemory((int8*)Dloc->FileEntry + Header + (SIZE_T)Dloc->DataLoc.Length,
+                      (SIZE_T)(End - Dloc->DataLoc.Length));
+        UDFSetFileSize(FileInfo, End);
         Dloc->DataLoc.Modified = TRUE;
-        Dloc->DataLoc.Length = t;
+        Dloc->DataLoc.Length = End;
         return UDFWriteFileData(IrpContext, Vcb, FileInfo, Offset, Length, Direct, Buffer, WrittenBytes);
     }
-    // We should not get here if Direct=TRUE
-    if (Direct) return STATUS_INVALID_PARAMETER;
-    OldLen = Dloc->DataLoc.Length;
-    if (Dloc->DataLoc.Offset && Dloc->DataLoc.Length) {
-        // read in-icb data. it'll be replaced after resize
-        ExtPrint(("  read in-icb data\n"));
-        OldInIcb = (int8*)MyAllocatePool__(NonPagedPool, (uint32)(Dloc->DataLoc.Length));
-        if (!OldInIcb) return STATUS_INSUFFICIENT_RESOURCES;
-        status = UDFReadFile__(IrpContext, Vcb, FileInfo, 0, (uint32)OldLen, FALSE, OldInIcb);
-        if (!NT_SUCCESS(status)) {
-            MyFreePool__(OldInIcb);
-            return status;
-        }
-    }
-    // init Alloc mode
-    ExtPrint(("  init Alloc mode\n"));
-    if ((((PFILE_ENTRY)(Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK) == ICB_FLAG_AD_IN_ICB) {
-        ((PFILE_ENTRY)(Dloc->FileEntry))->icbTag.flags &= ~ICB_FLAG_ALLOC_MASK;
-        ((PFILE_ENTRY)(Dloc->FileEntry))->icbTag.flags |=
-            (DataPartNum == PartNum) ? ICB_FLAG_AD_SHORT : ICB_FLAG_AD_LONG;
-        WasInIcb = TRUE;
-        // Clear embedded data flag since file is no longer in ICB mode
-        // Fcb may be NULL during directory operations (FCB not yet created)
-        if (FileInfo->Fcb) {
-            FileInfo->Fcb->FcbState &= ~UDF_FCB_EMBEDDED_DATA;
-        }
-    }
-    // increase extent
-    ExtPrint(("  %s %s %s\n",
-        UDFIsADirectory(FileInfo) ? "DIR" : "FILE",
-        WasInIcb ? "In-Icb" : "",
-        Vcb->LowFreeSpace ? "LowSpace" : ""));
-    status = UDFResizeExtent(IrpContext, Vcb, DataPartNum, t, FALSE, &(Dloc->DataLoc));
-    ExtPrint(("  DataLoc Offs %x, Len %I64x\n",
-        Dloc->DataLoc.Offset, Dloc->DataLoc.Length));
-    AdPrint(("UDFWriteFile__ (2) FileInfo %x, ExtInfo %x, Mapping %x\n", FileInfo, &(Dloc->DataLoc), Dloc->DataLoc.Mapping));
-    if (!NT_SUCCESS(status)) {
-        // rollback
-        ExtPrint(("  err -> rollback\n"));
-        if (WasInIcb) {
-            // restore Alloc mode
-            ((PFILE_ENTRY)(Dloc->FileEntry))->icbTag.flags &= ~ICB_FLAG_ALLOC_MASK;
-            ((PFILE_ENTRY)(Dloc->FileEntry))->icbTag.flags |= ICB_FLAG_AD_IN_ICB;
-            if (Dloc->AllocLoc.Mapping) {
-                MyFreePool__(Dloc->AllocLoc.Mapping);
-                Dloc->AllocLoc.Mapping = NULL;
-            }
-        }
-        if (OldInIcb) {
-            UDFWriteFileData(IrpContext, Vcb, FileInfo, 0, (uint32)OldLen, FALSE, OldInIcb, &_WrittenBytes);
-            MyFreePool__(OldInIcb);
-        }
-        if ((int64)OldLen != Dloc->DataLoc.Length) {
-            // restore file size
-            AdPrint(("  restore alloc\n"));
-            FileInfo->Dloc->DataLoc.Flags |= EXTENT_FLAG_CUT_PREALLOCATED;
-            UDFResizeExtent(IrpContext, Vcb, DataPartNum, OldLen, FALSE, &Dloc->DataLoc);
-            FileInfo->Dloc->DataLoc.Flags &= ~EXTENT_FLAG_CUT_PREALLOCATED;
-        }
-        return status;
-    }
-    if (OldInIcb) {
-        // replace data from ICB (if any) & free buffer
-        ExtPrint(("  write old in-icd data\n"));
-        status = UDFWriteFileData(IrpContext, Vcb, FileInfo, 0, (uint32)OldLen, FALSE, OldInIcb, &_WrittenBytes);
-        MyFreePool__(OldInIcb);
-        if (!NT_SUCCESS(status))
-            return status;
-    }
-    // ufff...
-    // & now we'll write out data to well prepared extent...
-    // ... like all normal people do...
-    ExtPrint(("  write user data\n"));
-    if (!NT_SUCCESS(status = UDFWriteFileData(IrpContext, Vcb, FileInfo, Offset, Length, FALSE, Buffer, WrittenBytes)))
-        return status;
-    UDFSetFileSize(FileInfo, t);
-    Dloc->DataLoc.Modified = TRUE;
-    ASSERT(UDFGetFileSize(FileInfo) <= UDFGetExtentLength(FileInfo->Dloc->DataLoc.Mapping));
-    return STATUS_SUCCESS;
+    if (Mode != ICB_FLAG_AD_SHORT && Mode != ICB_FLAG_AD_LONG)
+        return STATUS_NOT_SUPPORTED;
+    return UDFWriteExternalExtension(IrpContext, Vcb, FileInfo, DataPartNum,
+                                      Offset, Length, Direct, Buffer, WrittenBytes);
 } // end UDFWriteFile__()
 
 /* Keep the disk's prepared FREE generation visible across ordinary bitmap
@@ -1769,35 +2114,51 @@ UDFOverlayDeletePrefreeMetadata(PVCB Vcb, int8* Bitmap,
     return STATUS_SUCCESS;
 }
 
-static VOID
-UDFDetachDeletePrefree(PVCB Vcb, PUDF_DATALOC_INFO Dloc)
+/* Locate the exact owned record before either bitmap retirement or list
+ * removal. A bounded full traversal also rejects cycles/duplicate links;
+ * finding a prefix match alone would not make freeing that node safe. */
+static NTSTATUS
+UDFLocateDeletePrefree(PVCB Vcb, PUDF_DATALOC_INFO Dloc,
+                       PUDF_DELETE_PREFREE** Slot)
 {
     PUDF_DELETE_PREFREE* cursor = &Vcb->DeletePrefreeList;
     PUDF_DELETE_PREFREE record = Dloc->DeletePrefree;
-    if (!record) return;
-    while (*cursor && *cursor != record)
+    ULONG remaining = Vcb->DeletePrefreeCount;
+    *Slot = NULL;
+    ASSERT(ExIsResourceAcquiredExclusiveLite(&Vcb->BitMapResource1));
+    if (!record || record->Dloc != Dloc || !remaining)
+        return STATUS_FILE_CORRUPT_ERROR;
+    while (remaining--) {
+        if (!*cursor || !(*cursor)->Dloc)
+            return STATUS_FILE_CORRUPT_ERROR;
+        if (*cursor == record) {
+            if (*Slot) return STATUS_FILE_CORRUPT_ERROR;
+            *Slot = cursor;
+        }
         cursor = &(*cursor)->Next;
-    ASSERT(*cursor == record && Vcb->DeletePrefreeCount);
-    if (*cursor == record) {
-        *cursor = record->Next;
-        Vcb->DeletePrefreeCount--;
     }
-    Dloc->DeletePrefree = NULL;
-    MyFreePool__(record);
+    if (*cursor || !*Slot)
+        return STATUS_FILE_CORRUPT_ERROR;
+    return STATUS_SUCCESS;
 }
 
-VOID
-UDFAbandonDeletePrefreeDloc(PVCB Vcb, PUDF_DATALOC_INFO Dloc)
+static NTSTATUS
+UDFDetachDeletePrefree(PVCB Vcb, PUDF_DATALOC_INFO Dloc)
 {
-    if (!Dloc || !Dloc->DeletePrefree) return;
-    UDFAcquireResourceExclusive(&(Vcb->BitMapResource1), TRUE);
-    if (Dloc->DeletePrefree) {
-        /* An unexpected teardown must not leave a VCB list pointing at a
-         * freed Dloc or resume allocation from an uncommitted generation. */
+    PUDF_DELETE_PREFREE* slot;
+    PUDF_DELETE_PREFREE record = Dloc->DeletePrefree;
+    NTSTATUS status;
+    if (!record) return STATUS_SUCCESS;
+    status = UDFLocateDeletePrefree(Vcb, Dloc, &slot);
+    if (status != STATUS_SUCCESS) {
         Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
-        UDFDetachDeletePrefree(Vcb, Dloc);
+        return status; /* retain the record and its actual Dloc owner */
     }
-    UDFReleaseResource(&(Vcb->BitMapResource1));
+    *slot = record->Next;
+    Vcb->DeletePrefreeCount--;
+    Dloc->DeletePrefree = NULL;
+    MyFreePool__(record);
+    return STATUS_SUCCESS;
 }
 
 VOID
@@ -1821,22 +2182,32 @@ UDFReleaseDeletePrefreeRecords(PVCB Vcb)
     UDFReleaseResource(&(Vcb->BitMapResource1));
 }
 
+/* Readers hold independent main/mirror arrays. Do not acquire the bitmap
+ * writer resource from a Dloc/namespace reader merely to keep a map alive. */
 static BOOLEAN
-UDFDeleteRangeOverlapsMap(PEXTENT_MAP Map, uint32 Lba, uint32 Blocks)
+UDFDeleteRangeOverlapsMetadata(PVCB Vcb, uint32 Lba, uint32 Blocks)
 {
-    uint32 i;
-    uint64 first = Lba, end = first + Blocks;
-    for (i = 0; Map && i < 4096 &&
-                (Map[i].extLength & UDF_EXTENT_LENGTH_MASK); ++i) {
-        uint32 bytes = Map[i].extLength & UDF_EXTENT_LENGTH_MASK;
-        uint64 mapFirst = Map[i].extLocation;
-        uint64 mapEnd = mapFirst + ((uint64)bytes + 511) / 512;
-        if ((Map[i].extLength >> 30) !=
-                EXTENT_NOT_RECORDED_NOT_ALLOCATED &&
-            first < mapEnd && mapFirst < end)
-            return TRUE;
+    PUDF_METADATA_VIEW View = UDFAcquireMetadataView(Vcb);
+    const EXTENT_MAP* Map;
+    uint32 i, Copy, Count;
+    uint64 First = Lba, End = First + Blocks;
+    BOOLEAN Overlap = FALSE;
+    if (!View) return TRUE; /* no authoritative map: no prefree */
+    for (Copy = 0; Copy < 2 && !Overlap; Copy++) {
+        Map = Copy ? View->MirrorMap : View->MainMap;
+        Count = Copy ? View->MirrorCount : View->MainCount;
+        for (i = 0; i < Count; i++) {
+            uint64 MapFirst = Map[i].extLocation;
+            uint64 MapEnd = MapFirst +
+                ((Map[i].extLength & UDF_EXTENT_LENGTH_MASK) >> View->SectorShift);
+            if (First < MapEnd && MapFirst < End) {
+                Overlap = TRUE;
+                break;
+            }
+        }
     }
-    return i == 4096;
+    UDFReleaseMetadataView(View);
+    return Overlap;
 }
 
 /* Only the exact dense, 512-byte, external-SBD case is prepared here. Other
@@ -1943,12 +2314,7 @@ UDFBuildDeletePrefree(PVCB Vcb, PUDF_FILE_INFO FileInfo,
             map[i].extLocation - partRoot >= Vcb->FSBM_BitCount ||
             blocks > Vcb->FSBM_BitCount -
                      (map[i].extLocation - partRoot) ||
-            UDFDeleteRangeOverlapsMap(Vcb->MetadataFileInfo->Dloc->DataLoc.Mapping,
-                                      map[i].extLocation, blocks) ||
-            (Vcb->MetadataMirrorFileInfo &&
-             UDFDeleteRangeOverlapsMap(
-                 Vcb->MetadataMirrorFileInfo->Dloc->DataLoc.Mapping,
-                 map[i].extLocation, blocks)))
+            UDFDeleteRangeOverlapsMetadata(Vcb, map[i].extLocation, blocks))
             return STATUS_NOT_SUPPORTED;
         count++;
     }
@@ -2081,19 +2447,25 @@ UDFWriteDeletePrefreeBitmaps(PIRP_CONTEXT IrpContext, PVCB Vcb,
     return STATUS_SUCCESS;
 }
 
-static VOID
+static NTSTATUS
 UDFReleasePrefreedAllocation(PVCB Vcb, PUDF_FILE_INFO DirInfo,
                              PUDF_FILE_INFO FileInfo)
 {
+    PUDF_DELETE_PREFREE* slot;
+    NTSTATUS Status;
     UDFAcquireResourceExclusive(&(Vcb->BitMapResource1), TRUE);
     _SEH2_TRY {
-        UDFFreeFileAllocation(Vcb, DirInfo, FileInfo);
-        UDFDetachDeletePrefree(Vcb, FileInfo->Dloc);
+        Status = UDFLocateDeletePrefree(Vcb, FileInfo->Dloc, &slot);
+        if (Status == STATUS_SUCCESS)
+            Status = UDFFreeFileAllocation(Vcb, DirInfo, FileInfo);
+        if (Status == STATUS_SUCCESS)
+            Status = UDFDetachDeletePrefree(Vcb, FileInfo->Dloc);
     } _SEH2_FINALLY {
         if (_SEH2_AbnormalTermination())
             Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
         UDFReleaseResource(&(Vcb->BitMapResource1));
     } _SEH2_END;
+    return Status;
 }
 
 /* The directory transaction is deliberately narrower than the ordinary-file
@@ -2102,23 +2474,22 @@ UDFReleasePrefreedAllocation(PVCB Vcb, PUDF_FILE_INFO DirInfo,
 static BOOLEAN
 UDFDeleteHasIndependentMetadataMirror(PVCB Vcb, uint32 MainLba)
 {
-    PEXTENT_MAP mirror;
-    uint32 lbn, mirrorLba, flags;
-    SIZE_T available;
-
-    if (!(Vcb->MetadataFlags & UDF_METADATA_DUPLICATED) ||
-        !Vcb->MetadataMirrorFileInfo ||
-        !Vcb->MetadataMirrorFileInfo->Dloc ||
-        !(mirror = Vcb->MetadataMirrorFileInfo->Dloc->DataLoc.Mapping))
-        return FALSE;
-    lbn = UDFPhysLbaToMetadata(Vcb, MainLba);
-    if (lbn == LBA_OUT_OF_EXTENT || lbn >= Vcb->MetadataBitCount ||
-        UDFMetadataLbaToPhys(Vcb, lbn, NULL) != MainLba)
-        return FALSE;
-    mirrorLba = UDFExtentOffsetToLba(Vcb, mirror, ((int64)lbn) << 9,
-                                    NULL, &available, &flags, NULL);
-    return mirrorLba != LBA_OUT_OF_EXTENT && mirrorLba != MainLba &&
-           flags == EXTENT_RECORDED_ALLOCATED && available >= 512;
+    PUDF_METADATA_VIEW View = UDFAcquireMetadataView(Vcb);
+    uint32 Lbn, MirrorLba;
+    SIZE_T Available;
+    BOOLEAN Independent = FALSE;
+    if (!View) return FALSE;
+    if (View->SectorSize == 512 && (View->Flags & UDF_METADATA_DUPLICATED)) {
+        Lbn = UDFMetadataViewPhysToLba(View, MainLba);
+        if (Lbn != LBA_OUT_OF_EXTENT && Lbn < Vcb->MetadataBitCount &&
+            UDFMetadataViewLbaToPhys(View, Lbn, FALSE, NULL) == MainLba) {
+            MirrorLba = UDFMetadataViewLbaToPhys(View, Lbn, TRUE, &Available);
+            Independent = MirrorLba != LBA_OUT_OF_EXTENT &&
+                          MirrorLba != MainLba && Available >= 512;
+        }
+    }
+    UDFReleaseMetadataView(View);
+    return Independent;
 }
 
 static BOOLEAN
@@ -2140,7 +2511,7 @@ UDFDeleteParentHasOtherDirtyFid(PDIR_INDEX_HDR Index, uint_di Target)
 static NTSTATUS
 UDFTryPreparedEmptyDirectoryUnlink(PIRP_CONTEXT IrpContext, PVCB Vcb,
                                    PUDF_FILE_INFO FileInfo,
-                                   PBOOLEAN Handled)
+                                   PBOOLEAN Handled, PBOOLEAN NamespaceTouched)
 {
     PUDF_FILE_INFO parent;
     PUDF_DATALOC_INFO dloc;
@@ -2290,6 +2661,10 @@ UDFTryPreparedEmptyDirectoryUnlink(PIRP_CONTEXT IrpContext, PVCB Vcb,
         bitmapHeld = TRUE;
         status = UDFValidateDeletePrefreeBitmaps(IrpContext, Vcb,
                      bitmapPhysical, bitmapMetadata, sector);
+        if (NT_SUCCESS(status) && (dloc->DeletePrefree ||
+            Vcb->DeletePrefreeCount == MAXULONG))
+            status = dloc->DeletePrefree ? STATUS_FILE_CORRUPT_ERROR :
+                                          STATUS_INSUFFICIENT_RESOURCES;
         if (NT_SUCCESS(status)) {
             record->Next = Vcb->DeletePrefreeList;
             Vcb->DeletePrefreeList = record;
@@ -2297,6 +2672,7 @@ UDFTryPreparedEmptyDirectoryUnlink(PIRP_CONTEXT IrpContext, PVCB Vcb,
             dloc->DeletePrefree = record;
             attached = TRUE;
             uncertain = TRUE;
+            *NamespaceTouched = TRUE;
             status = UDFWriteDeletePrefreeBitmaps(IrpContext, Vcb, record,
                          bitmapPhysical, bitmapMetadata, sector,
                          &uncertain);
@@ -2329,6 +2705,7 @@ UDFTryPreparedEmptyDirectoryUnlink(PIRP_CONTEXT IrpContext, PVCB Vcb,
             UDFChangeFileCounter(Vcb, FALSE, FALSE);
             UDFDecFileLinkCount(FileInfo);
             dloc->FE_Flags &= ~UDF_FE_FLAG_FE_MODIFIED;
+            dloc->DeleteCommitted = TRUE;
             dloc->FE_Flags |= UDF_FE_FLAG_FREE_DEFERRED;
             UDFRemoveFileId(Vcb, removedId);
             UDFPrint(("UDFS empty-dir prefree committed FE %lx\n",
@@ -2356,9 +2733,13 @@ UDFTryPreparedEmptyDirectoryUnlink(PIRP_CONTEXT IrpContext, PVCB Vcb,
                                                 TRUE);
                     bitmapHeld = TRUE;
                 }
-                UDFDetachDeletePrefree(Vcb, dloc);
+                NTSTATUS detachStatus = UDFDetachDeletePrefree(Vcb, dloc);
+                if (NT_SUCCESS(status) && detachStatus != STATUS_SUCCESS)
+                    status = detachStatus;
+                /* A refusal leaves the record attached to Dloc. Do not
+                 * free it through this stack-local rollback receipt. */
                 record = NULL;
-                attached = FALSE;
+                attached = detachStatus != STATUS_SUCCESS;
             }
         }
         if (bitmapHeld)
@@ -2409,19 +2790,284 @@ UDFStreamDirectoryHasLiveHandles(
     return FALSE;
 }
 
+/* An SDir is reached through its parent's EFE, not a normal FID. The
+ * parent pointer removal must be committed before that SDir's allocation
+ * can be retired. The same parent FE ordering covers non-fast stream/dir
+ * tombstones without requiring an inline allocation release. */
+static NTSTATUS
+UDFCommitUnlinkParent(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                      PUDF_FILE_INFO FileInfo)
+{
+    PUDF_FILE_INFO Parent = FileInfo->ParentFile;
+    PFCB Fcb;
+    BOOLEAN Acquired = FALSE;
+    NTSTATUS Status = STATUS_SUCCESS;
+    uint32 PartNum;
+    if (!Parent || !Parent->Dloc || !Parent->Dloc->FileEntry ||
+        !Parent->Dloc->FELoc.Mapping)
+        return STATUS_FILE_CORRUPT_ERROR;
+    /* A parent already known unreachable must never be serialized again.
+     * Child holds still reserve its allocation until their final cleanup. */
+    if (Parent->Dloc->DeleteCommitted)
+        return STATUS_SUCCESS;
+    Fcb = Parent->Dloc->CommonFcb;
+    if (Fcb && !ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource)) {
+        if (!UDFAcquireFcbExclusive(IrpContext, Fcb, TRUE))
+            return STATUS_SHARING_VIOLATION;
+        Acquired = TRUE;
+    }
+    _SEH2_TRY {
+        _SEH2_TRY {
+            PartNum = UDFGetRefPartNumByPhysLba(Vcb,
+                Parent->Dloc->FELoc.Mapping[0].extLocation);
+            Status = PartNum == (uint32)-1 ? STATUS_FILE_CORRUPT_ERROR :
+                UDFFlushFE(IrpContext, Vcb, Parent, PartNum);
+        } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+            Status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (Acquired)
+            UDFReleaseFcb(IrpContext, Fcb);
+    } _SEH2_END;
+    return Status;
+}
+
+static NTSTATUS UDFDereferenceFileLocked(PVCB Vcb, PUDF_FILE_INFO FileInfo);
+static uint32 UDFCleanUpFileInternal(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                                     PNTSTATUS CleanupStatus);
+static uint32 UDFCleanUpFileWithStatus(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                                       PNTSTATUS CleanupStatus);
+
+/* A synchronous stream operation transfers one successful temporary open
+ * to this explicit slot. Do not add another reference or copy an aggregate
+ * Dloc count. A failed checked release retains the exact slot and prevents
+ * clean-close/disposal, rather than losing an anonymous reference. */
 NTSTATUS
-UDFUnlinkFile__(
+UDFOwnStreamDeleteFile(PVCB Vcb, PUDF_DATALOC_INFO Owner,
+                       PUDF_FILE_INFO FileInfo)
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    if (!Owner || !FileInfo || !FileInfo->Dloc || Owner == FileInfo->Dloc)
+        return STATUS_FILE_INVALID;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    if (Owner->StreamDeleteOwner || Owner->StreamCreate)
+        Status = STATUS_DEVICE_BUSY;
+    else if (!FileInfo->RefCount ||
+             FileInfo->Dloc->LinkRefCount < FileInfo->RefCount)
+        Status = STATUS_FILE_CORRUPT_ERROR;
+    else if (FileInfo->Dloc->CleanupOwner || FileInfo->Dloc->StreamDeleteContextOwner || FileInfo->Dloc->StreamCreate ||
+             (!FileInfo->Dloc->CommonFcb &&
+              (FileInfo->RefCount != 1 || FileInfo->Dloc->LinkRefCount != 1)))
+        Status = STATUS_DEVICE_BUSY;
+    else {
+        /* Without a common FCB there can be no pre-existing constructor/
+         * by-ID reference about to publish one behind our missing lock.
+         * Gate later acquisitions until the checked release/cleanup claim. */
+        FileInfo->Dloc->StreamDeleteContextOwner = Owner;
+        Owner->StreamDeleteOwner = FileInfo;
+        InterlockedIncrement(&Vcb->PendingNamespaceCount);
+    }
+    UDFReleaseResource(&Vcb->DlocResource2);
+    return Status;
+}
+
+/* Reference consumption is non-I/O. With an exclusive VCB, Dispose can
+ * atomically hand an ownerless cold FI to the collector. Shared-VCB callers
+ * leave CleanupPending in the indexed Dloc ring for explicit volume retry;
+ * never free weak cache topology concurrently with metadata readers.
+ * Error-path callers pass FALSE and perform no cleanup/writeback here. */
+NTSTATUS
+UDFReleaseStreamDeleteFile(PVCB Vcb, PUDF_DATALOC_INFO Owner,
+                           PUDF_FILE_INFO* OwnedFileInfo, BOOLEAN Dispose)
+{
+    PUDF_FILE_INFO FileInfo = *OwnedFileInfo;
+    PUDF_DATALOC_INFO Dloc;
+    NTSTATUS Status;
+    uint32 Result = UDF_FREE_NOTHING;
+    BOOLEAN Claimed = FALSE;
+    if (!Owner || !FileInfo)
+        return STATUS_FILE_INVALID;
+    if (Dispose && !ExIsResourceAcquiredSharedLite(&Vcb->VcbResource) &&
+        !ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource))
+        return STATUS_INVALID_DEVICE_STATE;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    if (Owner->StreamDeleteOwner != FileInfo || !FileInfo->Dloc ||
+        FileInfo->Dloc->StreamDeleteContextOwner != Owner) {
+        UDFReleaseResource(&Vcb->DlocResource2);
+        return STATUS_FILE_INVALID;
+    }
+    Dloc = FileInfo->Dloc;
+    if (Dispose)
+        FileInfo->CleanupPending = TRUE;
+    Status = UDFDereferenceFileLocked(Vcb, FileInfo);
+    if (NT_SUCCESS(Status)) {
+        if (Dispose && ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource) &&
+            Dloc && !FileInfo->RefCount && !FileInfo->OpenCount &&
+            !FileInfo->Fcb && !Dloc->CommonFcb && !Dloc->LinkRefCount &&
+            !Dloc->CleanupOwner && !(Dloc->FE_Flags & UDF_FE_FLAG_UNDER_INIT)) {
+            Dloc->CleanupOwner = PsGetCurrentThread();
+            Claimed = TRUE;
+        }
+        Dloc->StreamDeleteContextOwner = NULL;
+        Owner->StreamDeleteOwner = NULL;
+        NT_ASSERT(Vcb->PendingNamespaceCount > 0);
+        if (!Claimed)
+            InterlockedDecrement(&Vcb->PendingNamespaceCount);
+        /* Otherwise the cleanup claim inherits the slot's close barrier
+         * until normal completion; an exception keeps it quarantined. */
+    }
+    /* A failed checked decrement leaves the explicit slot as owner. The
+     * caller must not continue to use an FI after consuming/handover. */
+    *OwnedFileInfo = NULL;
+    UDFReleaseResource(&Vcb->DlocResource2);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (Claimed) {
+        NTSTATUS CleanupStatus = STATUS_SUCCESS;
+        _SEH2_TRY {
+            _SEH2_TRY {
+                Result = UDFCleanUpFileInternal(Vcb, FileInfo, &CleanupStatus);
+                if (CleanupStatus != STATUS_SUCCESS && CleanupStatus != STATUS_DEVICE_BUSY)
+                    Status = CleanupStatus;
+                if (Result & UDF_FREE_FILEINFO)
+                    MyFreePool__(FileInfo);
+            } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+                Status = _SEH2_GetExceptionCode();
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+            } _SEH2_END;
+        } _SEH2_FINALLY {
+            if (NT_SUCCESS(Status)) {
+                UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+                if (!(Result & UDF_FREE_DLOC))
+                    Dloc->CleanupOwner = NULL;
+                NT_ASSERT(Vcb->PendingNamespaceCount > 0);
+                InterlockedDecrement(&Vcb->PendingNamespaceCount);
+                UDFReleaseResource(&Vcb->DlocResource2);
+            }
+        } _SEH2_END;
+    }
+    return Status;
+}
+
+/* Abort a successful open that could not enter the operation slot. Do
+ * not access its FI after dropping the last reference. A corrupt decrement
+ * retains this exact rejected hold in the otherwise empty owner slot. */
+NTSTATUS
+UDFAbortStreamDeleteFile(PVCB Vcb, PUDF_DATALOC_INFO Owner,
+                         PUDF_FILE_INFO* OwnedFileInfo)
+{
+    PUDF_FILE_INFO FileInfo = *OwnedFileInfo;
+    NTSTATUS Status;
+    if (!Owner || !FileInfo)
+        return STATUS_FILE_INVALID;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    NT_ASSERT(Owner->StreamDeleteOwner == NULL);
+    if (Owner->StreamDeleteOwner) {
+        UDFReleaseResource(&Vcb->DlocResource2);
+        return STATUS_DEVICE_BUSY;
+    }
+    FileInfo->CleanupPending = TRUE;
+    Status = UDFDereferenceFileLocked(Vcb, FileInfo);
+    if (!NT_SUCCESS(Status)) {
+        Owner->StreamDeleteOwner = FileInfo;
+        InterlockedIncrement(&Vcb->PendingNamespaceCount);
+        /* No second context gate is installed over another operation's
+         * gate. This is an abort-only quarantine hold, not a new unlink. */
+    }
+    *OwnedFileInfo = NULL;
+    UDFReleaseResource(&Vcb->DlocResource2);
+    return Status;
+}
+
+/* Failed constructors do not own an ordinary successful-open reference.
+ * Bound contexts stay in the Dloc's failed-generation inventory; an unbound
+ * shell has no on-media allocation and can be disposed as memory only. */
+NTSTATUS
+UDFRetainFailedStreamOpen(PVCB Vcb, PUDF_FILE_INFO* FailedFileInfo)
+{
+    PUDF_FILE_INFO FileInfo = *FailedFileInfo;
+    NTSTATUS Status = STATUS_SUCCESS;
+    if (!FileInfo)
+        return STATUS_SUCCESS;
+    *FailedFileInfo = NULL;
+    _SEH2_TRY {
+        if (FileInfo->Dloc) {
+            UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+            if (FileInfo->Constructing)
+                FileInfo->ConstructionFailed = TRUE;
+            FileInfo->CleanupPending = TRUE;
+            UDFReleaseResource(&Vcb->DlocResource2);
+        } else if (UDFCleanUpFile__(Vcb, FileInfo) & UDF_FREE_FILEINFO) {
+            MyFreePool__(FileInfo);
+        } else {
+            Status = STATUS_DEVICE_BUSY;
+        }
+    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+        Status = _SEH2_GetExceptionCode();
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Caller still owns the main resource, but no longer any temporary FI
+ * reference. Indexed teardown may retire the entire FI ring; report whether
+ * it consumed that resource before an ancestor flush/exception can occur. */
+static NTSTATUS
+UDFTeardownClosedStream(PIRP_CONTEXT IrpContext, PVCB Vcb, PFCB Fcb,
+                         PBOOLEAN Removed)
+{
+    NTSTATUS Status = STATUS_SUCCESS, WritebackStatus;
+    BOOLEAN WasWriter = BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    *Removed = FALSE;
+    if (Fcb->FcbReference || Fcb->FcbCleanup)
+        return STATUS_SUCCESS;
+    if (Fcb->FileInfo && Fcb->FileInfo->Dloc &&
+        (Fcb->FileInfo->Dloc->LinkRefCount || Fcb->FileInfo->OpenCount ||
+         Fcb->FileInfo->Dloc->StreamDeleteOwner ||
+         Fcb->FileInfo->Dloc->StreamDeleteContextOwner || Fcb->FileInfo->Dloc->StreamCreate ||
+         (Fcb->FileInfo->Dloc->FE_Flags & UDF_FE_FLAG_CACHED_DATA_PENDING)))
+        return STATUS_SUCCESS; /* keep the prefix with every remaining owner */
+    SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    _SEH2_TRY {
+        _SEH2_TRY {
+            Status = UDFTeardownStructuresEx(IrpContext, Fcb, FALSE, FALSE, Removed);
+            /* Namespace commit has already completed. A busy memory-GC
+             * decision retains its indexed owner for explicit retry; it is
+             * not a failed unlink. Actual writeback errors stay latched. */
+            if (Status == STATUS_DEVICE_BUSY)
+                Status = STATUS_SUCCESS;
+        } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+            Status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (!WasWriter)
+            ClearFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    } _SEH2_END;
+    WritebackStatus = UDFTakeMetadataWritebackError(Vcb);
+    if (NT_SUCCESS(Status)) Status = WritebackStatus;
+    return Status;
+}
+
+static NTSTATUS UDFDeleteAllStreamsEx(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO FileInfo, PBOOLEAN NamespaceTouched);
+static NTSTATUS UDFUnlinkAllFilesInDirEx(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO DirInfo, PBOOLEAN NamespaceTouched);
+
+static NTSTATUS
+UDFUnlinkFileInternal(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
     IN PUDF_FILE_INFO FileInfo,
-    IN BOOLEAN FreeSpace
+    IN BOOLEAN FreeSpace,
+    OUT PBOOLEAN NamespaceTouched
     )
 {
     uint_di Index;   // index of file to be deleted
     uint16 lc;
     PUDF_DATALOC_INFO Dloc;
     PUDF_FILE_INFO DirInfo;
-    PUDF_FILE_INFO SDirInfo;
     PDIR_INDEX_HDR hDirNdx;
     PDIR_INDEX_HDR hCurDirNdx;
     PDIR_INDEX_ITEM DirNdx;
@@ -2455,14 +3101,14 @@ UDFUnlinkFile__(
 
     // check references
     Dloc = FileInfo->Dloc;
-    // Original check was too strict: (OpenCount) || (RefCount > 1)
-    // Problem: When we open a file via UDFOpenFile__ to delete it during rename,
-    // that adds +1 to RefCount. If there's also a delayed-close reference,
-    // RefCount becomes 2 and unlink fails even though OpenCount=0.
-    // Fix: Only check OpenCount. RefCount will be properly managed by Close/CleanUp.
-    // The key insight is: OpenCount tracks actual user handles, RefCount tracks
-    // internal references. If no user has the file open (OpenCount=0), we should
-    // be able to unlink it.
+    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY)
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    if (Dloc->DeleteCommitted || FileInfo->LinkDeleteCommitted)
+        return STATUS_FILE_DELETED;
+    /* RefCount belongs to this exact FI; OpenCount is the contribution
+     * from referenced child FIs, not a count of user handles. SDir/directory
+     * ownership has separate preflight below. These scalar counts cannot
+     * authorize consuming references owned by another CCB or LCB. */
     // When FreeSpace=FALSE (rename/move), we only unlink the FID from the
     // directory — the file data stays intact. OpenCount/RefCount/SDirInfo checks
     // are not relevant because the file remains alive under a new name.
@@ -2487,6 +3133,14 @@ UDFUnlinkFile__(
         }
     }
     ASSERT(FileInfo->RefCount >= 1);
+    if (!FileInfo->RefCount || Dloc->LinkRefCount < FileInfo->RefCount) {
+        /* Preserve the assertion and fail closed in free builds too. This
+         * guard is not a substitute for the exact CCB/LCB owner protocol. */
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo,
+                                           STATUS_FILE_CORRUPT_ERROR);
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
     DirInfo = FileInfo->ParentFile;
     // root dir or self
     if (!DirInfo || ((FileInfo->Index < 2) && !UDFIsAStreamDir(FileInfo))) return STATUS_CANNOT_DELETE;
@@ -2495,11 +3149,15 @@ UDFUnlinkFile__(
     // we can't delete modified file
     // it should be closed & reopened (or flushed) before deletion
     DirNdx = UDFDirIndex(hDirNdx,Index);
+    if (DirNdx && !UDFIsAStreamDir(FileInfo) && UDFIsDeleted(DirNdx))
+        return STATUS_FILE_DELETED; /* no second counter/ref/allocation transition */
 #if defined UDF_DBG
     if (DirNdx && DirNdx->FName.Buffer) {
         AdPrint(("Unlink: %wZ\n", &DirNdx->FName));
     }
 #endif // UDF_DBG
+    if (Dloc->RetiredExtents)
+        return STATUS_CANNOT_DELETE; /* flush the replacement FE before unlink */
     if (FreeSpace &&
        ((Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED) ||
          Dloc->DataLoc.Modified ||
@@ -2508,19 +3166,42 @@ UDFUnlinkFile__(
         (DirNdx && (DirNdx->FI_Flags & UDF_FI_FLAG_FI_MODIFIED)) )) {
         return STATUS_CANNOT_DELETE;
     }
-    /* A live named-stream handle must retain the stream directory and its
-     * owner until cleanup.  This check precedes every FID/link-count change;
-     * returning STATUS_CANNOT_DELETE later would leave a dirty parent FID. */
-    if (FreeSpace &&
-        UDFStreamDirectoryHasLiveHandles(UDFIsAStreamDir(FileInfo) ?
-            FileInfo : (UDFHasAStreamDir(FileInfo) ? Dloc->SDirInfo : NULL)))
-        return STATUS_CANNOT_DELETE;
+    /* Last-name/SDir deletion preflights each referenced stream inside the
+     * synchronous helper. A surviving base hard link keeps its stream tree;
+     * it does not need to delete or reject another link's live streams. */
+    /* Complete fallible stream deletion before changing the surviving
+     * base FID or its link counts. A child flush/unlink error must leave
+     * that namespace owner in place, not a deleted FID awaiting cleanup. */
+    if (FreeSpace && UDFIsAStreamDir(FileInfo)) {
+        if (!DirInfo->Dloc->FileEntry ||
+            DirInfo->Dloc->FileEntry->tagIdent != TID_EXTENDED_FILE_ENTRY ||
+            DirInfo->Dloc->FileEntryLen < sizeof(EXTENDED_FILE_ENTRY))
+            return STATUS_FILE_CORRUPT_ERROR;
+        if (UDFIsSDirDeleted(FileInfo))
+            return STATUS_FILE_DELETED;
+        status = UDFUnlinkAllFilesInDirEx(IrpContext, Vcb, FileInfo, NamespaceTouched);
+        if (NT_SUCCESS(status))
+            status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+        if (!NT_SUCCESS(status))
+            return status;
+    } else if (FreeSpace && UDFHasAStreamDir(FileInfo) &&
+               UDFGetFileNameLinkCount(FileInfo) == 1) {
+        status = UDFDeleteAllStreamsEx(IrpContext, Vcb, FileInfo, NamespaceTouched);
+        if (NT_SUCCESS(status))
+            status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+        if (!NT_SUCCESS(status))
+            return status;
+    }
     if (FreeSpace && UDFIsADirectory(FileInfo)) {
         status = UDFTryPreparedEmptyDirectoryUnlink(IrpContext, Vcb,
                                                      FileInfo,
-                                                     &DirectoryHandled);
-        if (DirectoryHandled)
+                                                     &DirectoryHandled,
+                                                     NamespaceTouched);
+        if (DirectoryHandled) {
+            if (!NT_SUCCESS(status))
+                UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, status);
             return status;
+        }
     }
     /* An ordinary final-link delete may fail while writing its FID. Save the
      * state that must be restored before cleanup can flush the parent. */
@@ -2533,12 +3214,6 @@ UDFUnlinkFile__(
         OldFeFlags = Dloc->FE_Flags;
         RtlCopyMemory(&OldIcb, &FileInfo->FileIdent->icb, sizeof(OldIcb));
     }
-    SDirInfo = Dloc->SDirInfo;
-/*    if (FreeSpace && SDirInfo) {
-        UDFPrint(("Unlink: SDirInfo should be NULL !!!\n"));
-        BrutePoint();
-        return STATUS_CANNOT_DELETE;
-    }*/
     // stream directory can be deleted even being not empty
     // otherwise we should perform some checks
     if (!(IsSDir = UDFIsAStreamDir(FileInfo))) {
@@ -2549,6 +3224,7 @@ UDFUnlinkFile__(
             if (!UDFIsDirEmpty(hCurDirNdx))
                 return STATUS_DIRECTORY_NOT_EMPTY;
         }
+        *NamespaceTouched = TRUE;
         DirNdx->FI_Flags |= UDF_FI_FLAG_FI_MODIFIED;
         DirNdx->FileCharacteristics |= FILE_DELETED;
         FileInfo->FileIdent->fileCharacteristics |= FILE_DELETED;
@@ -2563,6 +3239,7 @@ UDFUnlinkFile__(
             UDFDecFileLinkCount(FileInfo->ParentFile);
         }
     } else { // FID of stream dir parent link to owning file
+        *NamespaceTouched = TRUE;
         if (FileInfo->ParentFile) {
 
             UDFDecFileLinkCount(FileInfo->ParentFile);
@@ -2600,68 +3277,21 @@ UDFUnlinkFile__(
         ((icbtag*)(Dloc->FileEntry+1))->parentICBLocation.logicalBlockNum = 0;
         ((icbtag*)(Dloc->FileEntry+1))->parentICBLocation.partitionReferenceNum = 0;
         Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+        status = UDFFlushFile__(IrpContext, Vcb, FileInfo, UDF_FLUSH_FLAGS_LITE);
+        if (NT_SUCCESS(status))
+            status = UDFCommitUnlinkParent(IrpContext, Vcb, FileInfo);
+        if (NT_SUCCESS(status))
+            status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+        if (!NT_SUCCESS(status)) {
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, status);
+            return status;
+        }
     } else
     // if caller wishes to free file allocation &
     // there are no more references(links) to this file, lets do it >;->
     if (FreeSpace && !lc) {
-        if (UDFHasAStreamDir(FileInfo) &&
-           !UDFIsSDirDeleted(Dloc->SDirInfo) ) {
-            // we have a Stream Dir associated...
-            PUDF_FILE_INFO SFileInfo;
-            if (!Dloc->SDirInfo) {
-                // open SDir from disk
-                status = UDFOpenStreamDir__(IrpContext, Vcb, FileInfo, &(Dloc->SDirInfo));
-                if (!NT_SUCCESS(status)) {
-                    // abort Unlink on error
-                    SFileInfo = Dloc->SDirInfo;
-cleanup_SDir:
-                    UDFCleanUpFile__(Vcb, SFileInfo);
-                    if (SFileInfo) MyFreePool__(SFileInfo);
-                    UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
-                    return status;
-                }
-            }  else {
-                UDFReferenceFile__(Dloc->SDirInfo);
-            }
-            SDirInfo = Dloc->SDirInfo;
-            // try to perform deltree for Streams
-            status = UDFUnlinkAllFilesInDir(IrpContext, Vcb, SDirInfo);
-            if (!NT_SUCCESS(status)) {
-                // abort Unlink on error
-                UDFCloseFile__(IrpContext, Vcb, SDirInfo);
-                SFileInfo = SDirInfo;
-                BrutePoint();
-                goto cleanup_SDir;
-            }
-            // delete SDir
-            UDFFlushFile__(IrpContext, Vcb, SDirInfo, 0);
-            AdPrint(("  "));
-            UDFUnlinkFile__(IrpContext, Vcb, SDirInfo, TRUE);
-            // Mark SDir FCB as deleted so delayed close skips re-unlink
-            if (SDirInfo->Fcb) {
-                SDirInfo->Fcb->FcbState |= UDF_FCB_DELETED;
-                SDirInfo->Fcb->FcbState &= ~(UDF_FCB_DELETE_ON_CLOSE | UDF_FCB_DELETE_PARENT);
-            }
-            // close SDir
-            UDFCloseFile__(IrpContext, Vcb, SDirInfo);
-            if (UDFCleanUpFile__(Vcb, SDirInfo)) {
-                MyFreePool__(SDirInfo);
-            }
-            // If UDFCleanUpFile__ returns UDF_FREE_NOTHING, SDir has
-            // delayed-close stream references. TeardownStructures
-            // handles cleanup when those delayed closes fire.
-            // update FileInfo
-            ASSERT(Dloc->FileEntry);
-            RtlZeroMemory( &(((PEXTENDED_FILE_ENTRY)(Dloc->FileEntry))->streamDirectoryICB), sizeof(long_ad));
-            FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
-        } else
         if (IsSDir) {
-            // do deltree for Streams
-            status = UDFUnlinkAllFilesInDir(IrpContext, Vcb, FileInfo);
-            if (!NT_SUCCESS(status)) {
-                UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
-                return status;
-            }
             // update parent FileInfo
             ASSERT(FileInfo->ParentFile->Dloc->FileEntry);
             RtlZeroMemory( &(((PEXTENDED_FILE_ENTRY)(FileInfo->ParentFile->Dloc->FileEntry))->streamDirectoryICB), sizeof(long_ad));
@@ -2714,6 +3344,10 @@ cleanup_SDir:
                         status = UDFValidateDeletePrefreeBitmaps(IrpContext,
                             Vcb, PhysicalBitmapLba, MetadataBitmapLba,
                             PrefreeSector);
+                        if (NT_SUCCESS(status) && (Dloc->DeletePrefree ||
+                            Vcb->DeletePrefreeCount == MAXULONG))
+                            status = Dloc->DeletePrefree ? STATUS_FILE_CORRUPT_ERROR :
+                                                          STATUS_INSUFFICIENT_RESOURCES;
                         if (NT_SUCCESS(status)) {
                             Prefree->Next = Vcb->DeletePrefreeList;
                             Vcb->DeletePrefreeList = Prefree;
@@ -2756,9 +3390,11 @@ cleanup_SDir:
                                  * uncertain durable generation. */
                                 CommitBarrierFailed = TRUE;
                                 Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
-                                UDFDetachDeletePrefree(Vcb, Dloc);
+                                NTSTATUS detachStatus = UDFDetachDeletePrefree(Vcb, Dloc);
+                                if (NT_SUCCESS(status) && detachStatus != STATUS_SUCCESS)
+                                    status = detachStatus;
                                 Prefree = NULL;
-                                PrefreeAttached = FALSE;
+                                PrefreeAttached = detachStatus != STATUS_SUCCESS;
                             }
                         }
                     }
@@ -2766,8 +3402,11 @@ cleanup_SDir:
                     if (_SEH2_AbnormalTermination()) {
                         Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
                         if (PrefreeAttached) {
-                            UDFDetachDeletePrefree(Vcb, Dloc);
+                            NTSTATUS detachStatus = UDFDetachDeletePrefree(Vcb, Dloc);
+                            if (NT_SUCCESS(status) && detachStatus != STATUS_SUCCESS)
+                                status = detachStatus;
                             Prefree = NULL;
+                            PrefreeAttached = detachStatus != STATUS_SUCCESS;
                         }
                     }
                     if (PrefreeLockHeld)
@@ -2823,36 +3462,25 @@ cleanup_SDir:
             }
             Dloc->FE_Flags &= ~UDF_FE_FLAG_FE_MODIFIED;
         } else {
-            UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+            status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+            if (NT_SUCCESS(status))
+                status = UDFCommitUnlinkParent(IrpContext, Vcb, FileInfo);
+            if (NT_SUCCESS(status))
+                status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+            if (!NT_SUCCESS(status)) {
+                /* Namespace/FE writeback may be partial. Retain allocation
+                 * and stop further writes; never free a still-live ICB. */
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                return status;
+            }
         }
 
-        if ((Dloc->FE_Flags & UDF_FE_FLAG_FREE_DEFERRED) || Dloc->CommonFcb) {
+        /* The FID, or SDir's parent EFE pointer, is now committed absent.
+         * Even without CommonFcb the caller and child FIs still own this
+         * mapping. Retire it only at final claimed Dloc cleanup, never here. */
+        Dloc->DeleteCommitted = TRUE;
+        Dloc->FE_Flags |= UDF_FE_FLAG_FREE_DEFERRED;
 
-            // Defer block freeing while an FCB still owns this Dloc.
-            // Dloc->CommonFcb != NULL means this LBA is still keyed in
-            // Vcb->FcbTable. Freeing the FE block now would let a freshly
-            // created file reuse the LBA while the stale FCB lingers (the
-            // cleanup->close window, or delayed close), so the reused FCB
-            // accumulates parent LCBs from several incarnations and trips the
-            // multi-parent ASSERT(!Recursive) in UDFTeardownStructures.
-            // Keep the block allocated and the Dloc in cache; UDFCleanUpFile__
-            // performs the actual free at the last Dloc reference (KeepDloc=FALSE),
-            // which is exactly when the owning FCB is torn down (CommonFcb cleared).
-            Dloc->FE_Flags |= UDF_FE_FLAG_FREE_DEFERRED;
-
-        } else {
-
-            // Remove the Dloc lookup before its FE bit becomes allocatable.
-            // The overlay is independent of the lookup and stays present
-            // until RAM release finishes under the bitmap lock.
-            UDFUnlinkDloc(Vcb, Dloc);
-            if (Dloc->DeletePrefree)
-                UDFReleasePrefreedAllocation(Vcb, DirInfo, FileInfo);
-            else
-                UDFFreeFileAllocation(Vcb, DirInfo, FileInfo);
-            ASSERT(!(FileInfo->Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED));
-            FileInfo->Dloc->FE_Flags &= ~UDF_FE_FLAG_FE_MODIFIED;
-        }
     }
 
     /* A refused or failed unlink leaves the namespace entry reachable.
@@ -2860,175 +3488,273 @@ cleanup_SDir:
     if (RemoveFileId)
         UDFRemoveFileId(Vcb, RemovedFileId);
     return STATUS_SUCCESS;
-} // end UDFUnlinkFile__()
-
-/*
-    Drop the stream directory (and all named streams) of a file that itself stays
-    alive — used on overwrite/supersede. Unlike the full-delete path (where the base
-    file is torn down synchronously with its SDir), here the base survives, so we must
-    explicitly detach the in-memory base<->SDir prefix LCB; otherwise a later teardown
-    of the open base would follow a link to a freed SDir (use-after-free).
-
-    We do NOT free the SDir / stream FileInfo or FCB here: they stay on the
-    delayed-close path and are released there. We only:
-      - delete the streams and the SDir on disk (UDFUnlinkFile__ on the SDir, which
-        also clears the base file's HAS_SDIR flag and streamDirectoryICB),
-      - remove the base<->SDir prefix LCB and balance the base references,
-      - detach Dloc->SDirInfo from the base.
-
-    Requires exclusive Vcb access.
-*/
-NTSTATUS
-UDFDeleteAllStreams(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO FileInfo
-    )
-{
-    NTSTATUS status;
-    PUDF_FILE_INFO SDirInfo;
-    PUDF_DATALOC_INFO Dloc;
-    PFCB SDirFcb;
-
-    ValidateFileInfo(FileInfo);
-    Dloc = FileInfo->Dloc;
-
-    if (!UDFHasAStreamDir(FileInfo) || UDFIsSDirDeleted(Dloc->SDirInfo)) {
-        return STATUS_SUCCESS;
-    }
-
-    if (!Dloc->SDirInfo) {
-        status = UDFOpenStreamDir__(IrpContext, Vcb, FileInfo, &(Dloc->SDirInfo));
-        if (!NT_SUCCESS(status)) {
-            if (Dloc->SDirInfo) {
-                UDFCleanUpFile__(Vcb, Dloc->SDirInfo);
-                MyFreePool__(Dloc->SDirInfo);
-                Dloc->SDirInfo = NULL;
-            }
-            return status;
-        }
-    }
-    SDirInfo = Dloc->SDirInfo;
-
-    // Delete the streams and the stream directory on disk. UDFUnlinkFile__ on an
-    // SDir runs the deltree of its streams and clears the base file's HAS_SDIR /
-    // streamDirectoryICB (its IsSDir branch). Data blocks are freed there (or
-    // deferred while an FCB still owns the Dloc).
-    status = UDFFlushFile__(IrpContext, Vcb, SDirInfo, 0);
-    if (!NT_SUCCESS(status)) {
-        /* The stream directory remains attached to the base file. A failed
-         * metadata flush must not be followed by namespace deletion. */
-        UDFCloseFile__(IrpContext, Vcb, SDirInfo);
-        return status;
-    }
-    status = UDFUnlinkFile__(IrpContext, Vcb, SDirInfo, TRUE);
-    if (!NT_SUCCESS(status)) {
-        UDFCloseFile__(IrpContext, Vcb, SDirInfo);
-        return status;
-    }
-
-    // Detach the in-memory base<->SDir prefix LCB(s). The base file survives the
-    // overwrite, so this link must go now — otherwise teardown of the base would
-    // later follow it to a freed SDir. Balance the base references exactly as
-    // UDFTeardownStructures does when it removes a prefix.
-    SDirFcb = SDirInfo->Fcb;
-    if (SDirFcb) {
-
-        SDirFcb->FcbState |= UDF_FCB_DELETED;
-        SDirFcb->FcbState &= ~(UDF_FCB_DELETE_ON_CLOSE | UDF_FCB_DELETE_PARENT);
-
-        UDFLockVcb(IrpContext, Vcb);
-        while (!IsListEmpty(&SDirFcb->ParentLcbQueue)) {
-
-            PLCB Lcb = CONTAINING_RECORD(SDirFcb->ParentLcbQueue.Flink, struct LCB, ChildFcbLinks);
-            PFCB ParentFcb = Lcb->ParentFcb;
-
-            // A create may be holding this prefix; leave it to the normal path.
-            if (Lcb->Reference != 0) {
-                break;
-            }
-
-            UDFRemovePrefix(IrpContext, Lcb);
-
-            if (ParentFcb) {
-                if (ParentFcb->FileInfo) {
-                    UDFCloseFile__(IrpContext, Vcb, ParentFcb->FileInfo);
-                }
-                InterlockedDecrement((PLONG)&ParentFcb->FcbReference);
-            }
-        }
-        UDFUnlockVcb(IrpContext, Vcb);
-    }
-
-    // Fully release the SDir's hold on the (surviving) base file. The SDir is a
-    // child of the base (SDir->ParentFile == base), so each of its references
-    // contributes to the base's OpenCount. In the delete path the leftover would
-    // be resolved by tearing down the base; here the base survives, so we must
-    // drop the whole SDir->base linkage now, otherwise the base keeps a stray
-    // OpenCount and can no longer be deleted. The SDir FCB stays alive (FcbRef>0,
-    // delayed close), so UDFCleanUpFile__ will not free it — no use-after-free.
-    while (SDirInfo->RefCount) {
-        UDFCloseFile__(IrpContext, Vcb, SDirInfo);
-    }
-    Dloc->SDirInfo = NULL;
-    Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
-
-    UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
-    return STATUS_SUCCESS;
-} // end UDFDeleteAllStreams()
+} // end UDFUnlinkFileInternal()
 
 NTSTATUS
-UDFUnlinkAllFilesInDir(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO DirInfo
-    )
+UDFUnlinkFileEx__(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                  PUDF_FILE_INFO FileInfo, BOOLEAN FreeSpace,
+                  PBOOLEAN Touched)
 {
-    PDIR_INDEX_HDR hCurDirNdx;
-    PDIR_INDEX_ITEM CurDirNdx;
-    PUDF_FILE_INFO FileInfo;
-    NTSTATUS status;
-    uint_di i;
-
-    hCurDirNdx = DirInfo->Dloc->DirIndex;
-    // Retain the stream directory while a child still has a live handle.
-    // Callers normally preflight before changing their own FID as well.
-    if (UDFStreamDirectoryHasLiveHandles(DirInfo))
+    BOOLEAN NamespaceTouched = FALSE, FcbAcquired = FALSE, ParentAcquired = FALSE;
+    PFCB Fcb = FileInfo && FileInfo->Dloc ? FileInfo->Dloc->CommonFcb : NULL;
+    PFCB ParentFcb = FileInfo && FileInfo->ParentFile ? FileInfo->ParentFile->Fcb : NULL;
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    if (Touched) *Touched = FALSE;
+    if (FileInfo && FileInfo->Dloc && FileInfo->Dloc->StreamCreate)
+        return NT_SUCCESS(FileInfo->Dloc->StreamCreate->FirstError) ? STATUS_DEVICE_BUSY :
+               FileInfo->Dloc->StreamCreate->FirstError;
+    /* Internal stream-tree callers may hold only the parent. Serialize
+     * shared FCB/request state too, without waiting in parent->child order. */
+    if (FreeSpace && Fcb) {
+        if (!Fcb->Header.Resource || !Fcb->FileInfo ||
+            Fcb->FileInfo->Dloc != FileInfo->Dloc)
+            return STATUS_FILE_INVALID;
+        if (!ExIsResourceAcquiredExclusiveLite(Fcb->Header.Resource)) {
+            if (!UDFAcquireFcbExclusive(IrpContext, Fcb, TRUE))
+                return STATUS_DEVICE_BUSY;
+            FcbAcquired = TRUE;
+        }
+    }
+    if (FreeSpace && Fcb && Fcb->FcbCleanup) {
+        if (FcbAcquired) UDFReleaseFcb(IrpContext, Fcb);
         return STATUS_CANNOT_DELETE;
-    // start deletion
-    for(i=2; (CurDirNdx = UDFDirIndex(hCurDirNdx,i)); i++) {
+    }
+    if (FreeSpace && Fcb && !UDFIsADirectory(FileInfo)) {
+        NTSTATUS ImageStatus = STATUS_SUCCESS;
+        _SEH2_TRY {
+            if (!MmFlushImageSection(&Fcb->FcbNonpaged->SegmentObject,
+                UDFGetFileNameLinkCount(FileInfo) > 1 ? MmFlushForWrite : MmFlushForDelete))
+                ImageStatus = STATUS_CANNOT_DELETE;
+        } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+            ImageStatus = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+        if (!NT_SUCCESS(ImageStatus)) {
+            if (FcbAcquired) UDFReleaseFcb(IrpContext, Fcb);
+            return ImageStatus;
+        }
+    }
+    if (FreeSpace && ParentFcb && ParentFcb != Fcb) {
+        if (!ParentFcb->Header.Resource) {
+            if (FcbAcquired) UDFReleaseFcb(IrpContext, Fcb);
+            return STATUS_FILE_INVALID;
+        }
+        if (!ExIsResourceAcquiredExclusiveLite(ParentFcb->Header.Resource)) {
+            if (!UDFAcquireFcbExclusive(IrpContext, ParentFcb, TRUE)) {
+                if (FcbAcquired) UDFReleaseFcb(IrpContext, Fcb);
+                return STATUS_DEVICE_BUSY;
+            }
+            ParentAcquired = TRUE;
+        }
+    }
+    _SEH2_TRY {
+        Status = UDFUnlinkFileInternal(IrpContext, Vcb, FileInfo,
+                                       FreeSpace, &NamespaceTouched);
+        if (NT_SUCCESS(Status) && FreeSpace && FileInfo)
+            UDFNoteCommittedUnlink(Vcb, Fcb, FileInfo);
+    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+        Status = _SEH2_GetExceptionCode();
+        if (NamespaceTouched)
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    } _SEH2_END;
+    if (ParentAcquired)
+        UDFReleaseFcb(IrpContext, ParentFcb);
+    if (FcbAcquired)
+        UDFReleaseFcb(IrpContext, Fcb);
+    if (Touched)
+        *Touched = NamespaceTouched;
+    if (NamespaceTouched && !NT_SUCCESS(Status))
+        UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, Status);
+    return Status;
+}
 
+NTSTATUS
+UDFUnlinkFile__(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                PUDF_FILE_INFO FileInfo, BOOLEAN FreeSpace)
+{
+    return UDFUnlinkFileEx__(IrpContext, Vcb, FileInfo, FreeSpace, NULL);
+}
+
+
+/* Synchronous stream deletion retains the exact SDir/child open until its
+ * checked non-I/O release. Prefix and FCB lifetime belong to indexed teardown;
+ * do not manually detach a still-owned LCB or manufacture a base-file delete
+ * from a stream's canonical parent. NamespaceTouched includes descendants. */
+static NTSTATUS
+UDFDeleteAllStreamsEx(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                      PUDF_FILE_INFO FileInfo, PBOOLEAN NamespaceTouched)
+{
+    PUDF_DATALOC_INFO Owner = FileInfo ? FileInfo->Dloc : NULL;
+    PUDF_FILE_INFO SDirInfo = NULL;
+    PFCB SDirFcb = NULL;
+    NTSTATUS Status = STATUS_SUCCESS, ReleaseStatus;
+    BOOLEAN Opened = FALSE, SlotOwned = FALSE, SDirAcquired = FALSE;
+    BOOLEAN Removed = FALSE, ChildTouched = FALSE;
+    if (!Owner)
+        return STATUS_FILE_INVALID;
+    if (!UDFHasAStreamDir(FileInfo) || UDFIsSDirDeleted(Owner->SDirInfo))
+        return STATUS_SUCCESS;
+    if (Owner->StreamDeleteOwner)
+        return STATUS_DEVICE_BUSY;
+    _SEH2_TRY {
+        _SEH2_TRY {
+            Status = UDFOpenStreamDir__(IrpContext, Vcb, FileInfo, &SDirInfo);
+            if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+            Opened = TRUE;
+            Status = UDFOwnStreamDeleteFile(Vcb, Owner, SDirInfo);
+            if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+            SlotOwned = TRUE;
+            SDirFcb = SDirInfo->Dloc->CommonFcb;
+            if (SDirFcb) {
+                if (!SDirFcb->Header.Resource) {
+                    Status = STATUS_FILE_INVALID;
+                    _SEH2_LEAVE;
+                }
+                if (!ExIsResourceAcquiredExclusiveLite(SDirFcb->Header.Resource)) {
+                    if (!UDFAcquireFcbExclusive(IrpContext, SDirFcb, TRUE)) {
+                        Status = STATUS_DEVICE_BUSY;
+                        _SEH2_LEAVE;
+                    }
+                    SDirAcquired = TRUE;
+                }
+            }
+            Status = UDFFlushFile__(IrpContext, Vcb, SDirInfo, 0);
+            if (NT_SUCCESS(Status))
+                Status = UDFUnlinkFileEx__(IrpContext, Vcb, SDirInfo, TRUE,
+                                           &ChildTouched);
+        } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+            Status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (ChildTouched)
+            *NamespaceTouched = TRUE;
+        if (Opened) {
+            ReleaseStatus = SlotOwned ?
+                UDFReleaseStreamDeleteFile(Vcb, Owner, &SDirInfo, NT_SUCCESS(Status)) :
+                UDFAbortStreamDeleteFile(Vcb, Owner, &SDirInfo);
+            Opened = FALSE;
+            if (NT_SUCCESS(Status)) Status = ReleaseStatus;
+            if (NT_SUCCESS(Status)) {
+                if (SDirFcb && SDirAcquired) {
+                    SDirInfo = NULL; /* teardown may free the complete FI ring */
+                    Status = UDFTeardownClosedStream(IrpContext, Vcb, SDirFcb, &Removed);
+                } /* Cold FI disposal used the atomic release/claim above. */
+            }
+        }
+        ReleaseStatus = UDFRetainFailedStreamOpen(Vcb, &SDirInfo);
+        if (NT_SUCCESS(Status)) Status = ReleaseStatus;
+        if (SDirAcquired && !Removed)
+            UDFReleaseFcb(IrpContext, SDirFcb);
+    } _SEH2_END;
+    if (!NT_SUCCESS(Status) && *NamespaceTouched) {
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+    }
+    return Status;
+}
+
+NTSTATUS
+UDFDeleteAllStreams(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    BOOLEAN NamespaceTouched = FALSE;
+    return UDFDeleteAllStreamsEx(IrpContext, Vcb, FileInfo, &NamespaceTouched);
+}
+
+static NTSTATUS
+UDFUnlinkAllFilesInDirEx(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                        PUDF_FILE_INFO DirInfo, PBOOLEAN NamespaceTouched)
+{
+    PUDF_DATALOC_INFO Owner = DirInfo ? DirInfo->Dloc : NULL;
+    PUDF_FILE_INFO FileInfo = NULL;
+    PFCB ChildFcb = NULL;
+    NTSTATUS Status = STATUS_SUCCESS, ReleaseStatus;
+    BOOLEAN Opened = FALSE, SlotOwned = FALSE, ChildAcquired = FALSE;
+    BOOLEAN Removed = FALSE, ChildTouched = FALSE;
+    uint_di Index, Limit;
+    if (!Owner || !Owner->DirIndex || !UDFIsAStreamDir(DirInfo))
+        return STATUS_FILE_INVALID;
+    if (Owner->StreamDeleteOwner)
+        return STATUS_DEVICE_BUSY;
+    /* Every supported stream passes link/image/live-handle preflight before
+     * the first tombstone. Recheck each FCB under its own lock during unlink
+     * too, since a cold by-ID open need not use the parent's name tree. */
+    Status = UDFPreflightStreamDirectoryDelete(IrpContext, Vcb, DirInfo);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Limit = UDFDirIndexGetLastIndex(Owner->DirIndex);
+    for (Index = 2; Index < Limit; Index++) {
         FileInfo = NULL;
-
-        // try to open Stream
-        status = UDFOpenFile__(IrpContext, Vcb, FALSE, TRUE, NULL, DirInfo, &FileInfo, &i);
-
-        if (status == STATUS_FILE_DELETED) {
-            goto skip_del_stream;
-        } else if (!NT_SUCCESS(status)) {
-            // Error :(((
-            UDFCleanUpFile__(Vcb, FileInfo);
-            if (FileInfo)
-                MyFreePool__(FileInfo);
-            return status;
-        }
-
-        UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
-        AdPrint(("    "));
-        UDFUnlinkFile__(IrpContext, Vcb, FileInfo, TRUE);
-        // Mark stream FCB as deleted so delayed close skips re-unlink/flush
-        if (FileInfo->Fcb) {
-            FileInfo->Fcb->FcbState |= UDF_FCB_DELETED;
-            FileInfo->Fcb->FcbState &= ~(UDF_FCB_DELETE_ON_CLOSE | UDF_FCB_DELETE_PARENT);
-        }
-        UDFCloseFile__(IrpContext, Vcb, FileInfo);
-skip_del_stream:
-        if (FileInfo && UDFCleanUpFile__(Vcb, FileInfo)) {
-            MyFreePool__(FileInfo);
+        ChildFcb = NULL;
+        Opened = SlotOwned = ChildAcquired = Removed = ChildTouched = FALSE;
+        _SEH2_TRY {
+            _SEH2_TRY {
+                Status = UDFOpenFile__(IrpContext, Vcb, FALSE, TRUE, NULL,
+                                       DirInfo, &FileInfo, &Index);
+                if (Status == STATUS_FILE_DELETED) {
+                    Status = STATUS_SUCCESS;
+                    _SEH2_LEAVE;
+                }
+                if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+                Opened = TRUE;
+                Status = UDFOwnStreamDeleteFile(Vcb, Owner, FileInfo);
+                if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+                SlotOwned = TRUE;
+                ChildFcb = FileInfo->Dloc->CommonFcb;
+                if (ChildFcb) {
+                    if (!UDFAcquireFcbExclusive(IrpContext, ChildFcb, TRUE)) {
+                        Status = STATUS_DEVICE_BUSY;
+                        _SEH2_LEAVE;
+                    }
+                    ChildAcquired = TRUE;
+                    if (ChildFcb->FcbCleanup) {
+                        Status = STATUS_CANNOT_DELETE;
+                        _SEH2_LEAVE;
+                    }
+                }
+                Status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+                if (NT_SUCCESS(Status))
+                    Status = UDFUnlinkFileEx__(IrpContext, Vcb, FileInfo, TRUE,
+                                               &ChildTouched);
+            } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+                Status = _SEH2_GetExceptionCode();
+            } _SEH2_END;
+        } _SEH2_FINALLY {
+            if (ChildTouched)
+                *NamespaceTouched = TRUE;
+            if (Opened) {
+                ReleaseStatus = SlotOwned ?
+                    UDFReleaseStreamDeleteFile(Vcb, Owner, &FileInfo, NT_SUCCESS(Status)) :
+                    UDFAbortStreamDeleteFile(Vcb, Owner, &FileInfo);
+                Opened = FALSE;
+                if (NT_SUCCESS(Status)) Status = ReleaseStatus;
+                if (NT_SUCCESS(Status)) {
+                    if (ChildFcb && ChildAcquired) {
+                        FileInfo = NULL; /* teardown may dispose all parallel FIs */
+                        Status = UDFTeardownClosedStream(IrpContext, Vcb, ChildFcb, &Removed);
+                    } /* Cold FI disposal used the atomic release/claim. */
+                }
+            }
+            ReleaseStatus = UDFRetainFailedStreamOpen(Vcb, &FileInfo);
+            if (NT_SUCCESS(Status)) Status = ReleaseStatus;
+            if (ChildAcquired && !Removed)
+                UDFReleaseFcb(IrpContext, ChildFcb);
+        } _SEH2_END;
+        if (!NT_SUCCESS(Status)) {
+            if (*NamespaceTouched) {
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+            }
+            return Status;
         }
     }
     return STATUS_SUCCESS;
-} // end UDFUnlinkAllFilesInDir()
+}
+
+NTSTATUS
+UDFUnlinkAllFilesInDir(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO DirInfo)
+{
+    BOOLEAN NamespaceTouched = FALSE;
+    return UDFUnlinkAllFilesInDirEx(IrpContext, Vcb, DirInfo, &NamespaceTouched);
+}
 
 /*
     This routine inits UDF_FILE_INFO structure for specified file
@@ -3049,6 +3775,7 @@ UDFOpenFile__(
     )
 {
     NTSTATUS status;
+    BOOLEAN ClonedReference = FALSE;
     uint_di i=0;
     EXTENT_AD FEExt;
     uint16 Ident;
@@ -3086,17 +3813,29 @@ UDFOpenFile__(
                 if (!FileInfo) return STATUS_INSUFFICIENT_RESOURCES;
                 RtlCopyMemory(FileInfo, DirNdx->FileInfo, sizeof(UDF_FILE_INFO));
     //          FileInfo->NextLinkedFile = DirNdx->FileInfo->NextLinkedFile; // is already done
-                UDFInsertLinkedFile(FileInfo, DirNdx->FileInfo);
-                DirNdx->FI_Flags |= UDF_FI_FLAG_LINKED;
                 FileInfo->RefCount = 0;
+                FileInfo->OpenCount = 0;
+                FileInfo->ListPtr = NULL;
                 FileInfo->ParentFile = DirInfo;
                 FileInfo->Fcb = NULL;
+                status = UDFReferenceClonedFile(Vcb, FileInfo, DirNdx->FileInfo);
+                if (!NT_SUCCESS(status)) {
+                    MyFreePool__(FileInfo); /* shared FID/Dloc belong to Source */
+                    *_FileInfo = NULL;
+                    return status;
+                }
+                ClonedReference = TRUE;
+                DirNdx->FI_Flags |= UDF_FI_FLAG_LINKED;
             } else {
                 FileInfo = ParFileInfo;
             }
         }
         // Just increase some counters & exit
-        UDFReferenceFile__(FileInfo);
+        if (!ClonedReference) {
+            status = UDFReferenceFileChecked(Vcb, FileInfo);
+            if (!NT_SUCCESS(status))
+                return status;
+        }
 
         ASSERT(FileInfo->ParentFile == DirInfo);
         ValidateFileInfo(FileInfo);
@@ -3128,21 +3867,18 @@ UDFOpenFile__(
         BrutePoint();
         return STATUS_FILE_CORRUPT_ERROR;
     }
+    FileInfo->Index = i;
+    FileInfo->ParentFile = DirInfo;
     // check for opened links
     if (!NT_SUCCESS(status = UDFStoreDloc(Vcb, FileInfo, UDFPartLbaToPhys(Vcb, &(FileInfo->FileIdent->icb.extLocation)))))
         return status;
-    // init pointer to parent object
-    FileInfo->Index = i;
-    FileInfo->ParentFile = DirInfo;
-    // init pointers to linked files (if any)
-    if (FileInfo->Dloc->LinkedFileInfo != FileInfo)
-        UDFInsertLinkedFile(FileInfo, FileInfo->Dloc->LinkedFileInfo);
     if (FileInfo->Dloc->FileEntry) {
         // Dloc cached in UDFOpenFile__ — skip FE read from disk
         goto init_tree_entry;
     }
     // read (Ex)FileEntry
     FileInfo->Dloc->FileEntry = (tag*)MyAllocatePoolTag__(NonPagedPool, Vcb->SectorSize, MEM_FE_TAG);
+    FileInfo->Dloc->FileEntryCapacity = FileInfo->Dloc->FileEntry ? Vcb->SectorSize : 0;
     if (!(FileInfo->Dloc->FileEntry)) return STATUS_INSUFFICIENT_RESOURCES;
     status = UDFReadFileEntry(IrpContext, Vcb, &FileInfo->FileIdent->icb, (PFILE_ENTRY)(FileInfo->Dloc->FileEntry), &Ident);
 
@@ -3189,9 +3925,9 @@ init_tree_entry:
        ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLength )
         FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_HAS_SDIR;
     if (!(FileInfo->FileIdent->fileCharacteristics & FILE_DIRECTORY)) {
-        UDFReferenceFile__(FileInfo);
+        status = UDFCompleteFileInfoConstruction(Vcb, FileInfo);
+        if (!NT_SUCCESS(status)) return status;
         ASSERT(FileInfo->ParentFile == DirInfo);
-        UDFReleaseDloc(Vcb, FileInfo->Dloc);
         return STATUS_SUCCESS;
     }
 
@@ -3203,8 +3939,8 @@ init_tree_entry:
         if (!NT_SUCCESS(status))
             return status;
     }
-    UDFReferenceFile__(FileInfo);
-    UDFReleaseDloc(Vcb, FileInfo->Dloc);
+    status = UDFCompleteFileInfoConstruction(Vcb, FileInfo);
+    if (!NT_SUCCESS(status)) return status;
     ASSERT(FileInfo->ParentFile == DirInfo);
 
     return status;
@@ -3225,6 +3961,7 @@ UDFOpenFileInfoFromDirContext(
     )
 {
     NTSTATUS status;
+    BOOLEAN ClonedReference = FALSE;
     EXTENT_AD FEExt;
     uint16 Ident;
     PDIR_INDEX_ITEM DirNdx = DirContext->DirNdx;
@@ -3248,23 +3985,34 @@ UDFOpenFileInfoFromDirContext(
         if ((FileInfo->ParentFile != DirInfo) &&
            (FileInfo->Index >= 2)) {
             ParFileInfo = UDFLocateParallelFI(DirInfo, i, FileInfo);
-            BrutePoint();
-            if (ParFileInfo->ParentFile != DirInfo) {
+            if (!ParFileInfo || ParFileInfo->ParentFile != DirInfo) {
                 FileInfo = (PUDF_FILE_INFO)MyAllocatePoolTag__(UDF_FILE_INFO_MT, sizeof(UDF_FILE_INFO), MEM_FINF_TAG);
                 *_FileInfo = FileInfo;
                 if (!FileInfo) return STATUS_INSUFFICIENT_RESOURCES;
                 RtlCopyMemory(FileInfo, DirNdx->FileInfo, sizeof(UDF_FILE_INFO));
-                UDFInsertLinkedFile(FileInfo, DirNdx->FileInfo);
-                DirNdx->FI_Flags |= UDF_FI_FLAG_LINKED;
                 FileInfo->RefCount = 0;
+                FileInfo->OpenCount = 0;
+                FileInfo->ListPtr = NULL;
                 FileInfo->ParentFile = DirInfo;
                 FileInfo->Fcb = NULL;
+                status = UDFReferenceClonedFile(Vcb, FileInfo, DirNdx->FileInfo);
+                if (!NT_SUCCESS(status)) {
+                    MyFreePool__(FileInfo); /* shared FID/Dloc belong to Source */
+                    *_FileInfo = NULL;
+                    return status;
+                }
+                ClonedReference = TRUE;
+                DirNdx->FI_Flags |= UDF_FI_FLAG_LINKED;
             } else {
                 FileInfo = ParFileInfo;
             }
         }
         // Just increase some counters & exit
-        UDFReferenceFile__(FileInfo);
+        if (!ClonedReference) {
+            status = UDFReferenceFileChecked(Vcb, FileInfo);
+            if (!NT_SUCCESS(status))
+                return status;
+        }
 
         ASSERT(FileInfo->ParentFile == DirInfo);
         ValidateFileInfo(FileInfo);
@@ -3297,30 +4045,27 @@ UDFOpenFileInfoFromDirContext(
         BrutePoint();
         return STATUS_FILE_CORRUPT_ERROR;
     }
+    FileInfo->Index = i;
+    FileInfo->ParentFile = DirInfo;
     // check for opened links
     if (!NT_SUCCESS(status = UDFStoreDloc(Vcb, FileInfo, UDFPartLbaToPhys(Vcb, &(FileInfo->FileIdent->icb.extLocation)))))
         return status;
-    // init pointer to parent object
-    FileInfo->Index = i;
-    FileInfo->ParentFile = DirInfo;
-    // init pointers to linked files (if any)
-    if (FileInfo->Dloc->LinkedFileInfo != FileInfo)
-        UDFInsertLinkedFile(FileInfo, FileInfo->Dloc->LinkedFileInfo);
     if (FileInfo->Dloc->FileEntry)
         goto init_tree_entry;
     // read (Ex)FileEntry
     FileInfo->Dloc->FileEntry = (tag*)MyAllocatePoolTag__(NonPagedPool, Vcb->SectorSize, MEM_FE_TAG);
+    FileInfo->Dloc->FileEntryCapacity = FileInfo->Dloc->FileEntry ? Vcb->SectorSize : 0;
     if (!(FileInfo->Dloc->FileEntry)) return STATUS_INSUFFICIENT_RESOURCES;
     status = UDFReadFileEntry(IrpContext, Vcb, &FileInfo->FileIdent->icb, (PFILE_ENTRY)(FileInfo->Dloc->FileEntry), &Ident);
     if (!NT_SUCCESS(status)) {
         return status;
     }
     // build mappings for Data & AllocDescs
+    FEExt.extLength = FileInfo->FileIdent->icb.extLength;
+    FEExt.extLocation = UDFPartLbaToPhys(Vcb, &(FileInfo->FileIdent->icb.extLocation));
+    if (FEExt.extLocation == LBA_OUT_OF_EXTENT)
+        return STATUS_FILE_CORRUPT_ERROR;
     if (!FileInfo->Dloc->AllocLoc.Mapping) {
-        FEExt.extLength = FileInfo->FileIdent->icb.extLength;
-        FEExt.extLocation = UDFPartLbaToPhys(Vcb, &(FileInfo->FileIdent->icb.extLocation));
-        if (FEExt.extLocation == LBA_OUT_OF_EXTENT)
-            return STATUS_FILE_CORRUPT_ERROR;
         FileInfo->Dloc->AllocLoc.Mapping = UDFExtentToMapping(&FEExt);
         if (!(FileInfo->Dloc->AllocLoc.Mapping))
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -3334,6 +4079,7 @@ UDFOpenFileInfoFromDirContext(
     FileInfo->Dloc->FELoc.Length = (FileInfo->Dloc->DataLoc.Offset) ? FileInfo->Dloc->DataLoc.Offset :
                                                           FileInfo->Dloc->AllocLoc.Offset;
     FileInfo->Dloc->FELoc.Mapping = UDFExtentToMapping(&FEExt);
+    if (!FileInfo->Dloc->FELoc.Mapping) return STATUS_INSUFFICIENT_RESOURCES;
     FileInfo->Dloc->FileEntryLen = (uint32)(FileInfo->Dloc->FELoc.Length);
     // we get here immediately when opened link encountered
 init_tree_entry:
@@ -3352,9 +4098,9 @@ init_tree_entry:
        ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLength)
         FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_HAS_SDIR;
     if (!(FileInfo->FileIdent->fileCharacteristics & FILE_DIRECTORY)) {
-        UDFReferenceFile__(FileInfo);
+        status = UDFCompleteFileInfoConstruction(Vcb, FileInfo);
+        if (!NT_SUCCESS(status)) return status;
         ASSERT(FileInfo->ParentFile == DirInfo);
-        UDFReleaseDloc(Vcb, FileInfo->Dloc);
         return STATUS_SUCCESS;
     }
 
@@ -3367,8 +4113,8 @@ init_tree_entry:
             return status;
         }
     }
-    UDFReferenceFile__(FileInfo);
-    UDFReleaseDloc(Vcb, FileInfo->Dloc);
+    status = UDFCompleteFileInfoConstruction(Vcb, FileInfo);
+    if (!NT_SUCCESS(status)) return status;
     ASSERT(FileInfo->ParentFile == DirInfo);
 
     return status;
@@ -3378,43 +4124,67 @@ init_tree_entry:
 /*
     This routine inits UDF_FILE_INFO structure for root directory
  */
-NTSTATUS
-UDFOpenRootFile__(
+static NTSTATUS
+UDFOpenRootFileWithParent__(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
     IN lb_addr* RootLoc,
+    IN PUDF_FILE_INFO Parent,
+    IN uint8 ExpectedType, /* zero retains the generic root/by-ID contract */
     OUT PUDF_FILE_INFO FileInfo
     )
 {
     uint32 RootLBA;
     NTSTATUS status;
 //    uint32 PartNum = RootLoc->partitionReferenceNum;
-    uint32 LBS = Vcb->SectorSize;
+    uint32 LBS;
     uint16 Ident;
     LONG_AD FELoc;
     EXTENT_AD FEExt;
     uint8 FileType;
 
+    if (!FileInfo || FileInfo == Parent) return STATUS_INVALID_PARAMETER;
     RtlZeroMemory(FileInfo, sizeof(UDF_FILE_INFO));
+    if (!IrpContext || !Vcb || !RootLoc || !Vcb->Partitions ||
+        RootLoc->partitionReferenceNum >= Vcb->PartitionMaps ||
+        (Parent && (!Parent->Dloc || !Parent->Dloc->FELoc.Mapping)))
+        return STATUS_INVALID_PARAMETER;
+    LBS = Vcb->SectorSize;
     RootLBA = UDFPartLbaToPhys(Vcb,RootLoc);
     if (RootLBA == LBA_OUT_OF_EXTENT)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Parent && Parent->Dloc->FELoc.Mapping[0].extLocation == RootLBA)
         return STATUS_FILE_CORRUPT_ERROR;
     FELoc.extLocation = *RootLoc;
     FELoc.extLength = LBS;
     // init horizontal links
     FileInfo->NextLinkedFile =
     FileInfo->PrevLinkedFile = FileInfo;
-    // check for opened links
-    if (!NT_SUCCESS(status = UDFStoreDloc(Vcb, FileInfo, RootLBA)))
+    /* UDFStoreDloc acquires the constructor's exact FI/Dloc/parent hold.
+     * Bind Parent before that acquisition, not after successful completion. */
+    FileInfo->ParentFile = Parent;
+    if (!NT_SUCCESS(status = UDFStoreDloc(Vcb, FileInfo, RootLBA))) {
+        if (!FileInfo->Dloc) FileInfo->ParentFile = NULL; /* no hold was acquired */
         return status;
+    }
     if (FileInfo->Dloc->FileEntry)
         goto init_tree_entry;
     // read (Ex)FileEntry
     FileInfo->Dloc->FileEntry = (tag*)MyAllocatePoolTag__(NonPagedPool, LBS, MEM_FE_TAG);
+    FileInfo->Dloc->FileEntryCapacity = FileInfo->Dloc->FileEntry ? LBS : 0;
     if (!(FileInfo->Dloc->FileEntry)) return STATUS_INSUFFICIENT_RESOURCES;
 
     if (!NT_SUCCESS(status = UDFReadFileEntry(IrpContext, Vcb, &FELoc, (PFILE_ENTRY)(FileInfo->Dloc->FileEntry), &Ident)))
         return status;
+    /* Type-constrained internal opens do not parse a different object's
+     * payload as a metadata/stream mapping, or acquire a successful open
+     * which the caller must later guess how to undo. */
+    FileType = ((icbtag*)(FileInfo->Dloc->FileEntry + 1))->fileType;
+    if (ExpectedType && FileType != ExpectedType) {
+        UDFPrint(("UDFS: internal type %x expected %x at LBA %x\n",
+                  FileType, ExpectedType, RootLBA));
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
     // build mappings for Data & AllocDescs
     FEExt.extLength = LBS;
     FEExt.extLocation = UDFPartLbaToPhys(Vcb, &(FELoc.extLocation) );
@@ -3436,10 +4206,27 @@ UDFOpenRootFile__(
 init_tree_entry:
     // Keep FE buffer at SectorSize — FlushFE may write full sector for in-ICB mode
     // init DirIndex
-    if ( (FileType = ((icbtag*)((FileInfo->Dloc->FileEntry)+1))->fileType) != UDF_FILE_TYPE_DIRECTORY &&
-        (FileType != UDF_FILE_TYPE_STREAMDIR) ) {
-        UDFReferenceFile__(FileInfo);
-        UDFReleaseDloc(Vcb, FileInfo->Dloc);
+    FileType = ((icbtag*)(FileInfo->Dloc->FileEntry + 1))->fileType;
+    /* A stream pointer must not complete a successful open of a different
+     * object kind and leave the caller to undo an ordinary open reference. */
+    if ((ExpectedType && FileType != ExpectedType) ||
+        (Parent && FileType != UDF_FILE_TYPE_STREAMDIR)) {
+        UDFPrint(("UDFS: cached internal type %x expected %x at LBA %x\n",
+                  FileType, ExpectedType, RootLBA));
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+    if (FileType == UDF_FILE_TYPE_STREAMDIR) {
+        LONG OldFlags;
+        /* A cached Dloc may already have a canonical writer. Setting this
+         * immutable role bit must not overwrite concurrent dirty flags. */
+        do {
+            OldFlags = FileInfo->Dloc->FE_Flags;
+        } while (InterlockedCompareExchange((PLONG)&FileInfo->Dloc->FE_Flags,
+                     OldFlags | UDF_FE_FLAG_IS_SDIR, OldFlags) != OldFlags);
+    }
+    if (FileType != UDF_FILE_TYPE_DIRECTORY && FileType != UDF_FILE_TYPE_STREAMDIR) {
+        status = UDFCompleteFileInfoConstruction(Vcb, FileInfo);
+        if (!NT_SUCCESS(status)) return status;
         return STATUS_SUCCESS;
     }
     // build index for directories
@@ -3449,396 +4236,582 @@ init_tree_entry:
             return status;
 
     }
-    UDFReferenceFile__(FileInfo);
-    UDFReleaseDloc(Vcb, FileInfo->Dloc);
+    status = UDFCompleteFileInfoConstruction(Vcb, FileInfo);
+    if (!NT_SUCCESS(status)) return status;
 
     return status;
+} // end UDFOpenRootFileWithParent__()
+
+/* Preserve the existing parentless root/VAT/metadata/open-by-ID contract. */
+NTSTATUS
+UDFOpenRootFile__(PIRP_CONTEXT IrpContext, PVCB Vcb, lb_addr* RootLoc,
+                   PUDF_FILE_INFO FileInfo)
+{
+    return UDFOpenRootFileWithParent__(IrpContext, Vcb, RootLoc, NULL, 0, FileInfo);
 } // end UDFOpenRootFile__()
 
 /*
     This routine frees all memory blocks referenced by given FileInfo
  */
 uint32
-UDFCleanUpFile__(
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO FileInfo
-    )
+UDFCleanUpFile__(PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    NTSTATUS CleanupStatus;
+    return UDFCleanUpFileWithStatus(Vcb, FileInfo, &CleanupStatus);
+}
+
+static uint32
+UDFCleanUpFileWithStatus(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                         PNTSTATUS CleanupStatus)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo ? FileInfo->Dloc : NULL;
+    uint32 Result = UDF_FREE_NOTHING;
+    BOOLEAN VolumeAcquired = FALSE;
+    *CleanupStatus = STATUS_DEVICE_BUSY;
+    if (!Dloc)
+        return UDFCleanUpFileInternal(Vcb, FileInfo, CleanupStatus);
+    if (!NT_SUCCESS(Dloc->AllocationReleaseError)) {
+        *CleanupStatus = Dloc->AllocationReleaseError;
+        return UDF_FREE_NOTHING;
+    }
+    if (InterlockedCompareExchange(&Vcb->RetainedOpenCount, 0, 0)) {
+        FileInfo->CleanupPending = TRUE;
+        return UDF_FREE_NOTHING;
+    }
+
+    if (!ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource)) {
+        if (ExAcquireResourceExclusiveLite(&Vcb->VcbResource, FALSE))
+            VolumeAcquired = TRUE;
+        else {
+            UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+            if (FileInfo->Constructing)
+                FileInfo->ConstructionFailed = TRUE;
+            FileInfo->CleanupPending = TRUE;
+            UDFReleaseResource(&Vcb->DlocResource2);
+            return UDF_FREE_NOTHING;
+        }
+    }
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    if (Dloc->CleanupOwner || Dloc->CreateConstructionOwner ||
+        FileInfo->CreateConstructionParent || Dloc->StreamDeleteContextOwner || Dloc->StreamCreate) {
+        /* A failed open retains its exact construction hold, reachable
+         * from the Dloc ring, rather than stealing another cleanup claim. */
+        if (FileInfo->Constructing)
+            FileInfo->ConstructionFailed = TRUE;
+        FileInfo->CleanupPending = TRUE;
+        UDFReleaseResource(&Vcb->DlocResource2);
+        if (VolumeAcquired) ExReleaseResourceLite(&Vcb->VcbResource);
+        return UDF_FREE_NOTHING;
+    }
+    Dloc->CleanupOwner = PsGetCurrentThread();
+    UDFReleaseResource(&Vcb->DlocResource2);
+    _SEH2_TRY {
+        if (FileInfo->Constructing)
+            UDFDropFileInfoConstruction(Vcb, FileInfo);
+        Result = UDFCleanUpFileInternal(Vcb, FileInfo, CleanupStatus);
+        if (!(Result & UDF_FREE_FILEINFO))
+            FileInfo->CleanupPending = TRUE;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination() ||
+            (*CleanupStatus != STATUS_SUCCESS && *CleanupStatus != STATUS_DEVICE_BUSY)) {
+            /* Do not revive a partly destroyed generation after an
+             * exception. Keep the claim and report the failure at flush. */
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                _SEH2_AbnormalTermination() ? STATUS_UNSUCCESSFUL : *CleanupStatus, STATUS_SUCCESS);
+        } else if (!(Result & UDF_FREE_DLOC)) {
+            UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+            Dloc->CleanupOwner = NULL;
+            UDFReleaseResource(&Vcb->DlocResource2);
+        }
+        if (VolumeAcquired) ExReleaseResourceLite(&Vcb->VcbResource);
+    } _SEH2_END;
+    return Result;
+}
+
+uint32
+UDFCleanUpFileForFcb(PVCB Vcb, PUDF_FILE_INFO FileInfo, PNTSTATUS CleanupStatus)
+{
+    *CleanupStatus = STATUS_INVALID_DEVICE_STATE;
+    /* The indexed FCB owns this claim through the caller's decision. */
+    if (!ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource) ||
+        !FileInfo || !FileInfo->Dloc ||
+        FileInfo->Dloc->CleanupOwner != PsGetCurrentThread())
+        return UDF_FREE_NOTHING;
+    return UDFCleanUpFileInternal(Vcb, FileInfo, CleanupStatus);
+}
+
+/* Each mount-owned internal FI contributes exactly one open reference.
+ * A retry may flush/dispose it, but must not consume another owner's hold. */
+NTSTATUS
+UDFReleaseInternalFile(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                       PUDF_FILE_INFO* FileInfo)
+{
+    PUDF_FILE_INFO Owned;
+    NTSTATUS Status = STATUS_SUCCESS, CleanupStatus = STATUS_DEVICE_BUSY;
+    if (!FileInfo) return STATUS_INVALID_PARAMETER;
+    Owned = *FileInfo;
+    if (!Owned)
+        return STATUS_SUCCESS;
+    if (!Owned->InternalOpenReleased) {
+        if (!Owned->Constructing && !Owned->ConstructionFailed && Owned->Dloc) {
+            UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+            _SEH2_TRY {
+                if (!Owned->InternalOpenReleased) {
+                    if (!Owned->RefCount) {
+                        Status = STATUS_FILE_CORRUPT_ERROR;
+                        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                    } else {
+                        Status = UDFDereferenceFileLocked(Vcb, Owned);
+                        if (Status == STATUS_SUCCESS)
+                            Owned->InternalOpenReleased = TRUE;
+                    }
+                }
+            } _SEH2_FINALLY {
+                UDFReleaseResource(&Vcb->DlocResource2);
+            } _SEH2_END;
+            if (Status == STATUS_SUCCESS)
+                Status = UDFCompleteFileClose(IrpContext, Vcb, Owned);
+        }
+        /* An incomplete/failed constructor has no ordinary-open token to
+         * consume. The collector owns its actual construction hold; never
+         * label it as an already released successful mount open. */
+    } else if (!Owned->Constructing && !Owned->ConstructionFailed &&
+               !Owned->RefCount && !Owned->OpenCount && !Owned->Fcb &&
+               Owned->Dloc && !Owned->Dloc->DeleteCommitted && Owned->Dloc->FileEntry) {
+        /* The first close already consumed the reference. Retry only its
+         * metadata work, without calling close for a second decrement. */
+        Status = UDFFlushFile__(IrpContext, Vcb, Owned, UDF_FLUSH_FLAGS_LITE);
+    }
+    if (!NT_SUCCESS(Status)) {
+        /* A refused decrement retains the unspent slot. A metadata error
+         * retains the consumed receipt; retry must not call Close again. */
+        UDFRememberMetadataWritebackError(IrpContext, Vcb, Owned, Status);
+        return Status;
+    }
+    if (UDFCleanUpFileWithStatus(Vcb, Owned, &CleanupStatus) & UDF_FREE_FILEINFO) {
+        MyFreePool__(Owned);
+        *FileInfo = NULL;
+    } else if (NT_SUCCESS(Status)) {
+        Status = CleanupStatus == STATUS_SUCCESS ? STATUS_DEVICE_BUSY : CleanupStatus;
+    }
+    return Status;
+}
+
+NTSTATUS
+UDFReapFailedFileInfos(PIRP_CONTEXT IrpContext, PVCB Vcb)
+{
+    uint32 Index = 0;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    if (InterlockedCompareExchange(&Vcb->RetainedOpenCount, 0, 0))
+        return STATUS_FILE_CORRUPT_ERROR;
+    while (Index < Vcb->DlocCount) {
+        PUDF_DATALOC_INFO Dloc;
+        PUDF_FILE_INFO First, FileInfo = NULL, Link;
+        PFCB CanonicalFcb = NULL;
+        UDFAcquireResourceExclusive(&Vcb->DlocResource, TRUE);
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        Dloc = Vcb->DlocList[Index].Dloc;
+        if (Dloc && (First = Dloc->LinkedFileInfo)) {
+            Link = First;
+            do {
+                if ((Link->ConstructionFailed || Link->CleanupPending) &&
+                    !Link->InternalOpenReleased) {
+                    FileInfo = Link;
+                    CanonicalFcb = Dloc->CommonFcb;
+                    break;
+                }
+                Link = Link->NextLinkedFile;
+            } while (Link && Link != First);
+        }
+        UDFReleaseResource(&Vcb->DlocResource2);
+        UDFReleaseResource(&Vcb->DlocResource);
+        if (!FileInfo) {
+            Index++;
+            continue;
+        }
+        /* A failed constructor's exact hold/ring entry remains its retry
+         * owner. Exclusive VCB excludes other constructors/disposers here.
+         * Drain a shared canonical generation before dropping an alias;
+         * never flush a failed initializer's half-built FE/mapping. */
+        if (FileInfo->Fcb || FileInfo->OpenCount ||
+            FileInfo->RefCount > (FileInfo->ConstructionReferenceOwned ? 1U : 0U)) {
+            /* A normal live/cache owner will retry at its final teardown.
+             * It is not a failed constructor and must not block every
+             * otherwise valid flush while it still has open handles. */
+            if (FileInfo->ConstructionFailed)
+                return STATUS_DEVICE_BUSY;
+            FileInfo->CleanupPending = FALSE;
+            continue;
+        }
+        if (CanonicalFcb && !CanonicalFcb->FileInfo)
+            return STATUS_FILE_CORRUPT_ERROR;
+        if (!Dloc->DeleteCommitted && CanonicalFcb && CanonicalFcb->FileInfo != FileInfo) {
+            IO_STATUS_BLOCK IoStatus;
+            PFCB ParentFcb = CanonicalFcb->FileInfo->ParentFile ?
+                CanonicalFcb->FileInfo->ParentFile->Fcb : NULL;
+            BOOLEAN ParentAcquired = FALSE;
+            IoStatus.Status = STATUS_SUCCESS;
+            IoStatus.Information = 0;
+            UDFAcquireFcbExclusive(IrpContext, CanonicalFcb, FALSE);
+            _SEH2_TRY {
+                if (ParentFcb) {
+                    UDFAcquireFcbExclusive(IrpContext, ParentFcb, FALSE);
+                    ParentAcquired = TRUE;
+                }
+                UDFFlushAFile(IrpContext, CanonicalFcb, NULL, &IoStatus,
+                               UDF_FLUSH_FLAGS_LITE);
+            } _SEH2_FINALLY {
+                if (ParentAcquired)
+                    UDFReleaseFcb(IrpContext, ParentFcb);
+                UDFReleaseFcb(IrpContext, CanonicalFcb);
+            } _SEH2_END;
+            if (!NT_SUCCESS(IoStatus.Status))
+                return IoStatus.Status;
+        }
+        if (!FileInfo->ConstructionFailed && !FileInfo->TemporaryRetired &&
+            !FileInfo->Dloc->DeleteCommitted && FileInfo->Dloc->FileEntry) {
+            NTSTATUS Status;
+            PFCB ParentFcb = FileInfo->ParentFile ? FileInfo->ParentFile->Fcb : NULL;
+            if (ParentFcb)
+                UDFAcquireFcbExclusive(IrpContext, ParentFcb, FALSE);
+            _SEH2_TRY {
+                Status = UDFFlushFile__(IrpContext, Vcb, FileInfo,
+                                         UDF_FLUSH_FLAGS_LITE);
+            } _SEH2_FINALLY {
+                if (ParentFcb)
+                    UDFReleaseFcb(IrpContext, ParentFcb);
+            } _SEH2_END;
+            if (!NT_SUCCESS(Status))
+                return Status;
+        }
+        {
+            NTSTATUS CleanupStatus;
+            if (!(UDFCleanUpFileWithStatus(Vcb, FileInfo, &CleanupStatus) & UDF_FREE_FILEINFO))
+                return CleanupStatus == STATUS_SUCCESS ? STATUS_DEVICE_BUSY : CleanupStatus;
+        }
+        MyFreePool__(FileInfo);
+        /* Cleanup can remove this Dloc or change its ring head. Reload the
+         * same cache slot; each successful iteration removes one failed FI. */
+    }
+    return STATUS_SUCCESS;
+}
+
+/* The VCB excludes metadata lookup/reclamation; DlocResource2 excludes
+ * new FI references while weak cache edges are checked and rebound. No
+ * reference arithmetic is needed: an affected child has RefCount == 0.
+ * A replacement is another FI for the SAME Dloc, not a different parent
+ * namespace object. It need not represent the retiring FI's own name. */
+static BOOLEAN
+UDFRebindWeakChildParent(PUDF_FILE_INFO Child, PUDF_FILE_INFO OldParent,
+                         PUDF_FILE_INFO NewParent, BOOLEAN Apply)
+{
+    PUDF_FILE_INFO Peer;
+    PDIR_INDEX_ITEM ParentEntry;
+    if (!Child || !Child->Dloc)
+        return FALSE;
+    ParentEntry = UDFDirIndex(Child->Dloc->DirIndex, 1);
+    Peer = Child;
+    do {
+        BOOLEAN Affected;
+        if (!Peer || Peer->Dloc != Child->Dloc)
+            return FALSE;
+        Affected = Peer->ParentFile == OldParent ||
+                   (ParentEntry && ParentEntry->FileInfo == OldParent);
+        if (Affected) {
+            if (!NewParent || NewParent == OldParent ||
+                NewParent->Dloc != OldParent->Dloc ||
+                Peer->RefCount || Peer->OpenCount || Peer->Constructing ||
+                Child->Dloc->CleanupOwner || Child->Dloc->StreamDeleteContextOwner || Child->Dloc->StreamCreate ||
+                (Child->Dloc->FE_Flags & UDF_FE_FLAG_UNDER_INIT))
+                return FALSE;
+            if (Apply && Peer->ParentFile == OldParent)
+                Peer->ParentFile = NewParent;
+        }
+        Peer = Peer->NextLinkedFile;
+    } while (Peer != Child);
+    if (Apply && ParentEntry && ParentEntry->FileInfo == OldParent)
+        ParentEntry->FileInfo = NewParent;
+    return TRUE;
+}
+
+static BOOLEAN
+UDFRebindWeakChildren(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                      PUDF_FILE_INFO Parallel)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    PUDF_FILE_INFO Replacement = Parallel, Peer;
+    PDIR_INDEX_ITEM Entry;
+    uint_di Index;
+    ULONG Pass;
+    BOOLEAN Success = TRUE;
+    ASSERT(ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource));
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        Peer = FileInfo->NextLinkedFile;
+        while (!Replacement && Peer && Peer != FileInfo) {
+            if (Peer->Dloc == Dloc && !Peer->Constructing &&
+                !Peer->ConstructionFailed && !Peer->TemporaryRetired)
+                Replacement = Peer;
+            Peer = Peer->NextLinkedFile;
+        }
+        /* Check the entire set before changing a weak pointer. The second
+         * pass is allocation/I/O-free under the same lifetime lock. */
+        for (Pass = 0; Pass != 2 && Success; Pass++) {
+            for (Index = 2; (Entry = UDFDirIndex(Dloc->DirIndex, Index)); Index++) {
+                if (Entry->FileInfo && !UDFRebindWeakChildParent(
+                        Entry->FileInfo, FileInfo, Replacement, (BOOLEAN)Pass)) {
+                    Success = FALSE;
+                    break;
+                }
+            }
+            if (Success && Dloc->SDirInfo && !UDFRebindWeakChildParent(
+                    Dloc->SDirInfo, FileInfo, Replacement, (BOOLEAN)Pass))
+                Success = FALSE;
+        }
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    return Success;
+}
+
+static uint32
+UDFCleanupFailure(PVCB Vcb, PNTSTATUS CleanupStatus, NTSTATUS Status)
+{
+    if (Status == STATUS_SUCCESS) Status = STATUS_DEVICE_BUSY;
+    if (Status != STATUS_DEVICE_BUSY) {
+        if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+    }
+    *CleanupStatus = Status;
+    return UDF_FREE_NOTHING;
+}
+
+static uint32
+UDFCleanUpFileInternal(PVCB Vcb, PUDF_FILE_INFO FileInfo, PNTSTATUS CleanupStatus)
 {
     PUDF_DATALOC_INFO Dloc;
-    uint32 lc = 0;
-    BOOLEAN IsASDir;
-    BOOLEAN KeepDloc;
-    PDIR_INDEX_ITEM DirNdx = NULL, DirNdx2;
-    BOOLEAN Parallel = FALSE;
-    BOOLEAN Linked = FALSE;
-#ifdef UDF_DBG
-    BOOLEAN Modified = FALSE;
-    PDIR_INDEX_HDR hDirNdx;
-    uint_di Index;
-    PUDF_FILE_INFO DirInfo;
-#endif // UDF_DBG
+    PUDF_FILE_INFO Peer, ParFileInfo = NULL, Parent;
+    PDIR_INDEX_ITEM Entry, ParentEntry = NULL;
+    PFILE_IDENT_DESC Ident;
+    PDIR_INDEX_HDR Index;
+    BOOLEAN KeepDloc = FALSE, Linked = FALSE, SharedIdent = FALSE, FoundHead = FALSE;
+    NTSTATUS Status;
+    uint64 References = 0;
+    uint_di i;
+#ifdef UDF_TRACK_ONDISK_ALLOCATION
+    uint32 LinkCount;
+#endif
 
-    if (!FileInfo) return UDF_FREE_FILEINFO;
-
+    *CleanupStatus = STATUS_DEVICE_BUSY;
+    if (!FileInfo) {
+        *CleanupStatus = STATUS_SUCCESS;
+        return UDF_FREE_FILEINFO;
+    }
     ValidateFileInfo(FileInfo);
-
-    if (FileInfo->OpenCount || FileInfo->RefCount) {
-        UDFPrint(("UDF: not all references are closed\n"));
-        UDFPrint(("     Skipping cleanup\n"));
-        UDFPrint(("UDF: OpenCount = %x, RefCount = %x, LinkRefCount = %x\n",
-                              FileInfo->OpenCount,FileInfo->RefCount,FileInfo->Dloc->LinkRefCount));
+    Dloc = FileInfo->Dloc;
+    if (FileInfo->CreateConstructionParent || FileInfo->RetainedOpenReferences ||
+        FileInfo->RefCount || FileInfo->OpenCount || FileInfo->Fcb || FileInfo->Constructing)
         return UDF_FREE_NOTHING;
-    }
-    if (FileInfo->Fcb) {
-        UDFPrint(("Operating System still has references to this file\n"));
-        UDFPrint(("     Skipping cleanup\n"));
-//        BrutePoint();
-        return UDF_FREE_NOTHING;
-    }
+    if (Dloc) {
+        if (!NT_SUCCESS(Dloc->AllocationReleaseError))
+            return UDFCleanupFailure(Vcb, CleanupStatus, Dloc->AllocationReleaseError);
+        if (!NT_SUCCESS(Dloc->ZeroDataError))
+            return UDFCleanupFailure(Vcb, CleanupStatus, Dloc->ZeroDataError);
+        if (!NT_SUCCESS(Dloc->CacheSizeError))
+            return UDFCleanupFailure(Vcb, CleanupStatus, Dloc->CacheSizeError);
+        if (!NT_SUCCESS(Dloc->NamespaceTargetError))
+            return UDFCleanupFailure(Vcb, CleanupStatus, Dloc->NamespaceTargetError);
+        if (Dloc->AllocationReleaseActive || Dloc->CreateRollbackOwner ||
+            Dloc->CreateConstructionOwner || Dloc->NamespaceScratch || Dloc->NamespaceTarget ||
+            Dloc->NamespaceFileInfo || Dloc->NamespaceScratchOwner ||
+            Dloc->NamespacePhase != UdfNamespaceNone ||
+            Dloc->NamespaceTargetState != UdfNamespaceTargetNone ||
+            Dloc->StreamDeleteOwner ||
+            Dloc->StreamDeleteContextOwner || Dloc->StreamCreate || Dloc->RetiredExtents ||
+            (Dloc->CommonFcb && Dloc->CommonFcb->FileInfo == FileInfo))
+            return UDF_FREE_NOTHING;
 
-    /* A failed append flush still owns its entire generation. Keep the FI
-     * reachable from the parent scan for explicit retry instead of freeing
-     * its mapping or discarding its buffer during last-close teardown. */
-    if (UDFDirectoryAppendPending(FileInfo) ||
-        (FileInfo->Dloc && (FileInfo->Dloc->FE_Flags & UDF_FE_FLAG_CACHED_DATA_PENDING)))
-        return UDF_FREE_NOTHING;
-
-    IsASDir = UDFIsAStreamDir(FileInfo);
-
-    if ((Dloc = FileInfo->Dloc)) {
-
-#ifdef UDF_DBG
-        DirInfo = FileInfo->ParentFile;
-        if (DirInfo) {
-            hDirNdx = DirInfo->Dloc->DirIndex;
-            Index = FileInfo->Index;
-            // we can't delete modified file
-            // it should be closed & reopened (or flushed) before deletion
-            DirNdx = UDFDirIndex(hDirNdx,Index);
-            UDFPrint(("Cleanup Mod: %s%s%s%s%s%s\n",
-                                 (Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED) ? "FE "       : "",
-                                 (Dloc->DataLoc.Modified)                   ? "DataLoc "  : "",
-                                 (Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED) ? "Data-PreAlloc " : "",
-                                 (Dloc->AllocLoc.Modified)                  ? "AllocLoc " : "",
-                                 (Dloc->FELoc.Modified)                     ? "FELoc "    : "",
-                                 (DirNdx && (DirNdx->FI_Flags & UDF_FI_FLAG_FI_MODIFIED)) ? "FI " : ""
-                                 ));
-            Modified = ((Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED) ||
-                         Dloc->DataLoc.Modified ||
-                        (Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED) ||
-                         Dloc->AllocLoc.Modified ||
-                         Dloc->FELoc.Modified ||
-                        (DirNdx && (DirNdx->FI_Flags & UDF_FI_FLAG_FI_MODIFIED)) );
-        }
-#endif // UDF_DBG
-
-        PUDF_FILE_INFO ParFileInfo = UDFLocateAnyParallelFI(FileInfo);
-
-        Parallel = (ParFileInfo != NULL);
-        Linked = (FileInfo->NextLinkedFile != FileInfo);
-
-//        Parallel = (FileInfo->NextLinkedFile != FileInfo);
-        ASSERT(FileInfo->NextLinkedFile);
-//        ASSERT(!Parallel);
-        KeepDloc = (Dloc->LinkRefCount ||
-                    Dloc->CommonFcb ||
-                    Linked ) ?
-                    TRUE : FALSE;
-
-        if (Dloc->DirIndex) {
-            uint_di i;
-            for(i=2; (DirNdx = UDFDirIndex(Dloc->DirIndex,i)); i++) {
-                if (DirNdx->FileInfo) {
-                    if (!KeepDloc) {
-                        // Orphaned FileInfo in DirIndex: loaded by
-                        // UDFOpenFileInfoFromDirContext during path traversal
-                        // but never opened as final component (no LCB).
-                        // Recursively clean up instead of ASSERTing.
-                        UDFPrint(("UDF: Cleaning orphaned FileInfo %x in DirIndex[%d]\n",
-                                  DirNdx->FileInfo, i));
-                        PUDF_FILE_INFO OrphanFi = DirNdx->FileInfo;
-                        /* Do not discard a live cached-data retry owner as
-                         * an orphan, even when an earlier lifetime defect
-                         * left it outside the normal FCB/LCB hold graph. */
-                        if (OrphanFi->Dloc &&
-                            (OrphanFi->Dloc->FE_Flags & UDF_FE_FLAG_CACHED_DATA_PENDING))
-                            return UDF_FREE_NOTHING;
-                        // Orphan must have a valid Dloc (loaded by UDFOpenFileInfoFromDirContext)
-                        ASSERT(OrphanFi->Dloc);
-                        // Orphan should be self-linked (not part of a parallel/linked chain)
-                        ASSERT(OrphanFi->NextLinkedFile == OrphanFi);
-                        // ParentFile must point to the FileInfo we're currently cleaning up
-                        ASSERT(OrphanFi->ParentFile == FileInfo);
-                        // Clear CommonFcb to ensure KeepDloc=FALSE in recursive call
-                        // (floating FCB may have set CommonFcb != NULL).
-                        // The floating FCB itself will leak until unmount — acceptable.
-                        if (OrphanFi->Dloc->CommonFcb) {
-                            UDFPrint(("UDF: Orphan %x has floating CommonFcb %x\n",
-                                      OrphanFi, OrphanFi->Dloc->CommonFcb));
-                            OrphanFi->Dloc->CommonFcb = NULL;
-                        }
-                        // Clear Fcb so UDFCleanUpFile__ doesn't bail at line 2465
-                        if (OrphanFi->Fcb) {
-                            UDFPrint(("UDF: Orphan %x has floating Fcb %x\n",
-                                      OrphanFi, OrphanFi->Fcb));
-                            OrphanFi->Fcb->FileInfo = NULL;
-                            OrphanFi->Fcb = NULL;
-                        }
-                        // Log original counts for diagnostics
-                        UDFPrint(("UDF: Orphan counts: RefCount=%d, LinkRefCount=%d, OpenCount=%d\n",
-                                  OrphanFi->RefCount,
-                                  OrphanFi->Dloc->LinkRefCount,
-                                  OrphanFi->OpenCount));
-                        // Reset OpenCount — orphan's children (also orphans) may
-                        // have incremented it via UDFReferenceFile__. These children
-                        // will be recursively cleaned up by UDFCleanUpFile__.
-                        OrphanFi->OpenCount = 0;
-                        // Reset RefCount/LinkRefCount — may be non-zero if
-                        // UDFCloseFile__ was never called for this orphan
-                        OrphanFi->RefCount = 0;
-                        OrphanFi->Dloc->LinkRefCount = 0;
-                        // Clear Modified flags — orphan is being discarded along
-                        // with the parent directory's DirIndex, so unflushed
-                        // modifications would be lost anyway. Without this,
-                        // recursive UDFCleanUpFile__ asserts !Modified when
-                        // KeepDloc=FALSE (e.g., after rename-replace sets
-                        // FI_MODIFIED on directory entries during UDFUnlinkFile__).
-                        DirNdx->FI_Flags &= ~UDF_FI_FLAG_FI_MODIFIED;
-                        OrphanFi->Dloc->FE_Flags &= ~UDF_FE_FLAG_FE_MODIFIED;
-                        OrphanFi->Dloc->DataLoc.Modified = FALSE;
-                        OrphanFi->Dloc->DataLoc.Flags &= ~EXTENT_FLAG_PREALLOCATED;
-                        OrphanFi->Dloc->AllocLoc.Modified = FALSE;
-                        OrphanFi->Dloc->FELoc.Modified = FALSE;
-                        // UDFCleanUpFile__ handles Dloc cleanup (frees via
-                        // UDFRemoveDloc/UDFFreeDloc) and sets DirNdx->FileInfo=NULL
-                        // in parent's DirIndex. We also free the FileInfo struct.
-                        ULONG cleanupResult = UDFCleanUpFile__(Vcb, OrphanFi);
-                        // Cleanup must have freed the Dloc (KeepDloc=FALSE path)
-                        ASSERT(OrphanFi->Dloc == NULL);
-                        ASSERT(cleanupResult & UDF_FREE_FILEINFO);
-                        // Only free the FileInfo struct itself.
-                        MyFreePool__(OrphanFi);
-                        DirNdx->FileInfo = NULL;
-                        continue;
-                    }
-                    // The file being cleaned up may have not closed Dirs
-                    // (linked Dir). In this case each of them may have
-                    // reference to FileInfo in DirIndex[1]
-                    // Here we'll check it and change for valid value if
-                    // necessary (Update Child Objects - I)
-                    if (DirNdx->FileInfo->Dloc) {
-                        // we can get here only when (Parallel == TRUE)
-                        DirNdx2 = UDFDirIndex(DirNdx->FileInfo->Dloc->DirIndex, 1);
-                        // It is enough to check DirNdx2->FileInfo only.
-                        // If one of Parallel FI's has reference (and equal)
-                        // to the FI being removed, it'll be removed from
-                        // the chain & nothing wrong will happen.
-                        if (DirNdx2 && (DirNdx2->FileInfo == FileInfo)) {
-                            if (FileInfo->PrevLinkedFile == FileInfo) {
-                                BrutePoint();
-                                DirNdx2->FileInfo = NULL;
-                            } else {
-                                DirNdx2->FileInfo = Parallel ?
-                                    ParFileInfo : FileInfo->PrevLinkedFile;
-                            }
-                            ASSERT(!DirNdx2->FileInfo->RefCount);
-                        }
-                    }
+        /* Check the actual ring before a peer search or mutation. Reciprocal
+         * links exclude a cycle which omits this FI; reference totals have
+         * no hidden contribution from an FCB or an invented cleanup open. */
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        _SEH2_TRY {
+            Peer = FileInfo;
+            do {
+                if (!Peer || Peer->Dloc != Dloc || !Peer->NextLinkedFile || !Peer->PrevLinkedFile ||
+                    Peer->NextLinkedFile->PrevLinkedFile != Peer ||
+                    Peer->PrevLinkedFile->NextLinkedFile != Peer) {
+                    *CleanupStatus = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
                 }
-            }
-        }
-        if (Dloc->SDirInfo) {
-            UDFPrint(("UDF: Found not cleaned up reference (SDir).\n"));
-
-            // (Update Child Objects - II)
-            if (Dloc->SDirInfo->ParentFile == FileInfo) {
-                BrutePoint();
-                ASSERT(ParFileInfo);
-                Dloc->SDirInfo->ParentFile = ParFileInfo;
-            }
-            // We should break Cleanup process if alive reference detected
-            // and there is no possibility to store pointer in some other
-            // place (in parallel object)
-            if (!KeepDloc) {
-                BrutePoint();
-                UDFPrint(("     Skipping cleanup\n"));
+                if (Peer->RefCount > Dloc->LinkRefCount ||
+                    References > Dloc->LinkRefCount - Peer->RefCount) {
+                    *CleanupStatus = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+                References += Peer->RefCount;
+                if (Peer == Dloc->LinkedFileInfo) FoundHead = TRUE;
+                if (Peer != FileInfo && FileInfo->FileIdent && Peer->FileIdent == FileInfo->FileIdent)
+                    SharedIdent = TRUE;
+                Peer = Peer->NextLinkedFile;
+            } while (Peer != FileInfo);
+            if (!FoundHead || References != Dloc->LinkRefCount)
+                *CleanupStatus = STATUS_FILE_CORRUPT_ERROR;
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&Vcb->DlocResource2);
+        } _SEH2_END;
+        if (*CleanupStatus != STATUS_DEVICE_BUSY)
+            return UDFCleanupFailure(Vcb, CleanupStatus, *CleanupStatus);
+        ParFileInfo = UDFLocateAnyParallelFI(FileInfo);
+        Linked = FileInfo->NextLinkedFile != FileInfo;
+        KeepDloc = Dloc->LinkRefCount || Dloc->CommonFcb || Linked;
+        if (KeepDloc && !Linked)
+            return UDFCleanupFailure(Vcb, CleanupStatus, STATUS_FILE_CORRUPT_ERROR);
+        if (!KeepDloc && (Dloc->FE_Flags & UDF_FE_FLAG_FREE_DEFERRED) && !Dloc->DeleteCommitted)
+            return UDFCleanupFailure(Vcb, CleanupStatus, STATUS_FILE_CORRUPT_ERROR);
+        if (FileInfo->TemporaryRetired &&
+            (FileInfo->ParentFile || FileInfo->FileIdent || Linked || Dloc->CommonFcb ||
+             Dloc->LinkRefCount || Dloc->DataLoc.Length || !Dloc->FELoc.Mapping ||
+             Dloc->FELoc.Mapping[0].extLocation))
+            return UDF_FREE_NOTHING;
+        if (UDFDirectoryAppendPending(FileInfo) ||
+            (Dloc->FE_Flags & UDF_FE_FLAG_CACHED_DATA_PENDING))
+            return UDF_FREE_NOTHING;
+        if (!FileInfo->ConstructionFailed && !FileInfo->TemporaryRetired &&
+            !(Dloc->FE_Flags & UDF_FE_FLAG_FREE_DEFERRED)) {
+            Entry = FileInfo->ParentFile && FileInfo->ParentFile->Dloc ?
+                UDFDirIndex(FileInfo->ParentFile->Dloc->DirIndex, FileInfo->Index) : NULL;
+            if ((Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED) || Dloc->DataLoc.Modified ||
+                Dloc->AllocLoc.Modified || Dloc->FELoc.Modified ||
+                (Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED) ||
+                (Entry && (Entry->FI_Flags & UDF_FI_FLAG_FI_MODIFIED)))
                 return UDF_FREE_NOTHING;
-            }
-
-            if (!UDFIsSDirDeleted(Dloc->SDirInfo) &&
-               Dloc->SDirInfo->Dloc) {
-                DirNdx2 = UDFDirIndex(Dloc->SDirInfo->Dloc->DirIndex, 1);
-                if (DirNdx2 && (DirNdx2->FileInfo == FileInfo)) {
-                    DirNdx2->FileInfo =
-                        Parallel ? ParFileInfo : NULL;
-                    ASSERT(!DirNdx2->FileInfo->RefCount);
-                }
+        }
+        if (KeepDloc && !UDFRebindWeakChildren(Vcb, FileInfo, ParFileInfo))
+            return UDF_FREE_NOTHING;
+        if (!KeepDloc && Dloc->DirIndex) {
+            for (i = 2; (Entry = UDFDirIndex(Dloc->DirIndex, i)); i++) {
+                PUDF_FILE_INFO Child = Entry->FileInfo;
+                NTSTATUS ChildStatus;
+                uint32 ChildResult;
+                if (!Child) continue;
+                if (!Child->Dloc || Child->NextLinkedFile != Child || Child->ParentFile != FileInfo ||
+                    Child->Fcb || Child->RefCount || Child->OpenCount || Child->Dloc->CommonFcb ||
+                    Child->Dloc->LinkRefCount || (Entry->FI_Flags & UDF_FI_FLAG_FI_MODIFIED) ||
+                    (Child->Dloc->FE_Flags & (UDF_FE_FLAG_FE_MODIFIED | UDF_FE_FLAG_CACHED_DATA_PENDING)) ||
+                    Child->Dloc->DataLoc.Modified || Child->Dloc->AllocLoc.Modified ||
+                    Child->Dloc->FELoc.Modified || (Child->Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED))
+                    return UDF_FREE_NOTHING;
+                ChildResult = UDFCleanUpFileWithStatus(Vcb, Child, &ChildStatus);
+                if (!(ChildResult & UDF_FREE_FILEINFO))
+                    return UDFCleanupFailure(Vcb, CleanupStatus, ChildStatus);
+                MyFreePool__(Child);
+                Entry->FileInfo = NULL;
             }
         }
-
+        if (Dloc->SDirInfo && !KeepDloc)
+            return UDF_FREE_NOTHING;
         if (!KeepDloc) {
-
-            // Execute deferred block freeing — blocks were kept allocated
-            // during cleanup to prevent reuse while FCB was in the table.
-            // Safe to free now: this is the last Dloc reference (KeepDloc=FALSE).
+            /* Distinct ownership must be established before any free. */
+            if ((Dloc->DataLoc.Mapping && Dloc->DataLoc.Mapping == Dloc->AllocLoc.Mapping) ||
+                (Dloc->DataLoc.Mapping && Dloc->DataLoc.Mapping == Dloc->FELoc.Mapping) ||
+                (Dloc->AllocLoc.Mapping && Dloc->AllocLoc.Mapping == Dloc->FELoc.Mapping) ||
+                (Dloc->FileEntry && ((PVOID)Dloc->FileEntry == (PVOID)Dloc->DataLoc.Mapping ||
+                 (PVOID)Dloc->FileEntry == (PVOID)Dloc->AllocLoc.Mapping ||
+                 (PVOID)Dloc->FileEntry == (PVOID)Dloc->FELoc.Mapping)))
+                return UDFCleanupFailure(Vcb, CleanupStatus, STATUS_FILE_CORRUPT_ERROR);
+            Status = UDFCheckDlocCleanup(Vcb, FileInfo, FALSE);
+            if (Status != STATUS_SUCCESS) return UDFCleanupFailure(Vcb, CleanupStatus, Status);
             if (Dloc->FE_Flags & UDF_FE_FLAG_FREE_DEFERRED) {
-                UDFUnlinkDloc(Vcb, Dloc);
-                if (Dloc->DeletePrefree)
-                    UDFReleasePrefreedAllocation(Vcb, NULL, FileInfo);
-                else
-                    UDFFreeFileAllocation(Vcb, NULL, FileInfo);
+                /* Still indexed and claimed during bitmap I/O. Do not
+                 * forget the mappings, prefree receipt or dirty flags on
+                 * a failed or uncertain allocation release. */
+                Status = Dloc->DeletePrefree ? UDFReleasePrefreedAllocation(Vcb, NULL, FileInfo) :
+                                               UDFFreeFileAllocation(Vcb, NULL, FileInfo);
+                if (Status != STATUS_SUCCESS) return UDFCleanupFailure(Vcb, CleanupStatus, Status);
                 Dloc->FE_Flags &= ~(UDF_FE_FLAG_FREE_DEFERRED | UDF_FE_FLAG_FE_MODIFIED);
             }
-
 #ifdef UDF_DBG
-            ASSERT(!Modified);
-            ASSERT(!(Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED));
-            ASSERT(!Dloc->DataLoc.Modified);
-            ASSERT(!(Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED));
-            ASSERT(!Dloc->AllocLoc.Modified);
-            ASSERT(!Dloc->FELoc.Modified);
-            ASSERT(!(DirNdx && (DirNdx->FI_Flags & UDF_FI_FLAG_FI_MODIFIED)));
+            if (!FileInfo->ConstructionFailed && !FileInfo->TemporaryRetired) {
+                ASSERT(!(Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED));
+                ASSERT(!Dloc->DataLoc.Modified);
+                ASSERT(!(Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED));
+                ASSERT(!Dloc->AllocLoc.Modified);
+                ASSERT(!Dloc->FELoc.Modified);
+            }
 #endif
-
-#ifndef UDF_TRACK_ONDISK_ALLOCATION
-            if (Dloc->DataLoc.Mapping)  MyFreePool__(Dloc->DataLoc.Mapping);
-            if (Dloc->AllocLoc.Mapping) MyFreePool__(Dloc->AllocLoc.Mapping);
-            if (Dloc->FELoc.Mapping)    MyFreePool__(Dloc->FELoc.Mapping);
-            if (Dloc->FileEntry) {
-                // plain file
-                lc = UDFGetFileLinkCount(FileInfo);
-                MyFreePool__(Dloc->FileEntry);
-                Dloc->FileEntry = NULL;
-            } else if (FileInfo->Index >= 2) {
-                // error durring open operation
-                lc = UDF_INVALID_LINK_COUNT;
-            }
-#endif //UDF_TRACK_ONDISK_ALLOCATION
-            if (FileInfo->Dloc->DirIndex) {
-                uint_di i;
-                for(i=2; (DirNdx = UDFDirIndex(Dloc->DirIndex,i)); i++) {
-                    ASSERT(!DirNdx->FileInfo);
-                    if (DirNdx->FName.Buffer)
-                        MyFreePool__(DirNdx->FName.Buffer);
-                }
-                UDFDirIndexFree(Dloc->DirIndex);
-                Dloc->DirIndex = NULL;
 #ifdef UDF_TRACK_ONDISK_ALLOCATION
-                UDFIndexDirectory(Vcb, FileInfo);
-                if (FileInfo->Dloc->DirIndex) {
-                    for(i=2; DirNdx = UDFDirIndex(Dloc->DirIndex,i); i++) {
-                        ASSERT(!DirNdx->FileInfo);
-                        if (DirNdx->FName.Buffer)
-                            MyFreePool__(DirNdx->FName.Buffer);
-                    }
-                    UDFDirIndexFree(Dloc->DirIndex);
-                    Dloc->DirIndex = NULL;
-                }
-#endif //UDF_TRACK_ONDISK_ALLOCATION
+            /* Diagnostic bitmap reads happen while this generation still
+             * has its indexed owner. Never reload a directory during GC. */
+            if (!FileInfo->ConstructionFailed && Dloc->DataLoc.Mapping) {
+                LinkCount = Dloc->FileEntry ? UDFGetFileLinkCount(FileInfo) : UDF_INVALID_LINK_COUNT;
+                UDFCheckSpaceAllocation(Vcb, 0, Dloc->DataLoc.Mapping,
+                    LinkCount && LinkCount != UDF_INVALID_LINK_COUNT ? AS_USED : AS_FREE);
             }
-
-#ifdef UDF_TRACK_ONDISK_ALLOCATION
-            if (Dloc->AllocLoc.Mapping) MyFreePool__(Dloc->AllocLoc.Mapping);
-            if (Dloc->FELoc.Mapping)    MyFreePool__(Dloc->FELoc.Mapping);
-            if (Dloc->FileEntry) {
-                // plain file
-                lc = UDFGetFileLinkCount(FileInfo);
-                MyFreePool__(Dloc->FileEntry);
-                Dloc->FileEntry = NULL;
-            } else if (FileInfo->Index >= 2) {
-                // error durring open operation
-                lc = UDF_INVALID_LINK_COUNT;
-            }
-            if (Dloc->DataLoc.Mapping) {
-                if (lc && (lc != UDF_INVALID_LINK_COUNT)) {
-                    UDFCheckSpaceAllocation(Vcb, 0, Dloc->DataLoc.Mapping, AS_USED); // check if used
-                } else {
-                    UDFCheckSpaceAllocation(Vcb, 0, Dloc->DataLoc.Mapping, AS_FREE); // check if free
-                }
-                MyFreePool__(Dloc->DataLoc.Mapping);
-            }
-#endif //UDF_TRACK_ONDISK_ALLOCATION
-
-            if (lc && (lc != UDF_INVALID_LINK_COUNT)) {
-                UDFRemoveDloc(Vcb, Dloc);
-            } else {
-                UDFFreeDloc(Vcb, Dloc);
-            }
-        } else // KeepDloc cannot be FALSE if (Linked == TRUE)
-        if (Linked) {
-//            BrutePoint();
-            // Update pointers in ParentObject (if any)
-            if (FileInfo->ParentFile->Dloc->SDirInfo == FileInfo)
-                FileInfo->ParentFile->Dloc->SDirInfo = FileInfo->PrevLinkedFile;
-            DirNdx = UDFDirIndex(FileInfo->Dloc->DirIndex, 0);
-            if (DirNdx && (DirNdx->FileInfo == FileInfo))
-                DirNdx->FileInfo = FileInfo->PrevLinkedFile;
-            DirNdx = UDFDirIndex(FileInfo->ParentFile->Dloc->DirIndex, FileInfo->Index);
-            if (DirNdx && (DirNdx->FileInfo == FileInfo))
-                DirNdx->FileInfo = ParFileInfo;
-            // remove from linked chain
-            FileInfo->NextLinkedFile->PrevLinkedFile = FileInfo->PrevLinkedFile;
-            FileInfo->PrevLinkedFile->NextLinkedFile = FileInfo->NextLinkedFile;
-            // update pointer in Dloc
-            if (FileInfo->Dloc->LinkedFileInfo == FileInfo)
-                FileInfo->Dloc->LinkedFileInfo = FileInfo->PrevLinkedFile;
+#endif
         }
-        FileInfo->Dloc = NULL;
-    } else {
-        KeepDloc = FALSE;
     }
 
-    // Cleanup pointers in ParentObject (if any)
-    if (IsASDir) {
-        if (FileInfo->ParentFile->Dloc->SDirInfo == FileInfo) {
-            ASSERT(!Linked);
-            FileInfo->ParentFile->Dloc->SDirInfo = NULL;
-            FileInfo->ParentFile->Dloc->FE_Flags &= ~UDF_FE_FLAG_HAS_DEL_SDIR;
-        }
-    } else
-    if (FileInfo->ParentFile) {
-        ASSERT(FileInfo->ParentFile->Dloc);
-        DirNdx = UDFDirIndex(FileInfo->ParentFile->Dloc->DirIndex, FileInfo->Index);
-        ASSERT(DirNdx);
-#ifdef UDF_DBG
-        PUDF_FILE_INFO OldFI;
-        if (Parallel) {
-            ASSERT(!DirNdx || !(OldFI = DirNdx->FileInfo) ||
-                    !(OldFI == FileInfo));
-        } else {
-            ASSERT(!DirNdx || !(OldFI = DirNdx->FileInfo) ||
-                     (OldFI == FileInfo));
-        }
-#endif
-        if ( DirNdx && (DirNdx->FileInfo == FileInfo) ) {
-            if (!Parallel)
-                DirNdx->FileInfo = NULL;
-#ifdef UDF_DBG
-        } else {
-            // We can get here after incomplete Open
-            if (!Parallel && DirNdx->FileInfo)
-                BrutePoint();
-#endif
-        }
-#ifdef UDF_DBG
-    } else {
-//        BrutePoint();
-#endif
+    /* Prepare every weak-edge decision before last-Dloc detach. A failed
+     * initializer can have an unbound parent context with no directory row.
+     * A reused/foreign row is never overwritten merely to destroy this FI. */
+    Parent = FileInfo->ParentFile;
+    if (Parent) {
+        if (Parent == FileInfo || !Parent->Dloc)
+            return UDFCleanupFailure(Vcb, CleanupStatus, STATUS_FILE_CORRUPT_ERROR);
+        ParentEntry = UDFDirIndex(Parent->Dloc->DirIndex, FileInfo->Index);
+        if (!ParentEntry && !FileInfo->ConstructionFailed && !UDFIsAStreamDir(FileInfo))
+            return UDFCleanupFailure(Vcb, CleanupStatus, STATUS_FILE_CORRUPT_ERROR);
+    }
+    if (Dloc && !KeepDloc) {
+        Status = UDFCheckDlocCleanup(Vcb, FileInfo, TRUE);
+        if (Status != STATUS_SUCCESS) return UDFCleanupFailure(Vcb, CleanupStatus, Status);
     }
 
-    if (!Parallel && FileInfo->FileIdent)
-        MyFreePool__(FileInfo->FileIdent);
+    /* From here only checked weak-edge stores and valid pool destruction:
+     * no allocator, metadata/cache/device I/O or fallible status helper. */
+    if (Dloc && KeepDloc && Linked) {
+        Entry = UDFDirIndex(Dloc->DirIndex, 0);
+        if (Entry && Entry->FileInfo == FileInfo) Entry->FileInfo = FileInfo->PrevLinkedFile;
+        if (Dloc->LinkedFileInfo == FileInfo) Dloc->LinkedFileInfo = FileInfo->PrevLinkedFile;
+        FileInfo->NextLinkedFile->PrevLinkedFile = FileInfo->PrevLinkedFile;
+        FileInfo->PrevLinkedFile->NextLinkedFile = FileInfo->NextLinkedFile;
+    }
+    if (Parent) {
+        if (Parent->Dloc->SDirInfo == FileInfo) {
+            Parent->Dloc->SDirInfo = KeepDloc ? ParFileInfo : NULL;
+            if (!KeepDloc) Parent->Dloc->FE_Flags &= ~UDF_FE_FLAG_HAS_DEL_SDIR;
+        }
+        if (ParentEntry && ParentEntry->FileInfo == FileInfo)
+            ParentEntry->FileInfo = KeepDloc ? ParFileInfo : NULL;
+    }
+    if (FileInfo->ListPtr && FileInfo->ListPtr->FileInfo == FileInfo)
+        FileInfo->ListPtr->FileInfo = NULL;
+    Ident = FileInfo->FileIdent;
     FileInfo->FileIdent = NULL;
-    // Kill reference to parent object
     FileInfo->ParentFile = NULL;
-    // Kill references to parallel object(s) since it has no reference to
-    // this one now
-    FileInfo->NextLinkedFile =
-    FileInfo->PrevLinkedFile = FileInfo;
-    if (FileInfo->ListPtr)
-        FileInfo->ListPtr->FileInfo = NULL;;
+    FileInfo->ListPtr = NULL;
+    FileInfo->NextLinkedFile = FileInfo->PrevLinkedFile = FileInfo;
+    FileInfo->Dloc = NULL;
+    if (!SharedIdent && Ident) MyFreePool__(Ident);
+    if (Dloc && !KeepDloc) {
+        if (Dloc->DataLoc.Mapping) MyFreePool__(Dloc->DataLoc.Mapping);
+        if (Dloc->AllocLoc.Mapping) MyFreePool__(Dloc->AllocLoc.Mapping);
+        if (Dloc->FELoc.Mapping) MyFreePool__(Dloc->FELoc.Mapping);
+        if (Dloc->FileEntry) MyFreePool__(Dloc->FileEntry);
+        Index = Dloc->DirIndex;
+        if (Index) {
+            for (i = 2; (Entry = UDFDirIndex(Index, i)); i++)
+                if (Entry->FName.Buffer) MyFreePool__(Entry->FName.Buffer);
+            UDFDirIndexFree(Index);
+        }
+        MyFreePool__(Dloc);
+    }
+    *CleanupStatus = STATUS_SUCCESS;
     return KeepDloc ? UDF_FREE_FILEINFO : (UDF_FREE_FILEINFO | UDF_FREE_DLOC);
-} // end UDFCleanUpFile__()
+} // end UDFCleanUpFileInternal()
 
 /*
     This routine creates FileIdent record in destination directory &
@@ -3867,6 +4840,7 @@ UDFMayDeferInitialFE(PIRP_CONTEXT IrpContext, PVCB Vcb,
         FlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WRITE_THROUGH) ||
         FlagOn(Vcb->VcbState, VCB_STATE_REMOVABLE_MEDIA) ||
         !FileInfo || !(dloc = FileInfo->Dloc) || FileInfo->Fcb ||
+        !FileInfo->Constructing || FileInfo->ConstructionFailed ||
         FileInfo->RefCount || FileInfo->OpenCount || dloc->LinkRefCount ||
         dloc->CommonFcb ||
         !FlagOn(dloc->FE_Flags, UDF_FE_FLAG_UNDER_INIT) ||
@@ -3960,8 +4934,185 @@ UDFReserveInitialFid(PIRP_CONTEXT IrpContext, PVCB Vcb,
     return status;
 }
 
-NTSTATUS
-UDFCreateFile__(
+/* The private FI is already indexed by its new Dloc. Pin the exact parent
+ * before any weak namespace edge or initial FE/FID publication can escape.
+ * This holds no successful-open reference to the constructor itself. */
+static NTSTATUS
+UDFOwnCreateConstruction(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                         PUDF_FILE_INFO Parent)
+{
+    _SEH2_VOLATILE NTSTATUS Status;
+    LONG Count;
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    if (!Dloc || !FileInfo->Constructing || FileInfo->CreateConstructionParent)
+        return STATUS_FILE_INVALID;
+    Status = STATUS_SUCCESS;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (Dloc->CreateConstructionOwner || Dloc->CleanupOwner ||
+            Dloc->LinkedFileInfo != FileInfo || FileInfo->ConstructionFailed) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                        Status, STATUS_SUCCESS);
+        } else {
+            Dloc->CreateConstructionOwner = FileInfo;
+            for (;;) {
+                Count = InterlockedCompareExchange(&Vcb->PendingNamespaceCount, 0, 0);
+                if (Count < 0 || Count >= MAXLONG - 1) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                    break;
+                }
+                if (InterlockedCompareExchange(&Vcb->PendingNamespaceCount,
+                                               Count + 1, Count) == Count) {
+                    FileInfo->CreateConstructionCounted = TRUE;
+                    break;
+                }
+            }
+            if (Status == STATUS_SUCCESS) {
+                /* DlocResource2 is recursive for this thread. The close
+                 * barrier exists before reference admission can raise. */
+                Status = UDFReferenceFileChecked(Vcb, Parent);
+                if (Status == STATUS_SUCCESS)
+                    FileInfo->CreateConstructionParent = Parent;
+            }
+        }
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    return Status;
+}
+
+/* No I/O/callback or second ordinary close belongs to this release. A
+ * refused checked decrement leaves the exact parent token with the owner. */
+static NTSTATUS
+UDFReleaseCreateConstruction(PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_FILE_CORRUPT_ERROR;
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (!Dloc || Dloc->CreateConstructionOwner != FileInfo ||
+            !FileInfo->CreateConstructionCounted ||
+            !NT_SUCCESS(FileInfo->CreateConstructionError) ||
+            Vcb->PendingNamespaceCount <= 0 || Vcb->PendingNamespaceCount == MAXLONG)
+            _SEH2_LEAVE;
+        /* A returned parent-admission refusal acquired no parent token
+         * and bound no index edge. Only that private early failure may
+         * remove an owner with no parent; abnormal paths stay quarantined. */
+        if (!FileInfo->CreateConstructionParent &&
+            (!FileInfo->Constructing || FileInfo->ParentFile ||
+             FileInfo->CreateConstructionOpenOwned))
+            _SEH2_LEAVE;
+        Status = FileInfo->CreateConstructionParent ?
+            UDFDereferenceFileLocked(Vcb, FileInfo->CreateConstructionParent) : STATUS_SUCCESS;
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        FileInfo->CreateConstructionParent = NULL;
+        FileInfo->CreateConstructionOpenOwned = FALSE; /* original open moves to caller */
+        Dloc->CreateConstructionOwner = NULL;
+        FileInfo->CreateConstructionCounted = FALSE;
+        InterlockedDecrement(&Vcb->PendingNamespaceCount);
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Failure of initial publication is not proof that a tombstone reached
+ * disk. Retain FI, allocation and parent; a new mount/recovery policy, not
+ * the collector or another ordinary close, must decide their disposition. */
+static VOID
+UDFQuarantineCreateConstruction(PVCB Vcb, PUDF_FILE_INFO FileInfo, NTSTATUS Error)
+{
+    LONG Count;
+    if (NT_SUCCESS(Error)) Error = STATUS_IO_DEVICE_ERROR;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (!FileInfo->CreateConstructionCounted) {
+            for (;;) {
+                Count = InterlockedCompareExchange(&Vcb->PendingNamespaceCount, 0, 0);
+                if (Count < 0 || Count >= MAXLONG - 1) {
+                    /* Existing invalid/saturated inventory is itself a
+                     * close barrier; never wrap it into an apparent zero. */
+                    Error = STATUS_FILE_CORRUPT_ERROR;
+                    break;
+                }
+                if (InterlockedCompareExchange(&Vcb->PendingNamespaceCount,
+                                               Count + 1, Count) == Count) {
+                    FileInfo->CreateConstructionCounted = TRUE;
+                    break;
+                }
+            }
+        }
+        if (NT_SUCCESS(FileInfo->CreateConstructionError))
+            FileInfo->CreateConstructionError = Error;
+        FileInfo->ConstructionFailed = TRUE;
+        FileInfo->CleanupPending = TRUE;
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError, Error, STATUS_SUCCESS);
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+}
+
+/* An indexed failed constructor is owned as a constructor, not as a new
+ * successful ordinary open. In the early FE path ParentFile is still NULL:
+ * no namespace edge or allocator operation requires a parent FI token.
+ * A later defensive caller must retain an existing real parent contribution
+ * or acquire an explicitly checked extra parent hold. Never copy counters. */
+static VOID
+UDFRetainFailedCreateConstruction(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                                 PUDF_FILE_INFO Parent, NTSTATUS Error)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    NTSTATUS ParentStatus;
+    if (!Dloc) {
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+            NT_SUCCESS(Error) ? STATUS_FILE_CORRUPT_ERROR : Error, STATUS_SUCCESS);
+        return;
+    }
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (!Dloc->CreateConstructionOwner)
+            Dloc->CreateConstructionOwner = FileInfo;
+        else if (Dloc->CreateConstructionOwner != FileInfo)
+            Error = STATUS_FILE_CORRUPT_ERROR; /* do not replace another owner */
+        /* Publish the lifetime/close barrier before a checked parent
+         * admission or its resource acquisition can raise. */
+        UDFQuarantineCreateConstruction(Vcb, FileInfo, Error);
+        if (FileInfo->ParentFile && !FileInfo->RefCount &&
+            !FileInfo->ConstructionReferenceOwned && !FileInfo->CreateConstructionParent) {
+            if (FileInfo->ParentFile != Parent) {
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                    STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+                _SEH2_LEAVE;
+            }
+            _SEH2_TRY {
+                ParentStatus = UDFReferenceFileChecked(Vcb, Parent);
+                if (ParentStatus == STATUS_SUCCESS)
+                    FileInfo->CreateConstructionParent = Parent;
+            } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                          EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                ParentStatus = _SEH2_GetExceptionCode();
+            } _SEH2_END;
+            if (ParentStatus != STATUS_SUCCESS)
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                            ParentStatus, STATUS_SUCCESS);
+        }
+        /* A completed private stage can arrive here when scratch admission
+         * was refused. Retain only its already acquired, exact open token. */
+        if (!FileInfo->Constructing && !FileInfo->ConstructionReferenceOwned &&
+            FileInfo->RefCount == 1 && Dloc->LinkRefCount == 1 && !FileInfo->Fcb)
+            FileInfo->CreateConstructionOpenOwned = TRUE;
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+}
+
+static NTSTATUS
+UDFCreateFileInternal(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
 //    IN uint16 AllocMode, // short/long/ext/in-icb  // always in-ICB
@@ -3972,46 +5123,73 @@ UDFCreateFile__(
     IN BOOLEAN Extended,
     IN BOOLEAN CreateNew,
  IN OUT PUDF_FILE_INFO DirInfo,
-    OUT PUDF_FILE_INFO* _FileInfo
+    OUT PUDF_FILE_INFO* _FileInfo,
+    IN uint_di ExcludedIndex,
+    IN BOOLEAN StageOnly,
+    OUT PBOOLEAN FreshFileCreated OPTIONAL
     )
 {
-    uint32 l, d;
+    uint32 l, d, AppendOffset = 0, PartNum;
+    uint64 EntryCount, Placement;
     uint_di i, j;
-    NTSTATUS status;
+    _SEH2_VOLATILE NTSTATUS status = STATUS_UNSUCCESSFUL;
     LONG_AD FEicb;
     UDF_DIR_SCAN_CONTEXT ScanContext;
-    PDIR_INDEX_HDR hDirNdx = DirInfo->Dloc->DirIndex;
+    PDIR_INDEX_HDR hDirNdx;
     PDIR_INDEX_ITEM DirNdx;
-    uint32 LBS = Vcb->SectorSize;
-    PUDF_FILE_INFO FileInfo;
-    *_FileInfo = NULL;
+    uint32 LBS;
+    _SEH2_VOLATILE PUDF_FILE_INFO FileInfo = NULL;
+    UNICODE_STRING PreparedName = {0};
+    _SEH2_VOLATILE PWCHAR PreparedNameBuffer = NULL;
     BOOLEAN undel = FALSE;
 //    BOOLEAN PackDir = FALSE;
-    BOOLEAN FEAllocated = FALSE;
+    _SEH2_VOLATILE BOOLEAN FEAllocated = FALSE;
+    _SEH2_VOLATILE BOOLEAN InitialPublicationStarted = FALSE;
     BOOLEAN NewNameAppend = FALSE;
     BOOLEAN InitialFEDeferred = FALSE;
     ULONGLONG NewUniqueId = 0;
 
-    ValidateFileInfo(DirInfo);
+    if (FreshFileCreated) *FreshFileCreated = FALSE;
+    if (!_FileInfo) return STATUS_INVALID_PARAMETER;
     *_FileInfo = NULL;
-
-    ASSERT(DirInfo->Dloc->FELoc.Mapping[0].extLocation);
-    uint32 PartNum = UDFGetRefPartNumByPhysLba(Vcb, DirInfo->Dloc->FELoc.Mapping[0].extLocation);
+    if (!IrpContext || !Vcb || !Vcb->Partitions || !DirInfo || !DirInfo->Dloc ||
+        !DirInfo->Dloc->FELoc.Mapping || !_fn || !_fn->Buffer || !_fn->Length ||
+        _fn->Length % sizeof(WCHAR) || _fn->Length > MAXUSHORT - sizeof(WCHAR) ||
+        ImpUseLen > MAXUSHORT - 3 || Vcb->SectorSize < sizeof(FILE_IDENT_DESC) ||
+        (Vcb->SectorSize & (Vcb->SectorSize - 1)))
+        return STATUS_INVALID_PARAMETER;
+    hDirNdx = DirInfo->Dloc->DirIndex;
+    LBS = Vcb->SectorSize;
+    ValidateFileInfo(DirInfo);
+    PartNum = UDFGetRefPartNumByPhysLba(Vcb, DirInfo->Dloc->FELoc.Mapping[0].extLocation);
+    if (PartNum >= Vcb->PartitionMaps || PartNum > MAXUSHORT)
+        return STATUS_FILE_CORRUPT_ERROR;
     if (!hDirNdx) return STATUS_NOT_A_DIRECTORY;
+    if (!hDirNdx->FrameCount || !hDirNdx->LastFrameCount ||
+        hDirNdx->LastFrameCount > UDF_DIR_INDEX_FRAME)
+        return STATUS_FILE_CORRUPT_ERROR;
+    EntryCount = ((uint64)hDirNdx->FrameCount - 1) * UDF_DIR_INDEX_FRAME +
+                  hDirNdx->LastFrameCount;
+    if (EntryCount < 2 || EntryCount > MAXULONG)
+        return STATUS_FILE_CORRUPT_ERROR;
     i = 0;
 
     _SEH2_TRY {
 
         // check if exists
-        status = UDFFindFile(Vcb, IgnoreCase, FALSE, _fn, DirInfo, &i);
+        status = UDFFindFileExceptIndex(Vcb, IgnoreCase, FALSE, _fn, DirInfo, &i, ExcludedIndex);
         DirNdx = UDFDirIndex(hDirNdx,i);
         if (NT_SUCCESS(status)) {
             // file is a Cur(Parent)Dir
             if (i<2) try_return (status = STATUS_ACCESS_DENIED);
             // file deleted
             if (UDFIsDeleted(DirNdx)) {
+                /* A stage never reuses an existing live or cached link,
+                 * including an old deleted spelling of this name. */
+                if (StageOnly)
+                    goto CreateUndel;
                 j=0;
-                if (NT_SUCCESS(UDFFindFile(Vcb, IgnoreCase, TRUE, _fn, DirInfo, &j))) {
+                if (NT_SUCCESS(UDFFindFileExceptIndex(Vcb, IgnoreCase, TRUE, _fn, DirInfo, &j, ExcludedIndex))) {
                    i=j;
                    DirNdx = UDFDirIndex(hDirNdx,i);
                    goto CreateBothFound;
@@ -4039,41 +5217,20 @@ CreateBothFound:
             status = UDFOpenFile__(IrpContext, Vcb, IgnoreCase, TRUE, _fn, DirInfo, _FileInfo, &i);
     //        *_FileInfo = FileInfo; // OpenFile__ has already done it, so update it...
             DirNdx = UDFDirIndex(hDirNdx,i);
-            DirNdx->FI_Flags &= ~UDF_FI_FLAG_SYS_ATTR;
             FileInfo = *_FileInfo;
             if (!NT_SUCCESS(status)) {
                 // :(( can't open....
-                if (FileInfo && UDFCleanUpFile__(Vcb, FileInfo)) {
+                if (FileInfo && (UDFCleanUpFile__(Vcb, FileInfo) & UDF_FREE_FILEINFO)) {
                     MyFreePool__(FileInfo);
                     *_FileInfo = NULL;
                 }
                 BrutePoint();
                 try_return (status);
             }
-            // check if we can delete this file
-            if (FileInfo->OpenCount || (FileInfo->RefCount > 1)) {
-                BrutePoint();
-                UDFCloseFile__(IrpContext, Vcb, FileInfo);
-                try_return (status = STATUS_CANNOT_DELETE);
-            }
-            BrutePoint();
-            // remove DIRECTORY flag
-            DirNdx->FileCharacteristics &= ~FILE_DIRECTORY;
-            FileInfo->FileIdent->fileCharacteristics &= ~FILE_DIRECTORY;
-            DirNdx->FI_Flags |= UDF_FI_FLAG_FI_MODIFIED;
-            // truncate file size to ZERO
-            status = UDFResizeFile__(IrpContext, Vcb, FileInfo, 0);
-            if (!NT_SUCCESS(status)) {
-                BrutePoint();
-                UDFCloseFile__(IrpContext, Vcb, FileInfo);
-            }
-            // set NORMAL flag
-            FileInfo->FileIdent->fileCharacteristics = 0;
-            DirNdx->FileCharacteristics = 0;
-            // update DeletedFiles counter in Directory... (for PackDir)
-            if (undel && NT_SUCCESS(status))
-                hDirNdx->DelCount--;
-            try_return (status);
+            /* Finding a live file is an open, not permission to truncate.
+             * The caller applies its real disposition after access/share
+             * admission and receives FreshFileCreated=FALSE. */
+            try_return(status);
         }
 
 CreateUndel:
@@ -4092,9 +5249,10 @@ CreateUndel:
         *_FileInfo = FileInfo;
         if (!FileInfo)
             try_return (status = STATUS_INSUFFICIENT_RESOURCES);
-        ImpUseLen = (ImpUseLen + 3) & ~((uint16)3);
+        ImpUseLen = (ImpUseLen + 3) & ~((uint32)3);
 
         RtlZeroMemory(FileInfo, sizeof(UDF_FILE_INFO));
+        FileInfo->NamespaceStaged = StageOnly;
         // init horizontal links
         FileInfo->NextLinkedFile =
         FileInfo->PrevLinkedFile = FileInfo;
@@ -4105,6 +5263,8 @@ CreateUndel:
             try_return (status);
         }
         FEAllocated = TRUE;
+        status = UDFOwnCreateConstruction(Vcb, FileInfo, DirInfo);
+        if (status != STATUS_SUCCESS) try_return(status);
         FEicb.extLength = LBS;
         ASSERT(FileInfo->Dloc->FELoc.Mapping[0].extLocation);
         FEicb.extLocation.logicalBlockNum = UDFPhysLbaToPart(Vcb, PartNum, FileInfo->Dloc->FELoc.Mapping[0].extLocation);
@@ -4119,6 +5279,10 @@ CreateUndel:
                 try_return (status);
         } else {
             // read FileIdent
+            if (!DirNdx || DirNdx->Length < sizeof(FILE_IDENT_DESC) ||
+                DirNdx->Length > MAXUSHORT || DirInfo->Dloc->DataLoc.Length < 0 ||
+                (uint64)DirNdx->Offset + DirNdx->Length > (uint64)DirInfo->Dloc->DataLoc.Length)
+                try_return(status = STATUS_FILE_CORRUPT_ERROR);
             FileInfo->FileIdent = (PFILE_IDENT_DESC)MyAllocatePoolTag__(NonPagedPool, DirNdx->Length, MEM_FID_TAG);
             if (!(FileInfo->FileIdent)) try_return (status = STATUS_INSUFFICIENT_RESOURCES);
             FileInfo->FileIdentLen = DirNdx->Length;
@@ -4134,85 +5298,77 @@ CreateUndel:
         // try to find suitable unused FileIdent in DirIndex
         l = FileInfo->FileIdentLen;
         if (undel) goto CrF__2;
+        /* Own the replacement name before discarding an old deleted name
+         * or changing the directory index's capacity. */
+        PreparedName.MaximumLength = _fn->Length + sizeof(WCHAR);
+        PreparedName.Length = _fn->Length;
+        PreparedNameBuffer = (PWCHAR)MyAllocatePoolTag__(UDF_FILENAME_MT,
+                                      PreparedName.MaximumLength, MEM_FNAMECPY_TAG);
+        if (!PreparedNameBuffer) try_return(status = STATUS_INSUFFICIENT_RESOURCES);
+        PreparedName.Buffer = PreparedNameBuffer;
+        RtlCopyMemory(PreparedName.Buffer, _fn->Buffer, _fn->Length);
+        PreparedName.Buffer[_fn->Length / sizeof(WCHAR)] = 0;
         // search for suitable unused (deleted) entry to reuse
-        if (UDFDirIndexInitScan(DirInfo, &ScanContext, 2)) {
+        if (!StageOnly && UDFDirIndexInitScan(DirInfo, &ScanContext, 2)) {
             while((DirNdx = UDFDirIndexScan(&ScanContext, NULL))) {
                 if ((DirNdx->Length == l) && UDFIsDeleted(DirNdx) &&
                    !DirNdx->FileInfo ) {
-                    // free unicode-buffer with old name
-                    if (DirNdx->FName.Buffer) {
-                        MyFreePool__(DirNdx->FName.Buffer);
-                        DirNdx->FName.Buffer = NULL;
-                    }
                     i = ScanContext.i;
                     goto CrF__1;
                 }
             }
         }
         // no suitable deleted entry found, append new one
-        i = UDFDirIndexGetLastIndex(hDirNdx);
-
-        // append entry
-        if (!NT_SUCCESS(status = UDFDirIndexGrow(&(DirInfo->Dloc->DirIndex), 1))) {
-            try_return (status);
-        }
-
-        NewNameAppend = TRUE;
-        // init offset of new FileIdent in directory Data extent
-        hDirNdx = DirInfo->Dloc->DirIndex;
-        if (i-1) {
-            DirNdx = UDFDirIndex(hDirNdx,i-1);
-            UDFDirIndex(hDirNdx,i)->Offset = DirNdx->Offset + DirNdx->Length;
-            DirNdx = UDFDirIndex(hDirNdx,i);
-        } else {
-            DirNdx = UDFDirIndex(hDirNdx,i);
-            DirNdx->Offset = 0;
-        }
-        // new terminator is recorded by UDFDirIndexGrow()
-        if ( ((d = ((LBS - (DirNdx->Offset + l + DirInfo->Dloc->DataLoc.Offset)) & (LBS-1) )) < sizeof(FILE_IDENT_DESC)) &&
-              d ) {
-            // insufficient space at the end of last sector for
-            // next FileIdent's tag. fill it with ImpUse data
-
-            // generally, all data should be DWORD-aligned, but if it is not so
-            // this opearation will help us to avoid glitches
-            d = (d+3) & ~((uint32)3);
-
+        if (EntryCount == MAXULONG)
+            try_return(status = STATUS_FILE_TOO_LARGE);
+        i = (uint_di)EntryCount;
+        DirNdx = UDFDirIndex(hDirNdx, i - 1);
+        if (!DirNdx || (uint64)DirNdx->Offset + DirNdx->Length > MAXULONG)
+            try_return(status = STATUS_FILE_CORRUPT_ERROR);
+        AppendOffset = DirNdx->Offset + DirNdx->Length;
+        /* Placement includes the inline data offset only for sector-tag
+         * alignment. Keep the logical directory offset itself separate. */
+        Placement = (uint64)AppendOffset + l + DirInfo->Dloc->DataLoc.Offset;
+        d = (uint32)((LBS - (Placement & (LBS - 1))) & (LBS - 1));
+        if (d && d < sizeof(FILE_IDENT_DESC)) {
             uint32 IUl = FileInfo->FileIdent->lengthOfImpUse;
             uint32 FIl = FileInfo->FileIdent->lengthFileIdent;
-            uint32 NewIUl = max(IUl + d, 32);
+            uint32 NewIUl;
+            d = (d + 3) & ~((uint32)3);
+            NewIUl = max(IUl + d, 32);
             d = NewIUl - IUl;
-            if (!MyReallocPool__((PCHAR)(FileInfo->FileIdent), l, (PCHAR*)&(FileInfo->FileIdent), l+d )) {
-                try_return (status = STATUS_INSUFFICIENT_RESOURCES);
-            }
-
+            if ((uint64)sizeof(FILE_IDENT_DESC) + IUl + FIl > l ||
+                l > MAXUSHORT || NewIUl > MAXUSHORT || d > MAXUSHORT - l)
+                try_return(status = STATUS_OBJECT_NAME_INVALID);
+            if (!MyReallocPool__((PCHAR)FileInfo->FileIdent, l,
+                                (PCHAR*)&FileInfo->FileIdent, l + d))
+                try_return(status = STATUS_INSUFFICIENT_RESOURCES);
             l += d;
-            
-            RtlMoveMemory(((int8*)(FileInfo->FileIdent+1))+NewIUl,
-                          ((int8*)(FileInfo->FileIdent+1))+IUl, FIl);
-
-            RtlZeroMemory(((int8*)(FileInfo->FileIdent+1))+IUl, d);
-
-            RtlZeroMemory(((int8*)(FileInfo->FileIdent+1))+NewIUl+FIl,
+            RtlMoveMemory((int8*)(FileInfo->FileIdent + 1) + NewIUl,
+                          (int8*)(FileInfo->FileIdent + 1) + IUl, FIl);
+            RtlZeroMemory((int8*)(FileInfo->FileIdent + 1) + IUl, d);
+            RtlZeroMemory((int8*)(FileInfo->FileIdent + 1) + NewIUl + FIl,
                           l - sizeof(FILE_IDENT_DESC) - NewIUl - FIl);
-
-            if (!IUl) {
-                UDFSetEntityID_imp((EntityID*)(FileInfo->FileIdent+1), UDF_ID_DEVELOPER);
-            }
-
+            if (!IUl)
+                UDFSetEntityID_imp((EntityID*)(FileInfo->FileIdent + 1), UDF_ID_DEVELOPER);
             FileInfo->FileIdent->lengthOfImpUse = (uint16)NewIUl;
             FileInfo->FileIdentLen = l;
         }
+        /* Index offsets/length are 32-bit. Refuse before any index mutation
+         * rather than wrapping back into an earlier directory record. */
+        if (l > MAXULONG - AppendOffset)
+            try_return(status = STATUS_FILE_TOO_LARGE);
+        status = UDFDirIndexGrow(&DirInfo->Dloc->DirIndex, 1);
+        if (!NT_SUCCESS(status)) try_return(status);
+        NewNameAppend = TRUE;
+        hDirNdx = DirInfo->Dloc->DirIndex;
+        DirNdx = UDFDirIndex(hDirNdx, i);
+        DirNdx->Offset = AppendOffset;
         DirNdx->Length = l;
 CrF__1:
-        // clone unicode string
-        // it  **<<MUST>>**  be allocated with internal memory manager
-        DirNdx->FName.Buffer = (PWCHAR)MyAllocatePoolTag__(UDF_FILENAME_MT, (DirNdx->FName.MaximumLength = _fn->Length + sizeof(WCHAR)), MEM_FNAMECPY_TAG);
-        DirNdx->FName.Length = _fn->Length;
-        if (!DirNdx->FName.Buffer)
-            try_return (status = STATUS_INSUFFICIENT_RESOURCES);
-        RtlCopyMemory(DirNdx->FName.Buffer, _fn->Buffer, _fn->Length);
-        DirNdx->FName.Buffer[_fn->Length/sizeof(WCHAR)] = 0;
+        if (DirNdx->FName.Buffer) MyFreePool__(DirNdx->FName.Buffer);
+        DirNdx->FName = PreparedName;
+        PreparedNameBuffer = NULL; /* index owns it, including exception unwind */
 CrF__2:
         // Reset all flags: stale FI_INTERNAL from deleted entry would
         // hide the new file from enumeration.
@@ -4221,6 +5377,15 @@ CrF__2:
         // we get here immediately when 'undel' occured
         FileInfo->Index = i;
         ASSERT(!DirNdx->FileInfo);
+        /* A failed mapping allocation must still have the exact parent
+         * context needed to detach this weak index pointer during unwind. */
+        status = UDFSetFileInfoConstructionParent(Vcb, FileInfo, DirInfo);
+        if (status != STATUS_SUCCESS) {
+            /* Name/index preparation already ran. Do not free this FE
+             * just because a refused transfer left ParentFile NULL. */
+            UDFQuarantineCreateConstruction(Vcb, FileInfo, status);
+            try_return(status);
+        }
         DirNdx->FileInfo = FileInfo;
         DirNdx->FileEntryLoc = FEicb.extLocation;
         // mark file as 'deleted' for now
@@ -4228,12 +5393,12 @@ CrF__2:
         FileInfo->FileIdent->fileCharacteristics |= FILE_DELETED;
         FileInfo->Dloc->DataLoc.Mapping = UDFExtentToMapping(&(FileInfo->Dloc->FELoc.Mapping[0]));
         if (!(FileInfo->Dloc->DataLoc.Mapping)) {
-            UDFFlushFI(IrpContext, Vcb, FileInfo, PartNum);
+            /* No valid new FID was published; do not initiate tombstone I/O
+             * using an incompletely initialized constructor. */
             try_return (status = STATUS_INSUFFICIENT_RESOURCES);
         }
         FileInfo->Dloc->DataLoc.Length = 0;
         FileInfo->Dloc->DataLoc.Offset = FileInfo->Dloc->FileEntryLen;
-        FileInfo->ParentFile = DirInfo;
         // init FileEntry
         UDFSetFileUID(FileInfo, NewUniqueId);
         UDFSetFileSize(FileInfo, 0);
@@ -4268,14 +5433,15 @@ CrF__2:
 #endif // UDF_CHECK_DISK_ALLOCATION
 
         // make FileIdent valid
-        FileInfo->FileIdent->fileCharacteristics = 0;
-        DirNdx->FileCharacteristics = 0;
+        FileInfo->FileIdent->fileCharacteristics = StageOnly ? FILE_DELETED : 0;
+        DirNdx->FileCharacteristics = StageOnly ? FILE_DELETED : 0;
         /* A deferred initial FE remains owned and dirty until the existing
          * scalar or batch FE-before-FID publication boundary. No valid FID
          * may be emitted merely because this private buffer was initialized.
          * Reused slots and unsupported ownership retain the immediate write. */
         status = STATUS_SUCCESS;
-        if (NewNameAppend && !undel)
+        InitialPublicationStarted = TRUE;
+        if (!StageOnly && NewNameAppend && !undel)
             status = UDFReserveInitialFid(IrpContext, Vcb, FileInfo,
                                           PartNum, &InitialFEDeferred);
         if (NT_SUCCESS(status) && InitialFEDeferred) {
@@ -4284,47 +5450,127 @@ CrF__2:
         } else if (NT_SUCCESS(status)) {
             status = UDFFlushFE(IrpContext, Vcb, FileInfo, PartNum);
         }
-        if (NT_SUCCESS(status) && NewNameAppend && !undel &&
+        if (NT_SUCCESS(status) && !StageOnly && NewNameAppend && !undel &&
             !UDFIsAStreamDir(DirInfo) && UDFMayDeferNewCreate(IrpContext, Vcb))
         {
             FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_NEW_UNPUBLISHED;
             UDF_METADATA_COUNT(Vcb,30);
         }
         if (!NT_SUCCESS(status)) {
-            /* The new FE was not committed.  Keep its directory entry a
-               tombstone before FINALLY releases the FE allocation. */
-            FileInfo->FileIdent->fileCharacteristics |= FILE_DELETED;
-            DirNdx->FileCharacteristics |= FILE_DELETED;
-            DirNdx->FI_Flags |= UDF_FI_FLAG_FI_MODIFIED;
-            UDFFlushFI(IrpContext, Vcb, FileInfo, PartNum);
+            /* Do not issue a second, unchecked tombstone write or infer
+             * absence from RAM. FINALLY retains this exact generation. */
             try_return (status);
         }
-        UDFReferenceFile__(FileInfo);
-        if (undel)
-            hDirNdx->DelCount--;
-        UDFReleaseDloc(Vcb, FileInfo->Dloc);
-        if (!UDFIsAStreamDir(DirInfo))
-            UDFIncFileCounter(Vcb);
+        status = UDFCompleteFileInfoConstruction(Vcb, FileInfo);
+        if (!NT_SUCCESS(status)) try_return(status);
+        FileInfo->CreateConstructionOpenOwned = TRUE;
+        if (StageOnly)
+            hDirNdx->DelCount++; /* new reserved tombstone, no live file yet */
+        else {
+            if (undel) hDirNdx->DelCount--;
+            if (!UDFIsAStreamDir(DirInfo)) UDFIncFileCounter(Vcb);
+        }
 
         UDFCheckSpaceAllocation(Vcb, 0, FileInfo->Dloc->DataLoc.Mapping, AS_USED); // check if used
-
+        status = UDFReleaseCreateConstruction(Vcb, FileInfo);
+        if (status != STATUS_SUCCESS) try_return(status);
+        if (FreshFileCreated) *FreshFileCreated = TRUE;
         try_return (status = STATUS_SUCCESS);
 
 try_exit:   NOTHING;
 
     } _SEH2_FINALLY {
-        if (!NT_SUCCESS(status)) {
-            if (FEAllocated && FileInfo->Dloc) {
-                // Free FE space first (needs Dloc->FELoc), then remove Dloc entry
-                UDFFreeFESpace(Vcb, DirInfo, &(FileInfo->Dloc->FELoc));
-                UDFRemoveDloc(Vcb, FileInfo->Dloc);
-                FileInfo->Dloc = NULL;
+        BOOLEAN Abnormal = _SEH2_AbnormalTermination();
+        if (PreparedNameBuffer) MyFreePool__(PreparedNameBuffer);
+        if (FEAllocated && FileInfo && FileInfo->Dloc &&
+            (FileInfo->CreateConstructionParent ||
+             FileInfo->Dloc->CreateConstructionOwner == FileInfo) &&
+            (Abnormal || !NT_SUCCESS(status))) {
+            NTSTATUS ReleaseStatus = STATUS_DEVICE_BUSY;
+            /* Before binding a weak parent/index edge or beginning media
+             * publication, ordinary allocation failure remains private. */
+            if (!Abnormal && !InitialPublicationStarted && !FileInfo->ParentFile)
+                ReleaseStatus = UDFReleaseCreateConstruction(Vcb, FileInfo);
+            if (ReleaseStatus != STATUS_SUCCESS)
+                UDFQuarantineCreateConstruction(Vcb, FileInfo,
+                    Abnormal ? STATUS_UNSUCCESSFUL : status);
+        }
+        if (Abnormal) {
+            /* A possibly submitted write is not an ordinary allocation
+             * failure. Preserve the generation for its caller's unwind. */
+            if (FEAllocated && FileInfo->Dloc && !FileInfo->CreateConstructionParent &&
+                !FileInfo->Dloc->CreateConstructionOwner) {
+                FileInfo->ConstructionFailed = TRUE;
+                FileInfo->CleanupPending = TRUE;
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                            STATUS_UNSUCCESSFUL, STATUS_SUCCESS);
+            }
+        } else if (!NT_SUCCESS(status)) {
+            if (FEAllocated && FileInfo->Dloc && !FileInfo->CreateConstructionParent &&
+                !FileInfo->Dloc->CreateConstructionOwner) {
+                if (StageOnly && FileInfo->ParentFile) {
+                    /* The tombstone write may have reached the medium.
+                     * Its caller takes an explicit quarantine hold; keep
+                     * allocation and all buffers reachable until then. */
+                    FileInfo->ConstructionFailed = TRUE;
+                    FileInfo->CleanupPending = TRUE;
+                    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                    InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                                status, STATUS_SUCCESS);
+                } else {
+                    UDFDropFileInfoConstruction(Vcb, FileInfo);
+                    /* The caller's failed-FI cleanup owns inner mappings and
+                     * the FE buffer. Removing only the Dloc shell leaks them.
+                     * Do not release allocation if construction still owns a
+                     * reference or another generation unexpectedly joined. */
+                    if (!FileInfo->RefCount && !FileInfo->Dloc->LinkRefCount &&
+                        !FileInfo->Dloc->CommonFcb &&
+                        FileInfo->NextLinkedFile == FileInfo && !FileInfo->OpenCount) {
+                        UDFFreeFESpace(Vcb, DirInfo, &FileInfo->Dloc->FELoc);
+                        if (FileInfo->Dloc->FELoc.Mapping)
+                            FileInfo->Dloc->FELoc.Mapping[0].extLocation = 0;
+                    } else {
+                        FileInfo->CleanupPending = TRUE;
+                        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                        InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                                    status, STATUS_SUCCESS);
+                    }
+                    if (StageOnly && NewNameAppend && !FileInfo->ParentFile &&
+                        !FileInfo->RefCount && !FileInfo->Dloc->LinkRefCount &&
+                        !FileInfo->Dloc->CommonFcb && !FileInfo->OpenCount &&
+                        FileInfo->NextLinkedFile == FileInfo &&
+                        UDFDirIndexGetLastIndex(DirInfo->Dloc->DirIndex) == i + 1) {
+                        NTSTATUS RollbackStatus;
+                        PDIR_INDEX_ITEM Entry = UDFDirIndex(DirInfo->Dloc->DirIndex, i);
+                        if (Entry->FName.Buffer) MyFreePool__(Entry->FName.Buffer);
+                        RtlZeroMemory(Entry, sizeof(*Entry));
+                        RollbackStatus = UDFDirIndexTrunc(&DirInfo->Dloc->DirIndex, 1);
+                        if (!NT_SUCCESS(RollbackStatus)) {
+                            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                            InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                                        RollbackStatus, STATUS_SUCCESS);
+                        }
+                    }
+                }
             }
         }
     } _SEH2_END
     return status;
 
-} // end UDFCreateFile__()
+} // end UDFCreateFileInternal()
+
+NTSTATUS
+UDFCreateFile__(PIRP_CONTEXT IrpContext, PVCB Vcb, BOOLEAN IgnoreCase,
+    PUNICODE_STRING Name, uint32 ExtAttrSize, uint32 ImpUseLength,
+    BOOLEAN Extended, BOOLEAN CreateNew, PUDF_FILE_INFO Directory,
+    PUDF_FILE_INFO* FileInfo, PBOOLEAN FreshFileCreated)
+{
+    return UDFCreateFileInternal(IrpContext, Vcb, IgnoreCase, Name,
+        ExtAttrSize, ImpUseLength, Extended, CreateNew, Directory,
+        FileInfo, (uint_di)-1, FALSE, FreshFileCreated);
+}
+
 
 /*
     This routine reads data from file described by FileInfo
@@ -4390,103 +5636,190 @@ UDFSparseFile__(
     This routine fills tails of the last sector in extent with ZEROs
  */
 NTSTATUS
-UDFPadLastSector(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PEXTENT_INFO ExtInfo
-    )
+UDFPadLastSector(PIRP_CONTEXT IrpContext, PVCB Vcb, PEXTENT_INFO ExtInfo)
 {
-    if (!ExtInfo || !(ExtInfo->Mapping) || !(ExtInfo->Length)) return STATUS_INVALID_PARAMETER;
-
-    PEXTENT_MAP Extent = ExtInfo->Mapping;   // Extent array
-    SIZE_T to_write, WrittenBytes;
-    uint32 Lba, sect_offs, flags;
-    NTSTATUS status;
-    // Length should not be zero
-    int64 Offset = ExtInfo->Length + ExtInfo->Offset;
-    // data is sector-size-aligned, we needn't any padding
-    if (Offset && !((uint32)Offset & (Vcb->SectorSize-1) )) return STATUS_SUCCESS;
-    // get Lba of the last sector
-    Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_write, &flags, NULL);
-    // EOF check. If we have valid ExtInfo this will not happen, but who knows..
-    if ((Lba == (uint32)-1) ||
-       (flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED))
-        return STATUS_END_OF_FILE;
-    // write tail
-    status = UDFWriteData(IrpContext, Vcb, TRUE, (((int64)Lba) << Vcb->SectorShift) + sect_offs, to_write, FALSE, Vcb->ZBuffer, &WrittenBytes);
-    return status;
+    SIZE_T Available, ToWrite, Written;
+    uint32 Lba, SectorOffset, Flags;
+    uint64 Offset;
+    NTSTATUS Status;
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || ExtInfo->Length <= 0 ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) ||
+        (uint64)ExtInfo->Length > (uint64)MAXLONGLONG - ExtInfo->Offset)
+        return STATUS_INVALID_PARAMETER;
+    Offset = (uint64)ExtInfo->Length + ExtInfo->Offset;
+    if (!(Offset & (Vcb->SectorSize - 1))) return STATUS_SUCCESS;
+    Lba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, (int64)Offset,
+                              &SectorOffset, &Available, &Flags, NULL);
+    if (Lba == LBA_OUT_OF_EXTENT || Flags > EXTENT_NOT_RECORDED_ALLOCATED ||
+        SectorOffset >= Vcb->SectorSize || !Available)
+        return STATUS_FILE_CORRUPT_ERROR;
+    /* A mapping run may include many sectors. ZBuffer supplies a single
+     * sector tail, not the whole remaining preallocated run. */
+    ToWrite = Vcb->SectorSize - SectorOffset;
+    if (Available < ToWrite || !Vcb->ZBuffer) return STATUS_FILE_CORRUPT_ERROR;
+    Status = UDFWriteData(IrpContext, Vcb, TRUE,
+        (((uint64)Lba) << Vcb->SectorShift) + SectorOffset,
+        ToWrite, FALSE, Vcb->ZBuffer, &Written);
+    if (NT_SUCCESS(Status) && Written != ToWrite) Status = STATUS_IO_DEVICE_ERROR;
+    return Status;
 } // UDFPadLastSector()
 
 /*
     This routine updates AllocDesc sequence, FileIdent & FileEntry
     for given file
  */
+/* Consume only the caller's exact acquired FI hold. No allocation, I/O
+ * or exception-raising work may separate the ownership decision from these
+ * three decrements. Writeback is a distinct, repeatable operation below. */
 static NTSTATUS
-UDFCloseFile__Internal(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO FileInfo
-    )
+UDFDereferenceFileLocked(PVCB Vcb, PUDF_FILE_INFO FileInfo)
 {
-    ValidateFileInfo(FileInfo);
-
-    if (!FileInfo) return STATUS_SUCCESS;
-    if (FileInfo->Index<2 && (FileInfo->ParentFile) && !UDFIsAStreamDir(FileInfo)) {
-        UDFPrint(("Closing Current or Parent Directory... :-\\\n"));
-        if (FileInfo->RefCount) {
-            InterlockedDecrement((PLONG)&FileInfo->RefCount);
-            ASSERT(FileInfo->Dloc);
-            if (FileInfo->Dloc)
-                InterlockedDecrement((PLONG)&FileInfo->Dloc->LinkRefCount);
-#ifdef UDF_DBG
-        } else {
-            BrutePoint();
-            UDFPrint(("ERROR: Closing unreferenced file!\n"));
-#endif // UDF_DBG
-        }
-        if (FileInfo->ParentFile->OpenCount) {
-            InterlockedDecrement((PLONG)&FileInfo->ParentFile->OpenCount);
-#ifdef UDF_DBG
-        } else {
-            BrutePoint();
-            UDFPrint(("ERROR: Closing unopened file!\n"));
-#endif // UDF_DBG
-        }
-        return STATUS_SUCCESS;
+    PUDF_DATALOC_INFO Dloc;
+    PUDF_FILE_INFO Parent;
+    NTSTATUS Status = STATUS_SUCCESS;
+    if (!FileInfo)
+        return STATUS_INVALID_PARAMETER;
+    Dloc = FileInfo->Dloc;
+    Parent = FileInfo->ParentFile;
+    ASSERT(FileInfo->RefCount >= 1);
+    if (!Dloc || FileInfo->Constructing || !FileInfo->RefCount ||
+        !Dloc->LinkRefCount || (Parent && !Parent->OpenCount)) {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+    } else {
+        InterlockedDecrement((PLONG)&FileInfo->RefCount);
+        InterlockedDecrement((PLONG)&Dloc->LinkRefCount);
+        if (Parent)
+            InterlockedDecrement((PLONG)&Parent->OpenCount);
     }
-    PUDF_FILE_INFO DirInfo = FileInfo->ParentFile;
+    return Status;
+}
+
+NTSTATUS
+UDFDereferenceFileChecked(PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    NTSTATUS Status;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        Status = UDFDereferenceFileLocked(Vcb, FileInfo);
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Retain the caller's real ordinary-open token without consuming it or
+ * manufacturing a replacement FI reference. DlocResource2 is held. */
+static VOID
+UDFRetainOrdinaryReferenceLocked(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                                NTSTATUS Error)
+{
+    if (NT_SUCCESS(Error)) Error = STATUS_FILE_CORRUPT_ERROR;
+    FileInfo->CleanupPending = TRUE;
+    if (NT_SUCCESS(FileInfo->RetainedOpenError)) FileInfo->RetainedOpenError = Error;
+    if (FileInfo->RetainedOpenReferences != MAXULONG)
+        FileInfo->RetainedOpenReferences++;
+    if (Vcb->RetainedOpenCount < 0)
+        InterlockedExchange(&Vcb->RetainedOpenCount, MAXLONG);
+    else if (Vcb->RetainedOpenCount < MAXLONG)
+        InterlockedIncrement(&Vcb->RetainedOpenCount);
+    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    InterlockedCompareExchange(&Vcb->MetadataWritebackError, Error, STATUS_SUCCESS);
+}
+
+static VOID
+UDFRetainOrdinaryOpenReference(PVCB Vcb, PUDF_FILE_INFO* OpenReference,
+                              NTSTATUS Error)
+{
+    PUDF_FILE_INFO FileInfo = *OpenReference;
+    if (!FileInfo) return;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        UDFRetainOrdinaryReferenceLocked(Vcb, FileInfo, Error);
+        *OpenReference = NULL; /* the indexed retained-token inventory owns it */
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+}
+
+/* The failed request owns a successful open OR a partial constructor, never
+ * a new metadata flush. Ordinary success consumes its FI/Dloc/exact-parent
+ * contribution once and hands dirty metadata to the indexed collector. An
+ * inconsistent decrement transfers the same token to explicit retained FI
+ * inventory; it does not acquire a replacement or guess another owner. */
+NTSTATUS
+UDFReleaseCreateReference(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                           PUDF_FILE_INFO* OpenReference, BOOLEAN CloseLater)
+{
+    PUDF_FILE_INFO FileInfo;
+    PFCB Fcb;
+    NTSTATUS Status;
+    if (!OpenReference) return STATUS_INVALID_PARAMETER;
+    FileInfo = *OpenReference;
+    if (!FileInfo) return STATUS_SUCCESS;
+    if (!FileInfo->Dloc || FileInfo->Constructing || FileInfo->ConstructionFailed) {
+        Status = UDFRetainFailedStreamOpen(Vcb, OpenReference);
+        return NT_SUCCESS(Status) ? STATUS_FILE_INVALID : Status;
+    }
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (CloseLater) FileInfo->CleanupPending = TRUE;
+        Status = UDFDereferenceFileLocked(Vcb, FileInfo);
+        if (!NT_SUCCESS(Status)) {
+            UDFRetainOrdinaryReferenceLocked(Vcb, FileInfo, Status);
+        }
+        Fcb = FileInfo->Dloc->CommonFcb;
+        *OpenReference = NULL; /* consumed or exact token transferred to FI */
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    if ((CloseLater || !NT_SUCCESS(Status)) && Fcb && !Fcb->FcbReference)
+        UDFScheduleFcbTeardownRetry(IrpContext, Fcb);
+    return Status;
+}
+
+static NTSTATUS
+UDFCompleteFileCloseInternal(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                             PUDF_FILE_INFO FileInfo)
+{
+    PUDF_FILE_INFO DirInfo;
     NTSTATUS status;
     uint32 PartNum;
-    if (FileInfo->RefCount) {
-        InterlockedDecrement((PLONG)&FileInfo->RefCount);
-        ASSERT(FileInfo->Dloc);
-        if (FileInfo->Dloc)
-            InterlockedDecrement((PLONG)&FileInfo->Dloc->LinkRefCount);
-#ifdef UDF_DBG
-    } else {
-        BrutePoint();
-        UDFPrint(("ERROR: Closing unreferenced file!\n"));
-#endif // UDF_DBG
-    }
-    if (DirInfo) {
-        // validate DirInfo
-        ValidateFileInfo(DirInfo);
-
-        if (DirInfo->OpenCount) {
-            InterlockedDecrement((PLONG)&DirInfo->OpenCount);
-#ifdef UDF_DBG
-        } else {
-            BrutePoint();
-            UDFPrint(("ERROR: Closing unopened file!\n"));
-#endif // UDF_DBG
-        }
-    }
+    if (!FileInfo)
+        return STATUS_SUCCESS;
+    if (FileInfo->Constructing || !FileInfo->Dloc)
+        return STATUS_FILE_INVALID;
+    if (FileInfo->Index < 2 && FileInfo->ParentFile && !UDFIsAStreamDir(FileInfo))
+        return STATUS_SUCCESS;
+    DirInfo = FileInfo->ParentFile;
     // If the file has gone (unlinked) we should return STATUS_SUCCESS here.
     if (!FileInfo->Dloc) return STATUS_SUCCESS;
+    if (!NT_SUCCESS(FileInfo->Dloc->ZeroDataError) &&
+        !UDFIsZeroDataRetry(FileInfo->Dloc))
+        return FileInfo->Dloc->ZeroDataError;
 
     if (FileInfo->RefCount ||
        FileInfo->OpenCount ||
        !(FileInfo->Dloc->FELoc.Mapping)) return STATUS_SUCCESS;
+    if (FileInfo->Dloc->DeleteCommitted && !UDFGetFileNameLinkCount(FileInfo))
+        return STATUS_SUCCESS; /* no I/O and no clearing of cached-data ownership */
+    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY) {
+        PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+        PDIR_INDEX_ITEM Entry = DirInfo ?
+            UDFDirIndex(DirInfo->Dloc->DirIndex, FileInfo->Index) : NULL;
+        /* Consume the close hold once, but do not issue another metadata
+         * write after an earlier failure made the volume read-only. A clean
+         * read-only open needs no work and can still close successfully. */
+        if ((Dloc->FE_Flags & (UDF_FE_FLAG_FE_MODIFIED | UDF_FE_FLAG_CACHED_DATA_PENDING)) ||
+            Dloc->DataLoc.Modified || Dloc->AllocLoc.Modified || Dloc->FELoc.Modified ||
+            (Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED) ||
+            UDFDirectoryAppendPending(FileInfo) ||
+            (Entry && (Entry->FI_Flags & UDF_FI_FLAG_FI_MODIFIED)))
+            return STATUS_MEDIA_WRITE_PROTECTED;
+        return STATUS_SUCCESS;
+    }
     if (UDFDeferNewFileMetadata(IrpContext, Vcb, FileInfo))
         return STATUS_SUCCESS;
     /* Cleanup already consumed this FI reference. Its FILE_OBJECT still
@@ -4553,7 +5886,7 @@ UDFCloseFile__Internal(
 
             if (FileInfo->Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED) {
                 FileInfo->Dloc->DataLoc.Flags |= EXTENT_FLAG_CUT_PREALLOCATED;
-                status = UDFResizeExtent(IrpContext, Vcb, PartNum, UDFGetFileSize(FileInfo), FALSE, &(FileInfo->Dloc->DataLoc));
+                status = UDFResizeExtent(IrpContext, Vcb, FileInfo, PartNum, UDFGetFileSize(FileInfo), FALSE, &(FileInfo->Dloc->DataLoc));
                 FileInfo->Dloc->DataLoc.Flags &= ~EXTENT_FLAG_CUT_PREALLOCATED;
                 if (!NT_SUCCESS(status))
                     return status;
@@ -4583,6 +5916,44 @@ UDFCloseFile__Internal(
     }
 #endif // UDF_DBG
     return STATUS_SUCCESS;
+}
+
+NTSTATUS
+UDFCompleteFileClose(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                     PUDF_FILE_INFO FileInfo)
+{
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    _SEH2_TRY {
+        Status = UDFCompleteFileCloseInternal(IrpContext, Vcb, FileInfo);
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) {
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                        STATUS_UNSUCCESSFUL, STATUS_SUCCESS);
+        }
+    } _SEH2_END;
+    UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, Status);
+    return Status;
+}
+
+static NTSTATUS
+UDFCloseFile__Internal(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                       PUDF_FILE_INFO FileInfo)
+{
+    NTSTATUS Status;
+    ValidateFileInfo(FileInfo);
+    if (!FileInfo)
+        return STATUS_SUCCESS;
+    if (FileInfo->Constructing) {
+        UDFDropFileInfoConstruction(Vcb, FileInfo);
+        return STATUS_FILE_INVALID;
+    }
+    if (!FileInfo->RefCount || !FileInfo->Dloc)
+        return STATUS_FILE_INVALID;
+    Status = UDFDereferenceFileChecked(Vcb, FileInfo);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    return UDFCompleteFileClose(IrpContext, Vcb, FileInfo);
 } // end UDFCloseFile__Internal()
 
 NTSTATUS
@@ -4598,60 +5969,1064 @@ UDFCloseFile__(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO FileInfo)
 */
 static
 NTSTATUS
-UDFUpdateParentFID(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO DirInfo
-    )
+UDFUpdateParentFID(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                   PUDF_FILE_INFO DirInfo, BOOLEAN WriteToMedia)
 {
-    NTSTATUS status = STATUS_SUCCESS;
-    PFILE_IDENT_DESC fid = NULL;
-    PDIR_INDEX_ITEM DirNdx;
-    int8* Buf = NULL;
-    uint32 PartNum, ParentLBA;
+    NTSTATUS Status;
+    PDIR_INDEX_ITEM Entry;
+    PFILE_IDENT_DESC Fid;
+    PUDF_FILE_INFO Parent = DirInfo->ParentFile;
+    uint32 PartNum, ParentLba, ParentLbn;
     SIZE_T WrittenBytes = 0;
-
-    DirNdx = UDFDirIndex(DirInfo->Dloc->DirIndex, 1);
-    if (!DirNdx)
+    int8* Buffer;
+    if (!Parent || !Parent->Dloc || !Parent->Dloc->FELoc.Mapping ||
+        !(Entry = UDFDirIndex(DirInfo->Dloc->DirIndex, 1)) ||
+        Entry->Length < sizeof(FILE_IDENT_DESC) || Entry->Length > MAXUSHORT)
+        return STATUS_FILE_CORRUPT_ERROR;
+    ParentLba = Parent->Dloc->FELoc.Mapping[0].extLocation;
+    PartNum = UDFGetRefPartNumByPhysLba(Vcb, ParentLba);
+    ParentLbn = PartNum == (uint32)-1 ? (uint32)-1 :
+        UDFPhysLbaToPart(Vcb, PartNum, ParentLba);
+    if (!ParentLba || ParentLbn == (uint32)-1 || PartNum > MAXUSHORT)
         return STATUS_FILE_CORRUPT_ERROR;
 
-    Buf = (int8*)MyAllocatePool__(NonPagedPool, DirNdx->Length);
-    if (!Buf)
+    /* The FI already moved. Its borrowed '..' identity must follow that
+     * parent even when the media update fails; the new FI/LCB holds the
+     * parent, and the old parent must no longer be borrowed after its close. */
+    Entry->FileInfo = Parent;
+    Entry->FileEntryLoc.logicalBlockNum = ParentLbn;
+    Entry->FileEntryLoc.partitionReferenceNum = (uint16)PartNum;
+    if (!WriteToMedia)
+        return STATUS_SUCCESS;
+    Buffer = MyAllocatePool__(NonPagedPool, Entry->Length);
+    if (!Buffer)
         return STATUS_INSUFFICIENT_RESOURCES;
+    _SEH2_TRY {
+        Status = UDFReadFile__(IrpContext, Vcb, DirInfo, Entry->Offset,
+                               Entry->Length, FALSE, Buffer);
+        if (NT_SUCCESS(Status)) {
+            Fid = (PFILE_IDENT_DESC)Buffer;
+            if (!(Fid->fileCharacteristics & FILE_PARENT) ||
+                Fid->descTag.tagIdent != TID_FILE_IDENT_DESC) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+            } else {
+                Fid->icb.extLength = Vcb->SectorSize;
+                Fid->icb.extLocation = Entry->FileEntryLoc;
+                RtlZeroMemory(&Fid->icb.impUse, sizeof(Fid->icb.impUse));
+                ((struct FidADImpUse*)&Fid->icb.impUse)->uniqueID =
+                    (uint32)UDFGetFileUID(Parent);
+                UDFSetUpTag(Vcb, &Fid->descTag, (uint16)Entry->Length,
+                             Fid->descTag.tagLocation, 0);
+                Status = UDFWriteFile__(IrpContext, Vcb, DirInfo, Entry->Offset,
+                    Entry->Length, FALSE, Buffer, &WrittenBytes);
+                if (NT_SUCCESS(Status) && WrittenBytes != Entry->Length)
+                    Status = STATUS_IO_DEVICE_ERROR;
+            }
+        }
+    } _SEH2_FINALLY {
+        MyFreePool__(Buffer);
+    } _SEH2_END;
+    return Status;
+}
 
-    status = UDFReadFile__(IrpContext, Vcb, DirInfo, DirNdx->Offset, DirNdx->Length, FALSE, Buf);
-    if (!NT_SUCCESS(status))
-        goto cleanup;
+/* A temporary FE is still a real allocated generation until the target
+ * FID no longer points to it and that write passed a lower-device barrier.
+ * The owner is explicit so an error cannot discard its mapping at last close. */
+static NTSTATUS
+UDFOwnNamespaceScratch(PVCB Vcb, PUDF_FILE_INFO Owner,
+                       PUDF_FILE_INFO Namespace, PUDF_FILE_INFO Scratch)
+{
+    PUDF_DATALOC_INFO Dloc = Owner->Dloc;
+    NTSTATUS Status = STATUS_FILE_CORRUPT_ERROR;
+    LONG Count;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (Dloc->NamespaceScratch == Scratch &&
+            Scratch->Dloc->NamespaceScratchOwner == Dloc &&
+            Dloc->NamespaceFileInfo == Namespace) {
+            Status = STATUS_SUCCESS; /* an interrupted caller already transferred it */
+            _SEH2_LEAVE;
+        }
+        if (Dloc->NamespaceScratch || Dloc->NamespaceTarget ||
+            Dloc->NamespaceTargetState != UdfNamespaceTargetNone ||
+            !NT_SUCCESS(Dloc->NamespaceTargetError) ||
+            Dloc->NamespacePhase != UdfNamespaceNone || Scratch->Dloc->NamespaceScratchOwner ||
+            Scratch->Dloc->CreateConstructionOwner || Scratch->Constructing ||
+            Scratch->ConstructionReferenceOwned || Scratch->ConstructionFailed ||
+            !Scratch->RefCount || !Scratch->ParentFile)
+            _SEH2_LEAVE;
+        for (;;) {
+            Count = InterlockedCompareExchange(&Vcb->PendingNamespaceCount, 0, 0);
+            if (Count < 0) _SEH2_LEAVE;
+            if (Count >= MAXLONG - 1) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                _SEH2_LEAVE;
+            }
+            if (InterlockedCompareExchange(&Vcb->PendingNamespaceCount,
+                                           Count + 1, Count) == Count)
+                break;
+        }
+        /* No allocation, I/O or callback between the count reservation and
+         * transfer of the caller's existing successful stage reference. */
+        Dloc->NamespaceScratch = Scratch;
+        Dloc->NamespaceFileInfo = Namespace;
+        Dloc->NamespacePhase = UdfNamespaceReserved;
+        Scratch->Dloc->NamespaceScratchOwner = Dloc;
+        Status = STATUS_SUCCESS;
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    return Status;
+}
 
-    fid = (PFILE_IDENT_DESC)Buf;
-    if (!(fid->fileCharacteristics & FILE_PARENT)) {
-        status = STATUS_FILE_CORRUPT_ERROR;
-        goto cleanup;
+static NTSTATUS
+UDFQuarantineNamespace(PVCB Vcb, NTSTATUS Status)
+{
+    ASSERT(!NT_SUCCESS(Status));
+    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+    return Status;
+}
+
+/* Transfer the helper's one successful target open into the namespace
+ * owner before its FID is detached. This generation reserves its own data
+ * and FE until destination publication has passed a lower barrier. */
+static NTSTATUS
+UDFOwnNamespaceTarget(PVCB Vcb, PUDF_FILE_INFO Source, PUDF_FILE_INFO Target,
+                      PUDF_FILE_INFO* OpenReference, PBOOLEAN TargetOwned)
+{
+    PUDF_DATALOC_INFO Owner = Source ? Source->Dloc : NULL;
+    PUDF_DATALOC_INFO Dloc = Target ? Target->Dloc : NULL;
+    NTSTATUS Status = STATUS_SHARING_VIOLATION;
+    LONG Count;
+    if (!OpenReference || !TargetOwned || !Owner || !Dloc)
+        return STATUS_INVALID_PARAMETER;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (Owner->NamespaceTarget == Target && Dloc->NamespaceScratchOwner == Owner &&
+            Owner->NamespaceTargetState == UdfNamespaceTargetHeld &&
+            Owner->NamespacePhase == UdfNamespaceTargetRetained &&
+            !*OpenReference && *TargetOwned) {
+            Status = STATUS_SUCCESS; /* this exact caller already transferred it */
+            _SEH2_LEAVE;
+        }
+        if (*OpenReference != Target || *TargetOwned || Owner == Dloc ||
+            Owner->NamespaceTarget || Owner->NamespaceTargetState != UdfNamespaceTargetNone ||
+            !NT_SUCCESS(Owner->NamespaceTargetError) || !Owner->NamespaceScratch ||
+            Owner->NamespacePhase != UdfNamespaceReserved || Dloc->CleanupOwner ||
+            Dloc->CreateConstructionOwner || Dloc->CreateRollbackOwner ||
+            Dloc->StreamDeleteOwner || Dloc->StreamDeleteContextOwner || Dloc->StreamCreate ||
+            Dloc->NamespaceScratch || Dloc->NamespaceTarget || Dloc->NamespaceScratchOwner ||
+            !Target->RefCount || !Target->ParentFile || Target->Constructing ||
+            Target->ConstructionReferenceOwned || Target->ConstructionFailed)
+            _SEH2_LEAVE;
+        for (;;) {
+            Count = InterlockedCompareExchange(&Vcb->PendingNamespaceCount, 0, 0);
+            if (Count <= 0) {
+                Status = STATUS_FILE_CORRUPT_ERROR; /* the scratch already owns one */
+                _SEH2_LEAVE;
+            }
+            if (Count >= MAXLONG - 1) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                _SEH2_LEAVE;
+            }
+            if (InterlockedCompareExchange(&Vcb->PendingNamespaceCount,
+                                           Count + 1, Count) == Count)
+                break;
+        }
+        /* The owner fields and the caller's exact-token receipt form one
+         * callback-free group. A later exception cannot close that token
+         * through the caller after it belongs to the namespace operation. */
+        Owner->NamespaceTarget = Target;
+        Owner->NamespaceTargetState = UdfNamespaceTargetHeld;
+        Owner->NamespaceTargetError = STATUS_SUCCESS;
+        Owner->NamespacePhase = UdfNamespaceTargetRetained;
+        Dloc->NamespaceScratchOwner = Owner;
+        *OpenReference = NULL;
+        *TargetOwned = TRUE;
+        Status = STATUS_SUCCESS;
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Called only after destination and source tombstones/FE writes passed the
+ * final barrier. Existing live aliases still own their FCB/Dloc; only the
+ * exact target hold is released here. */
+static NTSTATUS
+UDFRetireNamespaceTarget(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                         PUDF_DATALOC_INFO Owner)
+{
+    _SEH2_VOLATILE PUDF_FILE_INFO Target = NULL;
+    _SEH2_VOLATILE PUDF_DATALOC_INFO Dloc = NULL;
+    _SEH2_VOLATILE PFCB Fcb = NULL;
+    _SEH2_VOLATILE BOOLEAN Acquired = FALSE, AttemptOwned = FALSE;
+    _SEH2_VOLATILE BOOLEAN Drain = FALSE, ActiveRefusal = FALSE;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    _SEH2_TRY {
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        _SEH2_TRY {
+            Target = Owner->NamespaceTarget;
+            if (!Target) {
+                if (Owner->NamespaceTargetState != UdfNamespaceTargetNone ||
+                    !NT_SUCCESS(Owner->NamespaceTargetError))
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            if (Owner->NamespaceTargetState == UdfNamespaceTargetDraining ||
+                Owner->NamespaceTargetState == UdfNamespaceTargetReleasing) {
+                ActiveRefusal = TRUE;
+                Status = STATUS_DEVICE_BUSY;
+                _SEH2_LEAVE;
+            }
+            if (Owner->NamespaceTargetState == UdfNamespaceTargetFailed) {
+                Status = NT_SUCCESS(Owner->NamespaceTargetError) ?
+                    STATUS_FILE_CORRUPT_ERROR : Owner->NamespaceTargetError;
+                _SEH2_LEAVE;
+            }
+            Dloc = Target->Dloc;
+            if (!Dloc || Dloc->NamespaceScratchOwner != Owner || !Target->RefCount ||
+                !Owner->NamespaceScratch || Owner->NamespacePhase != UdfNamespaceCommitted ||
+                !Target->FileIdent || !(Target->FileIdent->fileCharacteristics & FILE_DELETED) ||
+                (Owner->NamespaceTargetState != UdfNamespaceTargetHeld &&
+                 Owner->NamespaceTargetState != UdfNamespaceTargetReady)) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            Fcb = Dloc->CommonFcb;
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&Vcb->DlocResource2);
+        } _SEH2_END;
+        if (Status != STATUS_SUCCESS || !Target) _SEH2_LEAVE;
+        if (Fcb) {
+            if (!Fcb->Header.Resource ||
+                (ExIsResourceAcquiredSharedLite(Fcb->Header.Resource) &&
+                 !ExIsResourceAcquiredExclusiveLite(Fcb->Header.Resource))) {
+                Status = STATUS_DEVICE_BUSY; /* do not upgrade a borrowed Main */
+                _SEH2_LEAVE;
+            }
+            if (!UDFAcquireFcbExclusive(IrpContext, Fcb, TRUE)) {
+                Status = STATUS_SHARING_VIOLATION;
+                _SEH2_LEAVE;
+            }
+            Acquired = TRUE;
+        }
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        _SEH2_TRY {
+            if (Owner->NamespaceTarget != Target || Target->Dloc != Dloc ||
+                Dloc->NamespaceScratchOwner != Owner ||
+                (Owner->NamespaceTargetState != UdfNamespaceTargetHeld &&
+                 Owner->NamespaceTargetState != UdfNamespaceTargetReady)) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            Drain = Owner->NamespaceTargetState == UdfNamespaceTargetHeld;
+            Owner->NamespaceTargetState = Drain ? UdfNamespaceTargetDraining :
+                                                  UdfNamespaceTargetReleasing;
+            AttemptOwned = TRUE;
+            /* Internal stream cleanup can acquire its base FI. Exclusive
+             * VCB/Main and the source's retained target/count protect this
+             * existing narrow window. Reentrant retirement is now BUSY. */
+            if (Drain) Dloc->NamespaceScratchOwner = NULL;
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&Vcb->DlocResource2);
+        } _SEH2_END;
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        if (Drain) {
+            _SEH2_TRY {
+                if (!UDFGetFileNameLinkCount(Target) && UDFHasAStreamDir(Target))
+                    Status = UDFDeleteAllStreams(IrpContext, Vcb, Target);
+                if (Status == STATUS_SUCCESS) {
+                    if (!UDFGetFileNameLinkCount(Target)) {
+                        Dloc->DeleteCommitted = TRUE;
+                        Dloc->FE_Flags |= UDF_FE_FLAG_FREE_DEFERRED;
+                    } else {
+                        Status = UDFFlushFile__(IrpContext, Vcb, Target, UDF_FLUSH_FLAGS_LITE);
+                        if (Status == STATUS_SUCCESS)
+                            Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+                    }
+                }
+            } _SEH2_FINALLY {
+                BOOLEAN Abnormal = _SEH2_AbnormalTermination();
+                UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+                _SEH2_TRY {
+                    if (Owner->NamespaceTarget != Target ||
+                        Owner->NamespaceTargetState != UdfNamespaceTargetDraining ||
+                        Dloc->NamespaceScratchOwner) {
+                        if (Status == STATUS_SUCCESS) Status = STATUS_FILE_CORRUPT_ERROR;
+                    } else {
+                        Dloc->NamespaceScratchOwner = Owner;
+                        Owner->NamespaceTargetState = Abnormal || Status != STATUS_SUCCESS ?
+                            UdfNamespaceTargetFailed : UdfNamespaceTargetReleasing;
+                    }
+                } _SEH2_FINALLY {
+                    UDFReleaseResource(&Vcb->DlocResource2);
+                } _SEH2_END;
+            } _SEH2_END;
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        }
+        /* Acquire once before spending the token. No callback, I/O or second
+         * resource acquisition separates the checked decrements from removal
+         * of the exact owner/count. A refused decrement keeps a Ready owner. */
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        _SEH2_TRY {
+            if (Owner->NamespaceTarget != Target ||
+                Owner->NamespaceTargetState != UdfNamespaceTargetReleasing ||
+                Dloc->NamespaceScratchOwner != Owner || !Owner->NamespaceScratch ||
+                Vcb->PendingNamespaceCount <= 1 || Vcb->PendingNamespaceCount == MAXLONG) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            Status = UDFDereferenceFileLocked(Vcb, Target);
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            Owner->NamespaceTarget = NULL;
+            Owner->NamespaceTargetState = UdfNamespaceTargetNone;
+            Owner->NamespaceTargetError = STATUS_SUCCESS;
+            Dloc->NamespaceScratchOwner = NULL;
+            InterlockedDecrement(&Vcb->PendingNamespaceCount);
+            AttemptOwned = FALSE; /* generic GC can now free Target */
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&Vcb->DlocResource2);
+        } _SEH2_END;
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        {
+            NTSTATUS CleanupStatus;
+            if (UDFCleanUpFileWithStatus(Vcb, Target, &CleanupStatus) & UDF_FREE_FILEINFO)
+                MyFreePool__(Target);
+            else if (CleanupStatus != STATUS_SUCCESS && CleanupStatus != STATUS_DEVICE_BUSY)
+                Status = CleanupStatus;
+        }
+    } _SEH2_FINALLY {
+        BOOLEAN Abnormal = _SEH2_AbnormalTermination();
+        NTSTATUS Error = Abnormal ? STATUS_UNSUCCESSFUL : Status;
+        if (Error != STATUS_SUCCESS && NT_SUCCESS(Error)) Error = STATUS_IO_DEVICE_ERROR;
+        _SEH2_TRY {
+            if (AttemptOwned || (Target && Error != STATUS_SUCCESS && !ActiveRefusal)) {
+                UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+                _SEH2_TRY {
+                    if (Owner->NamespaceTarget == Target) {
+                        if (AttemptOwned) {
+                            if (!Dloc->NamespaceScratchOwner)
+                                Dloc->NamespaceScratchOwner = Owner;
+                            if (Dloc->NamespaceScratchOwner != Owner) {
+                                Owner->NamespaceTargetState = UdfNamespaceTargetFailed;
+                                if (Error == STATUS_SUCCESS) Error = STATUS_FILE_CORRUPT_ERROR;
+                            } else if (Owner->NamespaceTargetState == UdfNamespaceTargetReleasing) {
+                                Owner->NamespaceTargetState = UdfNamespaceTargetReady;
+                            } else {
+                                Owner->NamespaceTargetState = UdfNamespaceTargetFailed;
+                            }
+                        }
+                        if (NT_SUCCESS(Owner->NamespaceTargetError))
+                            Owner->NamespaceTargetError = Error == STATUS_SUCCESS ?
+                                STATUS_FILE_CORRUPT_ERROR : Error;
+                    } else if (AttemptOwned && Error == STATUS_SUCCESS) {
+                        Error = STATUS_FILE_CORRUPT_ERROR;
+                    }
+                } _SEH2_FINALLY {
+                    UDFReleaseResource(&Vcb->DlocResource2);
+                } _SEH2_END;
+            }
+            if (Error != STATUS_SUCCESS && !ActiveRefusal)
+                UDFQuarantineNamespace(Vcb, Error);
+            if (!Abnormal && Error != STATUS_SUCCESS && NT_SUCCESS(Status))
+                Status = Error;
+        } _SEH2_FINALLY {
+            if (Acquired) UDFReleaseFcb(IrpContext, Fcb);
+        } _SEH2_END;
+    } _SEH2_END;
+    return Status;
+}
+
+/* A freshly created private FE has one sector and independently owned map
+ * buffers. A general cached file/AED/stream is not eligible for this memory
+ * destructor, even if some of its ordinary reference counts reached zero. */
+static BOOLEAN
+UDFScratchMapIsIcbSector(PVCB Vcb, PEXTENT_MAP Map, uint32 Lba)
+{
+    uint32 Bytes;
+    return Map && UDFGetMappingByteCount(Map, &Bytes) == STATUS_SUCCESS &&
+        Bytes == 2 * sizeof(EXTENT_MAP) && Map[0].extLocation == Lba &&
+        (Map[0].extLength & UDF_EXTENT_LENGTH_MASK) == Vcb->SectorSize &&
+        (Map[0].extLength >> 30) <= EXTENT_NOT_RECORDED_ALLOCATED &&
+        !Map[1].extLength && !Map[1].extLocation;
+}
+
+static NTSTATUS
+UDFCheckNamespaceScratch(PVCB Vcb, PUDF_DATALOC_INFO Owner,
+                         PUDF_FILE_INFO Scratch)
+{
+    PUDF_DATALOC_INFO Dloc = Scratch ? Scratch->Dloc : NULL;
+    PDIR_INDEX_ITEM Entry;
+    uint32 Lba, Header;
+    if (!Dloc || Dloc == Owner || Dloc->NamespaceScratchOwner != Owner ||
+        Scratch->FileIdent || Scratch->Fcb || Scratch->ListPtr || Scratch->OpenCount ||
+        Scratch->RefCount != 1 || Dloc->LinkRefCount != 1 || Dloc->CommonFcb ||
+        !Scratch->ParentFile || !Scratch->ParentFile->Dloc || !Scratch->ParentFile->OpenCount ||
+        Scratch->ParentFile->OpenCount > MAXLONG ||
+        Scratch->NextLinkedFile != Scratch || Scratch->PrevLinkedFile != Scratch ||
+        Dloc->LinkedFileInfo != Scratch || Scratch->Constructing || Scratch->DlocInitOwner ||
+        Scratch->ConstructionFailed || Scratch->ConstructionReferenceOwned ||
+        Scratch->ConstructionParent || Scratch->CreateConstructionParent ||
+        Scratch->CreateConstructionCounted || Scratch->CreateConstructionOpenOwned ||
+        Scratch->CreateRollbackCounted || Scratch->CreateRollbackPhase ||
+        Scratch->RetainedOpenReferences || Scratch->InternalOpenReleased ||
+        Scratch->TemporaryRetired || Scratch->NamespaceStaged ||
+        Dloc->CleanupOwner || Dloc->AllocationReleaseActive ||
+        !NT_SUCCESS(Dloc->AllocationReleaseError) || Dloc->CreateConstructionOwner || Dloc->CreateRollbackOwner ||
+        Dloc->RetiredExtents || Dloc->DeletePrefree || Dloc->DeleteCommitted ||
+        Dloc->NamespaceScratch || Dloc->NamespaceFileInfo || Dloc->NamespaceTarget ||
+        Dloc->NamespacePhase != UdfNamespaceNone ||
+        Dloc->NamespaceTargetState != UdfNamespaceTargetNone ||
+        !NT_SUCCESS(Dloc->NamespaceTargetError) || Dloc->StreamDeleteOwner ||
+        Dloc->StreamDeleteContextOwner || Dloc->StreamCreate ||
+        Dloc->DirIndex || Dloc->SDirInfo || Dloc->DirectoryAppend || Dloc->DirectoryFECheckpoint ||
+        !NT_SUCCESS(Dloc->ZeroDataError) || !NT_SUCCESS(Dloc->CacheSizeError) ||
+        Dloc->ZeroDataAttempts || Dloc->ZeroDataCanRetry ||
+        Dloc->DataLoc.Length || Dloc->DataLoc.Offset > Vcb->SectorSize ||
+        Dloc->AllocLoc.Length < 0 || Dloc->AllocLoc.Offset > Vcb->SectorSize ||
+        (uint64)Dloc->AllocLoc.Length > Vcb->SectorSize - Dloc->AllocLoc.Offset ||
+        Dloc->FELoc.Offset || Dloc->FELoc.Length <= 0 || Dloc->FELoc.Length > Vcb->SectorSize ||
+        !Dloc->FELoc.Mapping || !Dloc->FileEntry || Dloc->FileEntryCapacity < Vcb->SectorSize ||
+        (Dloc->FE_Flags & (UDF_FE_FLAG_UNDER_INIT | UDF_FE_FLAG_FREE_DEFERRED |
+            UDF_FE_FLAG_CACHED_DATA_PENDING | UDF_FE_FLAG_HAS_SDIR | UDF_FE_FLAG_IS_SDIR |
+            UDF_FE_FLAG_HAS_DEL_SDIR | UDF_FE_FLAG_IS_DEL_SDIR)))
+        return STATUS_FILE_CORRUPT_ERROR;
+    Header = Dloc->FileEntry->tagIdent == TID_FILE_ENTRY ? sizeof(FILE_ENTRY) :
+        Dloc->FileEntry->tagIdent == TID_EXTENDED_FILE_ENTRY ? sizeof(EXTENDED_FILE_ENTRY) : 0;
+    Lba = Dloc->FELoc.Mapping[0].extLocation;
+    if (!Header || Dloc->FileEntryLen < Header || Dloc->FileEntryLen > Vcb->SectorSize ||
+        !Lba || Lba == LBA_OUT_OF_EXTENT || UDFGetFileSize(Scratch) ||
+        (((icbtag*)(Dloc->FileEntry + 1))->flags & ICB_FLAG_ALLOC_MASK) != ICB_FLAG_AD_IN_ICB ||
+        !UDFScratchMapIsIcbSector(Vcb, Dloc->FELoc.Mapping, Lba) ||
+        !UDFScratchMapIsIcbSector(Vcb, Dloc->DataLoc.Mapping, Lba) ||
+        (Dloc->AllocLoc.Mapping && !UDFScratchMapIsIcbSector(Vcb, Dloc->AllocLoc.Mapping, Lba)) ||
+        Dloc->DataLoc.Mapping == Dloc->FELoc.Mapping ||
+        (Dloc->AllocLoc.Mapping && (Dloc->AllocLoc.Mapping == Dloc->FELoc.Mapping ||
+                                   Dloc->AllocLoc.Mapping == Dloc->DataLoc.Mapping)) ||
+        (PVOID)Dloc->FileEntry == (PVOID)Dloc->FELoc.Mapping ||
+        (PVOID)Dloc->FileEntry == (PVOID)Dloc->DataLoc.Mapping ||
+        (PVOID)Dloc->FileEntry == (PVOID)Dloc->AllocLoc.Mapping)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Scratch->Index >= 2) {
+        Entry = UDFDirIndex(Scratch->ParentFile->Dloc->DirIndex, Scratch->Index);
+        if (!Entry || Entry->FileInfo == Scratch)
+            return STATUS_FILE_CORRUPT_ERROR; /* the namespace must already be detached */
     }
-    
-    ParentLBA = DirInfo->ParentFile->Dloc->FELoc.Mapping[0].extLocation;
-    ASSERT(ParentLBA);
-    PartNum = UDFGetRefPartNumByPhysLba(Vcb, ParentLBA);
-    fid->icb.extLength = Vcb->SectorSize;
-    fid->icb.extLocation.logicalBlockNum = UDFPhysLbaToPart(Vcb, PartNum, ParentLBA);
-    fid->icb.extLocation.partitionReferenceNum = (uint16)PartNum;
-    RtlZeroMemory(&(fid->icb.impUse), sizeof(fid->icb.impUse));
+    return STATUS_SUCCESS;
+}
 
-    ((struct FidADImpUse*)&(fid->icb.impUse))->uniqueID = 
-        (uint32)UDFGetFileUID(DirInfo->ParentFile);
+/* Media absence is confirmed before entry. Move the exact FE allocation to
+ * the existing source retirement ledger, retire the actual FI/index once,
+ * and dispose only private memory. Never restore through generic partial GC. */
+static NTSTATUS
+UDFRetireNamespaceScratch(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                          PUDF_FILE_INFO Source)
+{
+    PUDF_DATALOC_INFO Owner = Source ? Source->Dloc : NULL;
+    _SEH2_VOLATILE PUDF_FILE_INFO Scratch = NULL;
+    _SEH2_VOLATILE PUDF_DATALOC_INFO Dloc = NULL;
+    _SEH2_VOLATILE PUDF_EXTENT_RETIREMENT Retired = NULL;
+    PUDF_EXTENT_RETIREMENT Prior;
+    _SEH2_VOLATILE EXTENT_INFO Replacement = {0};
+    _SEH2_VOLATILE BOOLEAN BitmapLocked = FALSE, IndexLocked = FALSE, ReferencesLocked = FALSE;
+    _SEH2_VOLATILE BOOLEAN Detached = FALSE;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    LONG Slot, Remaining;
+    uint32 Part, i, Lba, Bytes;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    if (!Owner) return STATUS_FILE_INVALID;
+    _SEH2_TRY {
+    _SEH2_TRY {
+        if (Owner->NamespaceTarget || Owner->NamespaceTargetState != UdfNamespaceTargetNone ||
+            !NT_SUCCESS(Owner->NamespaceTargetError)) {
+            Status = STATUS_INVALID_DEVICE_STATE;
+            _SEH2_LEAVE;
+        }
+        Scratch = Owner->NamespaceScratch;
+        if (!Scratch) {
+            if (Owner->NamespaceFileInfo || Owner->NamespacePhase != UdfNamespaceNone) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            if (!Owner->RetiredExtents) _SEH2_LEAVE; /* no work or lower acquisition */
+        }
+        /* Actual callers own VCB/Main and have returned from their flushes.
+         * Refuse an inherited lower claim: the later bitmap backend can do
+         * I/O and must not run while a borrowed Dloc resource remains held.
+         * Do not upgrade or release any acquisition owned by the caller. */
+        if (ExIsResourceAcquiredSharedLite(&Vcb->BitMapResource1) ||
+            ExIsResourceAcquiredExclusiveLite(&Vcb->BitMapResource1) ||
+            ExIsResourceAcquiredSharedLite(&Vcb->DlocResource) ||
+            ExIsResourceAcquiredExclusiveLite(&Vcb->DlocResource) ||
+            ExIsResourceAcquiredSharedLite(&Vcb->DlocResource2) ||
+            ExIsResourceAcquiredExclusiveLite(&Vcb->DlocResource2)) {
+            Status = STATUS_DEVICE_BUSY;
+            _SEH2_LEAVE;
+        }
+        if (!Scratch) {
+            /* A prior memory retirement may have left only its exact range
+             * receipt. Retrying that backend never decrements another FI. */
+            Status = UDFAllocationFailureStatus(Vcb);
+            if (Status == STATUS_SUCCESS)
+                Status = FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY) ?
+                    STATUS_MEDIA_WRITE_PROTECTED : UDFCommitExtentRetirements(IrpContext, Vcb, Source);
+            _SEH2_LEAVE;
+        }
+        if (Owner->NamespacePhase != UdfNamespaceCommitted &&
+            Owner->NamespacePhase != UdfNamespaceAbortCommitted) {
+            Status = STATUS_INVALID_DEVICE_STATE;
+            _SEH2_LEAVE;
+        }
+        Status = UDFCheckNamespaceScratch(Vcb, Owner, Scratch);
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        Dloc = Scratch->Dloc;
+        Lba = Dloc->FELoc.Mapping[0].extLocation;
+        Part = UDFGetRefPartNumByPhysLba(Vcb, Lba);
+        Status = UDFPrepareExtentShrink(Vcb, Part, 0, FALSE, &Dloc->FELoc,
+            (PEXTENT_INFO)&Replacement, (PUDF_EXTENT_RETIREMENT*)&Retired);
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        if (!Retired || Retired->Count != 1 || Retired->Ranges[0].extLocation != Lba ||
+            (Retired->Ranges[0].extLength & UDF_EXTENT_LENGTH_MASK) != Vcb->SectorSize) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
+        }
+        _SEH2_TRY {
+            if (!UDFAcquireResourceExclusive(&Vcb->BitMapResource1, TRUE)) {
+                Status = STATUS_DEVICE_BUSY;
+                _SEH2_LEAVE;
+            }
+            BitmapLocked = TRUE;
+            if (!UDFAcquireResourceExclusive(&Vcb->DlocResource, TRUE)) {
+                Status = STATUS_DEVICE_BUSY;
+                _SEH2_LEAVE;
+            }
+            IndexLocked = TRUE;
+            if (!UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE)) {
+                Status = STATUS_DEVICE_BUSY;
+                _SEH2_LEAVE;
+            }
+            ReferencesLocked = TRUE;
+            Status = UDFCheckNamespaceScratch(Vcb, Owner, Scratch);
+            Slot = UDFFindDlocInMem(Vcb, Dloc);
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            if (Owner->NamespaceScratch != Scratch || Slot < 0 ||
+                Vcb->DlocList[Slot].Lba != Lba || Vcb->PendingNamespaceCount <= 0 ||
+                Vcb->PendingNamespaceCount == MAXLONG || Vcb->PendingExtentRetirements < 0) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            if (Vcb->PendingExtentRetirements >= MAXLONG - 1) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                _SEH2_LEAVE;
+            }
+            Remaining = Vcb->PendingExtentRetirements;
+            for (Prior = Owner->RetiredExtents; Prior; Prior = Prior->Next) {
+                if (Remaining-- <= 0 || !Prior->Count || Prior->Count > Prior->Capacity ||
+                    Prior->Completed > Prior->Count) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+                for (i = Prior->Completed; i < Prior->Count; i++) {
+                    Bytes = Prior->Ranges[i].extLength & UDF_EXTENT_LENGTH_MASK;
+                    if ((uint64)Lba >= Prior->Ranges[i].extLocation &&
+                        (uint64)Lba < (uint64)Prior->Ranges[i].extLocation +
+                                       (((uint64)Bytes + Vcb->SectorSize - 1) >> Vcb->SectorShift)) {
+                        Status = STATUS_FILE_CORRUPT_ERROR;
+                        _SEH2_LEAVE;
+                    }
+                }
+            }
+            Status = UDFDereferenceFileLocked(Vcb, Scratch);
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            /* No fallible call after that consume: the exact allocation
+             * owner/count is published before the namespace count retires. */
+            Retired->Next = Owner->RetiredExtents;
+            Owner->RetiredExtents = Retired;
+            Retired = NULL;
+            InterlockedIncrement(&Vcb->PendingExtentRetirements);
+            RtlZeroMemory(&Vcb->DlocList[Slot], sizeof(Vcb->DlocList[Slot]));
+            Vcb->DlocFreeHint = min(Vcb->DlocFreeHint, (ULONG)Slot);
+            Owner->NamespaceScratch = NULL;
+            Owner->NamespaceFileInfo = NULL;
+            Owner->NamespacePhase = UdfNamespaceNone;
+            Dloc->NamespaceScratchOwner = NULL;
+            Scratch->Dloc = NULL;
+            Scratch->ParentFile = NULL;
+            Scratch->TemporaryRetired = TRUE;
+            InterlockedDecrement(&Vcb->PendingNamespaceCount);
+            Detached = TRUE;
+        } _SEH2_FINALLY {
+            if (ReferencesLocked) UDFReleaseResource(&Vcb->DlocResource2);
+            if (IndexLocked) UDFReleaseResource(&Vcb->DlocResource);
+            if (BitmapLocked) UDFReleaseResource(&Vcb->BitMapResource1);
+        } _SEH2_END;
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        if (Detached) {
+            /* Preflight proved distinct buffers and no other context owner.
+             * Neither generic GC nor the bitmap backend sees this Dloc again. */
+            MyFreePool__(Dloc->DataLoc.Mapping);
+            if (Dloc->AllocLoc.Mapping) MyFreePool__(Dloc->AllocLoc.Mapping);
+            MyFreePool__(Dloc->FELoc.Mapping);
+            MyFreePool__(Dloc->FileEntry);
+            MyFreePool__(Dloc);
+            Dloc = NULL;
+            MyFreePool__(Scratch);
+            Scratch = NULL;
+            Status = UDFAllocationFailureStatus(Vcb);
+            if (Status == STATUS_SUCCESS)
+                Status = FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY) ?
+                    STATUS_MEDIA_WRITE_PROTECTED : UDFCommitExtentRetirements(IrpContext, Vcb, Source);
+        }
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (Replacement.Mapping) MyFreePool__(Replacement.Mapping);
+        if (Retired) MyFreePool__(Retired); /* private, never published */
+        if (_SEH2_AbnormalTermination())
+            UDFQuarantineNamespace(Vcb, STATUS_UNSUCCESSFUL);
+        else if (Status != STATUS_SUCCESS) {
+            if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+            UDFQuarantineNamespace(Vcb, Status);
+        }
+    } _SEH2_END;
+    return Status;
+}
 
-    UDFSetUpTag(Vcb, &fid->descTag, (uint16)DirNdx->Length, fid->descTag.tagLocation, 0);
+/* Rename/link conversion may retire only its own private, freshly created
+ * FE generation. Other aliases, opens or cache owners forbid that shortcut. */
+static BOOLEAN
+UDFPrivateTemporaryFileInfo(PUDF_FILE_INFO FileInfo)
+{
+    return FileInfo && FileInfo->Dloc && !FileInfo->Constructing &&
+        !FileInfo->ConstructionFailed && FileInfo->RefCount == 1 &&
+        !FileInfo->OpenCount && !FileInfo->Fcb &&
+        FileInfo->NextLinkedFile == FileInfo &&
+        FileInfo->Dloc->LinkRefCount == 1 && !FileInfo->Dloc->CommonFcb &&
+        !FileInfo->Dloc->CleanupOwner && !FileInfo->Dloc->CreateConstructionOwner &&
+        !FileInfo->Dloc->CreateRollbackOwner && !FileInfo->CreateConstructionParent &&
+        !FileInfo->Dloc->NamespaceScratch &&
+        (!FileInfo->Dloc->NamespaceScratchOwner ||
+         (FileInfo->NamespaceStaged &&
+          FileInfo->Dloc->NamespaceScratchOwner->NamespaceScratch == FileInfo));
+}
 
-    status = UDFWriteFile__(IrpContext, Vcb, DirInfo, DirNdx->Offset, DirNdx->Length, FALSE, Buf, &WrittenBytes);
-    if (!NT_SUCCESS(status))
-        goto cleanup;
+/* A staged FID is always deleted until its final ICB/name is ready.
+ * Persist its complete directory span before attempting target unlink;
+ * the stage's FE/parent reference remains held by Source.Dloc on error. */
+static NTSTATUS
+UDFPersistNamespaceStage(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                         PUDF_FILE_INFO Stage)
+{
+    NTSTATUS Status;
+    if (!Stage || !Stage->NamespaceStaged || !Stage->ParentFile || !Stage->FileIdent)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Status = UDFFlushFile__(IrpContext, Vcb, Stage, UDF_FLUSH_FLAGS_LITE);
+    if (NT_SUCCESS(Status))
+        Status = UDFFlushFile__(IrpContext, Vcb, Stage->ParentFile, UDF_FLUSH_FLAGS_LITE);
+    if (NT_SUCCESS(Status))
+        Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+    return Status;
+}
 
-    DirNdx->FileInfo = DirInfo->ParentFile;
-    DirNdx->FileEntryLoc = fid->icb.extLocation;
+static NTSTATUS
+UDFPublishNamespaceStage(PVCB Vcb, PUDF_FILE_INFO Stage, uint8 Characteristics)
+{
+    PDIR_INDEX_HDR Header;
+    PDIR_INDEX_ITEM Entry;
+    if (!Stage || !Stage->NamespaceStaged || !Stage->ParentFile || !Stage->FileIdent ||
+        (Characteristics & FILE_DELETED))
+        return UDFQuarantineNamespace(Vcb, STATUS_FILE_CORRUPT_ERROR);
+    Header = Stage->ParentFile->Dloc->DirIndex;
+    Entry = Header ? UDFDirIndex(Header, Stage->Index) : NULL;
+    if (!Entry || Entry->FileInfo != Stage || !Header->DelCount ||
+        !(Entry->FileCharacteristics & FILE_DELETED) ||
+        !(Stage->FileIdent->fileCharacteristics & FILE_DELETED))
+        return UDFQuarantineNamespace(Vcb, STATUS_FILE_CORRUPT_ERROR);
+    Entry->FileCharacteristics = Characteristics;
+    Stage->FileIdent->fileCharacteristics = Characteristics;
+    Entry->FI_Flags |= UDF_FI_FLAG_FI_MODIFIED;
+    Stage->NamespaceStaged = FALSE;
+    Header->DelCount--;
+    if (!UDFIsAStreamDir(Stage->ParentFile)) {
+        UDFChangeFileCounter(Vcb, !(Characteristics & FILE_DIRECTORY), TRUE);
+        if (Characteristics & FILE_DIRECTORY)
+            UDFIncFileLinkCount(Stage->ParentFile);
+    }
+    return STATUS_SUCCESS;
+}
 
-cleanup:
-    MyFreePool__(Buf);
-    return status;
+/* The submitted FID may or may not be on disk. Until its confirming
+ * barrier, hide its private scratch FI from name lookup/enumeration while
+ * retaining every allocation and reference. This is not an on-media undo. */
+static VOID
+UDFHideUncertainNamespaceStage(PVCB Vcb, PUDF_FILE_INFO Stage)
+{
+    PDIR_INDEX_HDR Header = Stage->ParentFile->Dloc->DirIndex;
+    PDIR_INDEX_ITEM Entry = UDFDirIndex(Header, Stage->Index);
+    if (!Stage->NamespaceStaged && Entry && Entry->FileInfo == Stage) {
+        uint8 Characteristics = Entry->FileCharacteristics;
+        Entry->FileCharacteristics |= FILE_DELETED;
+        Stage->FileIdent->fileCharacteristics |= FILE_DELETED;
+        Stage->NamespaceStaged = TRUE;
+        Header->DelCount++;
+        if (!UDFIsAStreamDir(Stage->ParentFile)) {
+            UDFChangeFileCounter(Vcb, !(Characteristics & FILE_DIRECTORY), FALSE);
+            if (Characteristics & FILE_DIRECTORY)
+                UDFDecFileLinkCount(Stage->ParentFile);
+        }
+    }
+}
+
+/* Prepare the surviving source FE, then confirm its destination FID
+ * before the caller is allowed to tombstone the original source name.
+ * Convert exceptions to the same retained first-error path as NTSTATUS. */
+static NTSTATUS
+UDFCommitRenameDestination(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                           PUDF_FILE_INFO Source, PUDF_FILE_INFO Stage)
+{
+    PDIR_INDEX_ITEM SourceEntry, Entry;
+    NTSTATUS Status = STATUS_SUCCESS;
+    uint32 PartNum;
+    SourceEntry = UDFDirIndex(Source->ParentFile->Dloc->DirIndex, Source->Index);
+    Entry = UDFDirIndex(Stage->ParentFile->Dloc->DirIndex, Stage->Index);
+    PartNum = UDFGetRefPartNumByPhysLba(Vcb, Source->Dloc->FELoc.Mapping[0].extLocation);
+    if (!SourceEntry || !Entry || !Source->FileIdent || !Stage->FileIdent ||
+        PartNum == (uint32)-1)
+        return UDFQuarantineNamespace(Vcb, STATUS_FILE_CORRUPT_ERROR);
+    _SEH2_TRY {
+        Stage->FileIdent->icb = Source->FileIdent->icb;
+        Stage->FileIdent->fileVersionNum = Source->FileIdent->fileVersionNum;
+        Entry->FileEntryLoc = SourceEntry->FileEntryLoc;
+        Source->Dloc->NamespacePhase = UdfNamespaceSourcePreparing;
+        UDFIncFileLinkCount(Source);
+        Status = UDFFlushFE(IrpContext, Vcb, Source, PartNum);
+        if (NT_SUCCESS(Status))
+            Status = UDFPublishNamespaceStage(Vcb, Stage,
+                SourceEntry->FileCharacteristics & ~FILE_DELETED);
+        if (NT_SUCCESS(Status)) {
+            Source->Dloc->NamespacePhase = UdfNamespaceDestinationSubmitted;
+            Status = UDFFlushFI(IrpContext, Vcb, Stage, PartNum);
+        }
+        if (NT_SUCCESS(Status))
+            Status = UDFFlushFile__(IrpContext, Vcb, Stage->ParentFile, UDF_FLUSH_FLAGS_LITE);
+        if (NT_SUCCESS(Status))
+            Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    if (!NT_SUCCESS(Status)) {
+        UDFHideUncertainNamespaceStage(Vcb, Stage);
+        return UDFQuarantineNamespace(Vcb, Status);
+    }
+    Source->Dloc->NamespacePhase = UdfNamespaceDestinationCommitted;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+UDFAbortNamespaceStage(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                       PUDF_FILE_INFO Source)
+{
+    PUDF_FILE_INFO Stage = Source->Dloc->NamespaceScratch;
+    PDIR_INDEX_ITEM Entry;
+    NTSTATUS Status;
+    if (!Stage || !Stage->NamespaceStaged || !Stage->FileIdent || !Stage->ParentFile ||
+        Stage->Dloc->NamespaceScratchOwner != Source->Dloc)
+        return UDFQuarantineNamespace(Vcb, STATUS_FILE_CORRUPT_ERROR);
+    Entry = UDFDirIndex(Stage->ParentFile->Dloc->DirIndex, Stage->Index);
+    if (!Entry || Entry->FileInfo != Stage || !(Entry->FileCharacteristics & FILE_DELETED) ||
+        !(Stage->FileIdent->fileCharacteristics & FILE_DELETED))
+        return UDFQuarantineNamespace(Vcb, STATUS_FILE_CORRUPT_ERROR);
+    /* A successful retry must leave a real tombstone, not an unwritten
+     * hole in the enlarged directory. It is then safe to retire its FE. */
+    Status = UDFPersistNamespaceStage(IrpContext, Vcb, Stage);
+    if (Status != STATUS_SUCCESS)
+        return UDFQuarantineNamespace(Vcb, NT_SUCCESS(Status) ? STATUS_IO_DEVICE_ERROR : Status);
+    Source->Dloc->NamespacePhase = UdfNamespaceAbortCommitted;
+    Entry->FileInfo = NULL;
+    MyFreePool__(Stage->FileIdent);
+    Stage->FileIdent = NULL;
+    Stage->NamespaceStaged = FALSE;
+    return UDFRetireNamespaceScratch(IrpContext, Vcb, Source);
+}
+
+/* Keep incomplete construction distinct from a completed ordinary open.
+ * Neither path manufactures an FI reference or drops an early reader pin.
+ * UNDER_INIT remains set on an incomplete FE. The enclosing exclusive VCB
+ * and parent FCB resources protect this non-I/O ownership handoff. */
+static VOID
+UDFRetainFailedNamespaceStage(PVCB Vcb, PUDF_FILE_INFO Source,
+                            PUDF_FILE_INFO Directory, PUDF_FILE_INFO Stage,
+                            BOOLEAN HardLink, NTSTATUS Reason)
+{
+    NTSTATUS Status;
+    if (Stage->CreateConstructionParent ||
+        (Stage->Dloc && Stage->Dloc->CreateConstructionOwner)) {
+        /* The constructor owner already holds its exact generation and
+         * close barrier (a parent token only after binding). Do not invent
+         * a successful FI open or install a second scratch owner. */
+        UDFQuarantineCreateConstruction(Vcb, Stage, Reason);
+        return;
+    }
+    if (Stage->Dloc->NamespaceScratchOwner) {
+        /* The scratch admission may have finished before its caller set
+         * StageOwned. Never increment its close count or overwrite it. */
+        UDFQuarantineNamespace(Vcb, Reason);
+        return;
+    }
+    if (Stage->Constructing || Stage->ConstructionReferenceOwned ||
+        !Stage->RefCount || Stage->ConstructionFailed) {
+        UDFRetainFailedCreateConstruction(Vcb, Stage, Directory, Reason);
+        return;
+    }
+    Status = UDFOwnNamespaceScratch(Vcb, Source, HardLink ? Stage : Source, Stage);
+    if (Status != STATUS_SUCCESS) {
+        UDFRetainFailedCreateConstruction(Vcb, Stage, Directory, Reason);
+        return;
+    }
+    Stage->ConstructionFailed = TRUE;
+    Stage->CleanupPending = TRUE;
+    UDFQuarantineNamespace(Vcb, Reason);
+}
+
+/* Prepare a hidden destination before removing an existing target. All
+ * create-time FE/FID/name/index/mapping allocations precede that removal.
+ * This does not make arbitrary later I/O/serialization failures atomic. */
+static NTSTATUS
+UDFStageNamespaceDestination(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    BOOLEAN IgnoreCase, BOOLEAN Replace, BOOLEAN HardLink,
+    PUNICODE_STRING Name, PUDF_FILE_INFO Directory, PUDF_FILE_INFO Source,
+    uint_di ExcludedSourceIndex, PUDF_FILE_INFO* Result, PBOOLEAN TargetRemoved)
+{
+    _SEH2_VOLATILE PUDF_FILE_INFO Target = NULL, Stage = NULL, TargetOpen = NULL;
+    _SEH2_VOLATILE PFCB TargetFcb = NULL;
+    _SEH2_VOLATILE BOOLEAN TargetAcquired = FALSE;
+    _SEH2_VOLATILE BOOLEAN StageOwned = FALSE, TargetOwned = FALSE;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS CloseStatus;
+    uint_di Index = 0, ExcludedIndex = ExcludedSourceIndex;
+    *Result = NULL;
+    *TargetRemoved = FALSE;
+    if (!Name || !Name->Buffer || !Name->Length || Name->Length % sizeof(WCHAR) ||
+        Name->Length > MAXUSHORT - sizeof(WCHAR))
+        return STATUS_OBJECT_NAME_INVALID;
+    _SEH2_TRY {
+        Status = UDFFindFile(Vcb, IgnoreCase, TRUE, Name, Directory, &Index);
+        if (NT_SUCCESS(Status) && Index != ExcludedSourceIndex) {
+            if (!Replace || Index < 2) {
+                Status = STATUS_OBJECT_NAME_COLLISION;
+                _SEH2_LEAVE;
+            }
+            Status = UDFOpenFile__(IrpContext, Vcb, IgnoreCase, TRUE, Name,
+                                    Directory, (PUDF_FILE_INFO*)&Target, &Index);
+            if (!NT_SUCCESS(Status))
+                _SEH2_LEAVE;
+            TargetOpen = Target; /* exact successful named-open token */
+            if (Target->Dloc == Source->Dloc) {
+                Status = HardLink ? STATUS_SUCCESS : STATUS_OBJECT_NAME_COLLISION;
+                _SEH2_LEAVE;
+            }
+            TargetFcb = Target->Fcb;
+            /* A parentless canonical by-ID alias is not a substitute for
+             * ownership of this namespace link. Keep that case fail closed. */
+            if (Target->Dloc->CommonFcb && Target->Dloc->CommonFcb != TargetFcb) {
+                Status = STATUS_SHARING_VIOLATION;
+                _SEH2_LEAVE;
+            }
+            if (TargetFcb) {
+                if (!UDFAcquireFcbExclusive(IrpContext, TargetFcb, TRUE)) {
+                    Status = STATUS_SHARING_VIOLATION;
+                    _SEH2_LEAVE;
+                }
+                TargetAcquired = TRUE;
+                if (TargetFcb->TeardownInProgress || !TargetFcb->FileInfo ||
+                    TargetFcb->FileInfo->Dloc != Target->Dloc) {
+                    Status = STATUS_FILE_INVALID;
+                    _SEH2_LEAVE;
+                }
+            }
+            if (TargetFcb && UDFIsLinkDeletePending(TargetFcb, Target)) {
+                Status = STATUS_DELETE_PENDING;
+                _SEH2_LEAVE;
+            }
+            if (TargetFcb && TargetFcb->ShareAccess.SharedDelete < TargetFcb->ShareAccess.OpenCount) {
+                Status = STATUS_SHARING_VIOLATION;
+                _SEH2_LEAVE;
+            }
+            Status = UDFDoesOSAllowFileToBeTargetForRename__(Target);
+            if (!NT_SUCCESS(Status))
+                _SEH2_LEAVE;
+            ExcludedIndex = Index;
+        } else if (!NT_SUCCESS(Status) && Status != STATUS_OBJECT_NAME_NOT_FOUND) {
+            _SEH2_LEAVE;
+        }
+        Status = UDFCreateFileInternal(IrpContext, Vcb, IgnoreCase, Name,
+            UDFGetFileEALength(Source), 0,
+            Source->Dloc->FileEntry->tagIdent == TID_EXTENDED_FILE_ENTRY,
+            TRUE, Directory, (PUDF_FILE_INFO*)&Stage, ExcludedIndex, TRUE, NULL);
+        if (!NT_SUCCESS(Status))
+            _SEH2_LEAVE;
+        Status = UDFOwnNamespaceScratch(Vcb, Source, HardLink ? Stage : Source, Stage);
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        StageOwned = TRUE;
+        if (!UDFPrivateTemporaryFileInfo(Stage)) {
+            Status = UDFQuarantineNamespace(Vcb, STATUS_SHARING_VIOLATION);
+            _SEH2_LEAVE;
+        }
+        Status = UDFPersistNamespaceStage(IrpContext, Vcb, Stage);
+        if (!NT_SUCCESS(Status)) {
+            Status = UDFQuarantineNamespace(Vcb, Status);
+            _SEH2_LEAVE;
+        }
+        if (Target) {
+            uint32 PartNum;
+            /* A refused replacement leaves streams and their live owners
+             * intact. Data/cache and FE writeback precede any namespace edit. */
+            if (UDFStreamDirectoryHasLiveHandles(UDFHasAStreamDir(Target) ?
+                                                Target->Dloc->SDirInfo : NULL)) {
+                Status = STATUS_CANNOT_DELETE;
+                _SEH2_LEAVE;
+            }
+            if (TargetFcb && TargetFcb->FcbNonpaged->SegmentObject.DataSectionObject) {
+                IO_STATUS_BLOCK IoStatus;
+                IoStatus.Status = STATUS_SUCCESS;
+                IoStatus.Information = 0;
+                CcFlushCache(&TargetFcb->FcbNonpaged->SegmentObject, NULL, 0, &IoStatus);
+                Status = IoStatus.Status;
+                if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+                Target->Dloc->FE_Flags &= ~UDF_FE_FLAG_CACHED_DATA_PENDING;
+            }
+            Status = UDFFlushFile__(IrpContext, Vcb, Target, UDF_FLUSH_FLAGS_LITE);
+            if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+            Status = UDFOwnNamespaceTarget(Vcb, Source, Target,
+                (PUDF_FILE_INFO*)&TargetOpen, (PBOOLEAN)&TargetOwned);
+            if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+            /* FALSE detaches only the name. The retained FI still reserves
+             * every old FE/data block; no bitmap bit becomes reusable yet. */
+            Status = UDFUnlinkFile__(IrpContext, Vcb, Target, FALSE);
+            if (NT_SUCCESS(Status)) {
+                *TargetRemoved = TRUE;
+                Source->Dloc->NamespacePhase = UdfNamespaceTargetDetached;
+                if (TargetFcb && !UDFGetFileNameLinkCount(Target))
+                    TargetFcb->FcbState |= UDF_FCB_DELETED;
+                PartNum = UDFGetRefPartNumByPhysLba(Vcb,
+                    Target->Dloc->FELoc.Mapping[0].extLocation);
+                Status = PartNum == (uint32)-1 ? STATUS_FILE_CORRUPT_ERROR :
+                    UDFFlushFI(IrpContext, Vcb, Target, PartNum);
+                if (NT_SUCCESS(Status))
+                    Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+                if (NT_SUCCESS(Status)) {
+                    Source->Dloc->NamespacePhase = UdfNamespaceTargetTombstoneCommitted;
+                    UDFNoteCommittedUnlink(Vcb, TargetFcb, Target);
+                }
+            }
+            if (!NT_SUCCESS(Status))
+                Status = UDFQuarantineNamespace(Vcb, Status);
+        }
+    } _SEH2_FINALLY {
+        BOOLEAN Abnormal = _SEH2_AbnormalTermination();
+        _SEH2_TRY {
+            if (Stage && Stage->Dloc && !StageOwned &&
+                (Abnormal || (!NT_SUCCESS(Status) && Stage->ParentFile))) {
+                UDFRetainFailedNamespaceStage(Vcb, Source, Directory, Stage, HardLink,
+                    Abnormal ? STATUS_UNSUCCESSFUL : Status);
+                StageOwned = TRUE;
+            }
+            if (TargetOpen) {
+                CloseStatus = UDFReleaseCreateReference(IrpContext, Vcb,
+                    (PUDF_FILE_INFO*)&TargetOpen, TRUE);
+                if (NT_SUCCESS(CloseStatus) && !Abnormal && NT_SUCCESS(Status))
+                    CloseStatus = UDFCompleteFileClose(IrpContext, Vcb, Target);
+                if (!Abnormal && NT_SUCCESS(Status)) Status = CloseStatus;
+            }
+            if (Target && !TargetOpen && !TargetOwned && !Abnormal &&
+                (UDFCleanUpFile__(Vcb, Target) & UDF_FREE_FILEINFO))
+                MyFreePool__(Target);
+            if (StageOwned && (Abnormal || !NT_SUCCESS(Status))) {
+                if (Abnormal || TargetOwned || FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY))
+                    UDFQuarantineNamespace(Vcb, Abnormal ? STATUS_UNSUCCESSFUL : Status);
+                else
+                    UDFAbortNamespaceStage(IrpContext, Vcb, Source);
+            } else if (Stage && !StageOwned && !Abnormal) {
+                /* A failed initializer has no successful open to close. */
+                if (UDFCleanUpFile__(Vcb, Stage) & UDF_FREE_FILEINFO)
+                    MyFreePool__(Stage);
+            }
+        } _SEH2_FINALLY {
+            BOOLEAN CleanupAbnormal = Abnormal || _SEH2_AbnormalTermination();
+            _SEH2_TRY {
+                if (TargetOpen) {
+                    /* Release can raise before entering its checked group.
+                     * Keep that actual unspent ordinary token explicitly;
+                     * a token consumed before a later callback is NULL. */
+                    UDFRetainOrdinaryOpenReference(Vcb,
+                        (PUDF_FILE_INFO*)&TargetOpen,
+                        NT_SUCCESS(Status) ? STATUS_UNSUCCESSFUL : Status);
+                }
+                if (CleanupAbnormal) {
+                    if (Stage && Stage->Dloc && !StageOwned) {
+                        UDFRetainFailedNamespaceStage(Vcb, Source, Directory, Stage, HardLink,
+                                                        STATUS_UNSUCCESSFUL);
+                        StageOwned = TRUE;
+                    }
+                    if (StageOwned || *TargetRemoved)
+                        UDFQuarantineNamespace(Vcb, STATUS_UNSUCCESSFUL);
+                }
+            } _SEH2_FINALLY {
+                if (TargetAcquired)
+                    UDFReleaseFcb(IrpContext, TargetFcb);
+            } _SEH2_END;
+        } _SEH2_END;
+    } _SEH2_END;
+    if (NT_SUCCESS(Status))
+        *Result = Stage;
+    return Status;
+}
+
+/* Transfer a freshly created link's old FE hold to a preallocated
+ * private FI, then acquire exactly one hold on the surviving Dloc. The
+ * temporary parent contribution remains owned by Scratch until retirement;
+ * the new link contributes its own separate parent hold. No aggregate
+ * LinkRefCount copying and no shell-only Dloc free is permitted. */
+static NTSTATUS
+UDFAdoptHardLinkScratch(PVCB Vcb, PUDF_FILE_INFO Source,
+                       PUDF_FILE_INFO Link, PUDF_FILE_INFO Scratch)
+{
+    PUDF_DATALOC_INFO Old, New = Source->Dloc;
+    NTSTATUS Status = STATUS_SHARING_VIOLATION;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    if (!UDFPrivateTemporaryFileInfo(Link) || !Link->ParentFile ||
+        New == Link->Dloc || New->CleanupOwner ||
+        New->NamespaceScratch != Link || New->NamespaceFileInfo != Link ||
+        Link->Dloc->NamespaceScratchOwner != New || !Link->NamespaceStaged ||
+        New->NamespaceScratchOwner || Source->Constructing || Source->ConstructionFailed)
+        goto out;
+    if (New->LinkRefCount == MAXULONG || Link->ParentFile->OpenCount == MAXULONG) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto out;
+    }
+    Old = Link->Dloc;
+    Scratch->Dloc = Old;
+    Scratch->NextLinkedFile = Scratch->PrevLinkedFile = Scratch;
+    Scratch->ParentFile = Link->ParentFile;
+    Scratch->RefCount = 1; /* transferred from the fresh Link/Old pair */
+    Old->LinkedFileInfo = Scratch;
+    Link->Dloc = New;
+    InterlockedIncrement((PLONG)&New->LinkRefCount); /* one exact hold */
+    InterlockedIncrement((PLONG)&Link->ParentFile->OpenCount);
+    UDFInsertLinkedFile(Link, Source);
+    New->NamespaceScratch = Scratch;
+    New->NamespaceFileInfo = Link;
+    Old->NamespaceScratchOwner = New;
+    /* PendingNamespaceCount was acquired by the stage; retain it. */
+    Status = STATUS_SUCCESS;
+out:
+    UDFReleaseResource(&Vcb->DlocResource2);
+    return Status;
 }
 
 /*
@@ -4666,165 +7041,148 @@ UDFRenameMoveFile__(
     IN PUNICODE_STRING fn,       // destination
     IN OUT PUDF_FILE_INFO DirInfo1,
     IN OUT PUDF_FILE_INFO DirInfo2,
-    IN OUT PUDF_FILE_INFO FileInfo  // source (opened)
+    IN OUT PUDF_FILE_INFO FileInfo, // source (opened)
+    OUT PBOOLEAN NamespaceChanged,
+    OUT PBOOLEAN TargetRemoved
     )
 {
-    PUDF_FILE_INFO FileInfo2;
+    PUDF_FILE_INFO FileInfo2 = NULL;
     NTSTATUS status;
+    NTSTATUS CompletionStatus = STATUS_SUCCESS;
+    BOOLEAN ReplaceRequested = *Replace;
     PDIR_INDEX_ITEM DirNdx1;
     PDIR_INDEX_ITEM DirNdx2;
     uint_di i,j;
-    BOOLEAN Recovery = FALSE;
-    BOOLEAN SameFE = FALSE;
+    uint32 PartNum;
+    uint_di ExcludedSourceIndex = (uint_di)-1;
     uint32 NTAttr = 0;
-    long_ad SrcIcb;
+
+    *NamespaceChanged = FALSE;
+    *TargetRemoved = FALSE;
+    *Replace = FALSE;
+
+    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY)
+        return STATUS_ACCESS_DENIED;
 
     // validate FileInfo
     ValidateFileInfo(DirInfo1);
     ValidateFileInfo(DirInfo2);
     ValidateFileInfo(FileInfo);
-    if (FileInfo->Dloc->FE_Flags & UDF_FE_FLAG_NEW_UNPUBLISHED) {
-        status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
-        if (!NT_SUCCESS(status))
-            return status;
-    }
+    if (!NT_SUCCESS(FileInfo->Dloc->ZeroDataError))
+        return FileInfo->Dloc->ZeroDataError;
+    if (!FileInfo->ParentFile || !FileInfo->FileIdent ||
+        (FileInfo->Index < 2 && !UDFIsAStreamDir(FileInfo)))
+        return STATUS_INVALID_PARAMETER;
+    if (FileInfo->Dloc->NamespaceScratch || FileInfo->Dloc->NamespaceTarget ||
+        FileInfo->Dloc->NamespaceTargetState != UdfNamespaceTargetNone ||
+        !NT_SUCCESS(FileInfo->Dloc->NamespaceTargetError) ||
+        FileInfo->Dloc->NamespaceScratchOwner)
+        return STATUS_SHARING_VIOLATION;
+    if (UDFLocateAnyParallelFI(FileInfo))
+        return STATUS_SHARING_VIOLATION; /* no partial per-link owner transfer */
+    if (UDFGetFileLinkCount(FileInfo) >= UDF_MAX_LINK_COUNT)
+        return STATUS_TOO_MANY_LINKS; /* the temporary second name needs one link */
+    /* Commit the prior source generation before staging or replacing a
+     * target. A source flush failure cannot remove that target name. */
+    status = UDFFlushFile__(IrpContext, Vcb, FileInfo, UDF_FLUSH_FLAGS_LITE);
+    if (!NT_SUCCESS(status))
+        return status;
 
 
     i = j = 0;
-    if (DirInfo1 == DirInfo2) {
+    if (DirInfo1->Dloc == DirInfo2->Dloc) {
         if (NT_SUCCESS(status = UDFFindFile(Vcb, IgnoreCase, TRUE, fn, DirInfo2, &j)) &&
-           (j==FileInfo->Index) ) {
-            // case-only rename
-            uint8* CS0;
-            SIZE_T Nlen, /* l, FIXME ReactOS */ IUl;
-
-            // prepare filename
-            UDFCompressUnicode(fn, &CS0, &Nlen);
-            if (!CS0) return STATUS_INSUFFICIENT_RESOURCES;
-/*            if (Nlen > UDF_NAME_LEN) {
-                if (CS0) MyFreePool__(CS0);
-                return STATUS_OBJECT_NAME_INVALID;
-            }*/
-            // allocate memory for FI
-            DirNdx2 = UDFDirIndex(DirInfo2->Dloc->DirIndex,j);
-            IUl = DirNdx2->FileInfo->FileIdent->lengthOfImpUse;
-#if 0
-            l = (sizeof(FILE_IDENT_DESC) + Nlen + IUl + 3) & ~((uint32)3);
-#endif
-
-            RtlCopyMemory( ((uint8*)(DirNdx2->FileInfo->FileIdent+1))+IUl, CS0, Nlen);
-            RtlCopyMemory(DirNdx2->FName.Buffer, fn->Buffer, fn->Length);
-
-            if (CS0) MyFreePool__(CS0);
-
-            DirNdx2->FI_Flags |= UDF_FI_FLAG_FI_MODIFIED;
-            UDFBuildHashEntry(Vcb, &(DirNdx2->FName), &(DirNdx2->hashes), HASH_ALL);
-            return STATUS_SUCCESS;
-/*        } else
-        if (!NT_SUCCESS(status) && (fn->Length == UDFDirIndex(DirInfo2->Dloc->DirIndex, j=FileInfo->Index)->FName.Length)) {
-            // target file doesn't exist, but name lengthes are equal
-            RtlCopyMemory((DirNdx1 = UDFDirIndex(DirInfo1->Dloc->DirIndex,j))->FName.Buffer, fn->Buffer, fn->Length);
-            DirNdx1->FI_Flags |= UDF_FI_FLAG_FI_MODIFIED;
-            UDFBuildHashEntry(Vcb, &(DirNdx1->FName), &(DirNdx1->hashes), HASH_ALL);
-            return STATUS_SUCCESS;*/
-        }
-    }
-
-    // PHASE 0
-    // try to create new FileIdent & FileEntry in Dir2
-
-RenameRetry:
-    if (!NT_SUCCESS(status = UDFCreateFile__(IrpContext, Vcb, IgnoreCase, fn, UDFGetFileEALength(FileInfo),
-                    0, (FileInfo->Dloc->FileEntry->tagIdent == TID_EXTENDED_FILE_ENTRY),
-                    TRUE, DirInfo2, &FileInfo2))) {
-        UDFCleanUpFile__(Vcb, FileInfo2);
-        if (FileInfo2) MyFreePool__(FileInfo2);
-        if (status == STATUS_ACCESS_DENIED) {
-            // try to recover >;->
-            if ((*Replace) && !Recovery) {
-                Recovery = TRUE;
-                status = UDFOpenFile__(IrpContext, Vcb, IgnoreCase, TRUE, fn, DirInfo2, &FileInfo2, NULL);
-                if (!NT_SUCCESS(status)) {
-
-                    goto cleanup_and_abort_rename;
+            j == FileInfo->Index) {
+            PFILE_IDENT_DESC NewFid;
+            uint32 NewFidLength;
+            UNICODE_STRING NewIndexName;
+            uint32 HeaderBytes;
+            if (FileInfo->FileIdentLen < sizeof(FILE_IDENT_DESC))
+                return STATUS_FILE_CORRUPT_ERROR;
+            HeaderBytes = sizeof(FILE_IDENT_DESC) + FileInfo->FileIdent->lengthOfImpUse;
+            DirNdx2 = UDFDirIndex(DirInfo2->Dloc->DirIndex, j);
+            if (!DirNdx2 || FileInfo->FileIdentLen != DirNdx2->Length ||
+                HeaderBytes > FileInfo->FileIdentLen ||
+                FileInfo->FileIdent->lengthFileIdent > FileInfo->FileIdentLen - HeaderBytes)
+                return STATUS_FILE_CORRUPT_ERROR;
+            status = UDFBuildFileIdent(Vcb, fn, &FileInfo->FileIdent->icb,
+                FileInfo->FileIdent->lengthOfImpUse, &NewFid, &NewFidLength);
+            if (!NT_SUCCESS(status))
+                return status;
+            if (NewFidLength == DirNdx2->Length) {
+                /* The serialized record, not its UTF-16 spelling, decides
+                 * whether this directory slot can be reused in place. */
+                RtlZeroMemory(&NewIndexName, sizeof(NewIndexName));
+                NewIndexName.Buffer = MyAllocatePool__(NonPagedPool,
+                                                        fn->Length + sizeof(WCHAR));
+                if (!NewIndexName.Buffer) {
+                    MyFreePool__(NewFid);
+                    return STATUS_INSUFFICIENT_RESOURCES;
                 }
-                // file opened successfully
-;
-                status = UDFDoesOSAllowFileToBeTargetForRename__(FileInfo2);
-
-                if (!NT_SUCCESS(status)) {
-
-                    UDFCloseFile__(IrpContext, Vcb, FileInfo2);
-                    goto cleanup_and_abort_rename;
+                NewIndexName.Length = fn->Length;
+                NewIndexName.MaximumLength = fn->Length + sizeof(WCHAR);
+                RtlCopyMemory(NewIndexName.Buffer, fn->Buffer, fn->Length);
+                NewIndexName.Buffer[fn->Length / sizeof(WCHAR)] = 0;
+                NewFid->descTag = FileInfo->FileIdent->descTag;
+                NewFid->fileVersionNum = FileInfo->FileIdent->fileVersionNum;
+                NewFid->fileCharacteristics = FileInfo->FileIdent->fileCharacteristics;
+                RtlCopyMemory(NewFid + 1, FileInfo->FileIdent + 1,
+                               FileInfo->FileIdent->lengthOfImpUse);
+                MyFreePool__(FileInfo->FileIdent);
+                FileInfo->FileIdent = NewFid;
+                FileInfo->FileIdentLen = NewFidLength;
+                if (DirNdx2->FName.Buffer)
+                    MyFreePool__(DirNdx2->FName.Buffer);
+                DirNdx2->FName = NewIndexName;
+                if (DirInfo1 != DirInfo2) {
+                    InterlockedExchangeAdd((PLONG)&DirInfo2->OpenCount, FileInfo->RefCount);
+                    InterlockedExchangeAdd((PLONG)&DirInfo1->OpenCount,
+                                            -((LONG)FileInfo->RefCount));
+                    FileInfo->ParentFile = DirInfo2;
                 }
-
-                // TODO: Refactor — don't use UDFCreateFile__ in rename path.
-                // Use direct FID unlink + create link instead.
-                // Quick fix: if target's Dloc == source's Dloc, the internal open got the
-                // wrong file (shared Dloc bug). Unlink would destroy the source data.
-                if (FileInfo2->Dloc == FileInfo->Dloc) {
-
-                    UDFCloseFile__(IrpContext, Vcb, FileInfo2);
-                    status = STATUS_ACCESS_DENIED;
-                    goto cleanup_and_abort_rename;
-                }
-                status = UDFUnlinkFile__(IrpContext, Vcb, FileInfo2, TRUE);
-
-                // Mark FCB as deleted to prevent it from going into delayed close queue
-                if (FileInfo2->Fcb) {
- 
-                    FileInfo2->Fcb->FcbState |= UDF_FCB_DELETED;
-                }
-                UDFCloseFile__(IrpContext, Vcb, FileInfo2);
-
-                if (UDFCleanUpFile__(Vcb, FileInfo2)) {
-
-                    MyFreePool__(FileInfo2);
-                    FileInfo2 = NULL;
-                    if (SameFE)
-                        return status;
-                } else {
-                    // we get here if the FileInfo has associated
-                    // system-specific Fcb
-                    // Such fact means that not all system references
-                    // has already gone (except Linked file case)
-
-                    // Note: After UDFUnlinkFile__ link count is 0, which is expected
-                    // Only return ACCESS_DENIED if unlink itself failed
-                    if (!NT_SUCCESS(status))
-                        status = STATUS_ACCESS_DENIED;
-                }
-
-                if (NT_SUCCESS(status)) goto RenameRetry;
-cleanup_and_abort_rename:
-
-                if (FileInfo2 && UDFCleanUpFile__(Vcb, FileInfo2)) {
-                    MyFreePool__(FileInfo2);
-                    FileInfo2 = NULL;
-                }
-            } else {
-                status = STATUS_OBJECT_NAME_COLLISION;
+                DirNdx2->FI_Flags |= UDF_FI_FLAG_FI_MODIFIED;
+                *NamespaceChanged = TRUE;
+                UDFBuildHashEntry(Vcb, &DirNdx2->FName, &DirNdx2->hashes, HASH_ALL);
+                return STATUS_SUCCESS;
             }
+            MyFreePool__(NewFid);
+            /* A different CS0 length (or a short-name alias) needs a new
+             * record. Ignore only this source slot during collision search;
+             * all other case-insensitive/8.3 collisions still reject it. */
+            ExcludedSourceIndex = j;
         }
-        return status;
     }
+
+    /* Allocate a complete deleted destination slot before target removal.
+     * The helper returns an exact source-owned scratch generation. */
+    status = UDFStageNamespaceDestination(IrpContext, Vcb, IgnoreCase,
+        ReplaceRequested, FALSE, fn, DirInfo2, FileInfo,
+        ExcludedSourceIndex, &FileInfo2, TargetRemoved);
+    *Replace = *TargetRemoved;
+    if (!NT_SUCCESS(status))
+        return status;
+    if (!FileInfo2 || !UDFPrivateTemporaryFileInfo(FileInfo2))
+        return UDFQuarantineNamespace(Vcb, STATUS_FILE_CORRUPT_ERROR);
     // update pointers
     DirNdx1 = UDFDirIndex(DirInfo1->Dloc->DirIndex, i = FileInfo->Index);
     DirNdx2 = UDFDirIndex(DirInfo2->Dloc->DirIndex, j = FileInfo2->Index);
 
-    // copy file attributes to newly created FileIdent
+
     NTAttr = UDFAttributesToNT(DirNdx1, FileInfo->Dloc->FileEntry);
-    FileInfo2->FileIdent->fileVersionNum = FileInfo->FileIdent->fileVersionNum;
-    SrcIcb = FileInfo->FileIdent->icb;
-    // unlink source FileIdent
-    if (!NT_SUCCESS(status = UDFUnlinkFile__(IrpContext, Vcb, FileInfo, FALSE))) {
-        // kill newly created entry
-        UDFFlushFile__(IrpContext, Vcb, FileInfo2, 0);
-        UDFUnlinkFile__(IrpContext, Vcb, FileInfo2, TRUE);
-        UDFCloseFile__(IrpContext, Vcb, FileInfo2);
-        UDFCleanUpFile__(Vcb, FileInfo2);
-        MyFreePool__(FileInfo2);
+    PartNum = UDFGetRefPartNumByPhysLba(Vcb,
+        FileInfo->Dloc->FELoc.Mapping[0].extLocation);
+    if (PartNum == (uint32)-1)
+        return UDFQuarantineNamespace(Vcb, STATUS_FILE_CORRUPT_ERROR);
+    status = UDFCommitRenameDestination(IrpContext, Vcb, FileInfo, FileInfo2);
+    if (!NT_SUCCESS(status))
         return status;
+
+    /* Only a confirmed destination permits removal of the old source.
+     * Its unlink consumes the temporary second name's link-count increment. */
+    status = UDFUnlinkFile__(IrpContext, Vcb, FileInfo, FALSE);
+    if (!NT_SUCCESS(status)) {
+        UDFHideUncertainNamespaceStage(Vcb, FileInfo2);
+        return UDFQuarantineNamespace(Vcb, status);
     }
 
     // PHASE 1
@@ -4832,52 +7190,66 @@ cleanup_and_abort_rename:
 
     DirNdx1->FileInfo = NULL;
     ASSERT(FileInfo->Dloc->FELoc.Mapping[0].extLocation);
-    UDFFlushFI(IrpContext, Vcb, FileInfo, UDFGetRefPartNumByPhysLba(Vcb, FileInfo->Dloc->FELoc.Mapping[0].extLocation));
+    FileInfo->Dloc->NamespacePhase = UdfNamespaceSourceTombstoneSubmitted;
+    _SEH2_TRY {
+        status = UDFFlushFI(IrpContext, Vcb, FileInfo, PartNum);
+        if (NT_SUCCESS(status))
+            status = UDFFlushFile__(IrpContext, Vcb, DirInfo1, UDF_FLUSH_FLAGS_LITE);
+        if (NT_SUCCESS(status))
+            status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+        status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    if (!NT_SUCCESS(status))
+        CompletionStatus = status;
     InterlockedExchangeAdd((PLONG)&(DirInfo1->OpenCount),
                           -((LONG)(FileInfo->RefCount)));
     // PHASE 2
     // copy all necessary info from FileInfo to FileInfo2
 
-    FileInfo2->FileIdent->icb = SrcIcb;
-    FileInfo2->FileIdent->fileCharacteristics = FileInfo->FileIdent->fileCharacteristics;
-    FileInfo2->FileIdent->fileVersionNum = FileInfo->FileIdent->fileVersionNum;
+    /* Destination bytes already name the surviving source ICB. Keep
+     * that valid FID when the old source buffer contains a tombstone. */
     MyFreePool__(FileInfo->FileIdent);
     FileInfo->FileIdent = NULL;
 
     // PHASE 3
     // copy all necessary info from FileInfo2 to FileInfo
 
+    /* The confirmed destination now uses the surviving source FI. */
     DirNdx2->FileInfo = FileInfo;
     DirNdx2->FileCharacteristics = DirNdx1->FileCharacteristics & ~FILE_DELETED;
     DirNdx2->FileEntryLoc = DirNdx1->FileEntryLoc;
-    DirNdx2->FI_Flags = (DirNdx1->FI_Flags & ~UDF_FI_FLAG_SYS_ATTR) | UDF_FI_FLAG_FI_MODIFIED;
-    InterlockedExchangeAdd((PLONG)&(DirInfo2->OpenCount),
-                           FileInfo->RefCount - FileInfo2->RefCount);
+    DirNdx2->FI_Flags = (DirNdx2->FI_Flags & ~UDF_FI_FLAG_SYS_ATTR) | UDF_FI_FLAG_FI_MODIFIED;
+    /* The scratch still owns its one parent contribution until retirement. */
+    InterlockedExchangeAdd((PLONG)&(DirInfo2->OpenCount), FileInfo->RefCount);
 
     UDFAttributesToUDF(DirNdx2, FileInfo2->Dloc->FileEntry, NTAttr);
 
     FileInfo->Index = j;
     FileInfo->FileIdent = FileInfo2->FileIdent;
     FileInfo->FileIdentLen = FileInfo2->FileIdentLen;
+    FileInfo2->FileIdent = NULL; /* ownership transferred to the source FI */
     FileInfo->ParentFile = DirInfo2;
+    FileInfo->Dloc->NamespacePhase = UdfNamespaceIdentityMoved;
+    *NamespaceChanged = TRUE;
     FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
 
     ((icbtag*)(FileInfo->Dloc->FileEntry+1))->parentICBLocation =
         ((icbtag*)(FileInfo2->Dloc->FileEntry+1))->parentICBLocation;
 
-    UDFIncFileLinkCount(FileInfo); // increase to 1
-
-    // UDFCreateFile__ counts every new entry like a file but,
-    // UDFUnlinkFile__ removes dir and old parent link
+    /* Stage publication already counted the new directory/name and its
+     * parent link; source unlink removed the old ones exactly once. */
     if (UDFIsADirectory(FileInfo)) {
-        UDFDecFileCounter(Vcb);
-        UDFIncDirCounter(Vcb);
-        UDFIncFileLinkCount(DirInfo2);
 
         if (DirInfo1 != DirInfo2) {
-            status = UDFUpdateParentFID(IrpContext, Vcb, FileInfo);
-            if(!NT_SUCCESS(status)) {
-                
+            _SEH2_TRY {
+                status = UDFUpdateParentFID(IrpContext, Vcb, FileInfo,
+                                             NT_SUCCESS(CompletionStatus));
+            } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+                status = _SEH2_GetExceptionCode();
+            } _SEH2_END;
+            if (!NT_SUCCESS(status)) {
+                if (NT_SUCCESS(CompletionStatus)) CompletionStatus = status;
                 UDFPrint(("UDFRenameMoveFile__: Updating parent FID failed: %08lx\n", status));
             }
         }
@@ -4885,34 +7257,25 @@ cleanup_and_abort_rename:
 
 //    UDFUpdateModifyTime(Vcb, FileInfo);
 
-    // PHASE 4
-    // drop all unnecessary info from FileInfo2
-
-    // Skip if UDFUnlinkFile__ already freed the FE via free allocation path
-    if (FileInfo2->Dloc->FELoc.Mapping[0].extLocation) {
-        UDFFreeFESpace(Vcb, DirInfo2, &(FileInfo2->Dloc->FELoc));
-    }
-    UDFUnlinkDloc(Vcb, FileInfo2->Dloc);
-    UDFDecFileLinkCount(FileInfo2);
-
-    FileInfo2->Dloc->FE_Flags &= ~UDF_FE_FLAG_FE_MODIFIED;
-/*    MyFreePool__(FileInfo2->Dloc->FileEntry);
-    FileInfo2->Dloc->FileEntry = NULL;*/
-    FileInfo2->ParentFile = NULL;
-    FileInfo2->FileIdent = NULL;
-    FileInfo2->RefCount = 0;
-    FileInfo2->Dloc->LinkRefCount = 0;
-    ASSERT(FileInfo2->Dloc->DataLoc.Mapping);
-    FileInfo2->Dloc->DataLoc.Mapping[0].extLocation = 0;
-    FileInfo2->Dloc->DataLoc.Mapping[0].extLength = 0;
-
-    UDFCleanUpFile__(Vcb, FileInfo2);
-    MyFreePool__(FileInfo2);
-
-    // return 'delete target' status
-    (*Replace) = Recovery;
-
-    return STATUS_SUCCESS;
+    /* Publish the actual surviving FE/FID before its old scratch FE can
+     * become allocatable. A failed write retains both generations and the
+     * first error; the caller still applies the prepared in-memory prefix. */
+    _SEH2_TRY {
+        if (NT_SUCCESS(CompletionStatus))
+            CompletionStatus = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+        if (NT_SUCCESS(CompletionStatus))
+            CompletionStatus = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+    } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+        if (NT_SUCCESS(CompletionStatus)) CompletionStatus = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    if (!NT_SUCCESS(CompletionStatus))
+        return UDFQuarantineNamespace(Vcb, CompletionStatus);
+    FileInfo->Dloc->NamespacePhase = UdfNamespaceCommitted;
+    CompletionStatus = UDFRetireNamespaceTarget(IrpContext, Vcb, FileInfo->Dloc);
+    if (NT_SUCCESS(CompletionStatus))
+        CompletionStatus = UDFRetireNamespaceScratch(IrpContext, Vcb, FileInfo);
+    (*Replace) = *TargetRemoved;
+    return CompletionStatus;
 } // end UDFRenameMoveFile__()
 
 /*
@@ -4922,87 +7285,84 @@ NTSTATUS
 UDFRecordDirectory__(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN OUT PUDF_FILE_INFO DirInfo   // source (opened)
+    IN OUT PUDF_FILE_INFO DirInfo
     )
 {
-    NTSTATUS status;
-    LONG_AD FEicb;
-    UDF_FILE_INFO FileInfo;
-    UDF_DATALOC_INFO Dloc;
-    UNICODE_STRING PName;
-    uint32 PartNum;
-    SIZE_T WrittenBytes;
-    PDIR_INDEX_ITEM CurDirNdx;
-    uint32 lba, ParentLBA, TagLoc;
+    NTSTATUS Status;
+    LONG_AD ParentIcb;
+    PFILE_IDENT_DESC ParentFid = NULL;
+    UNICODE_STRING ParentName;
+    uint32 ChildPart, ParentPart, ChildLba, ParentLba, TagLoc, FidLength;
+    SIZE_T Written = 0;
+    PDIR_INDEX_ITEM DirNdx = NULL;
+    BOOLEAN StreamDirectory;
 
-    // validate DirInfo
-    ValidateFileInfo(DirInfo);
-    if (DirInfo->ParentFile && UDFIsAStreamDir(DirInfo->ParentFile))
-        return STATUS_ACCESS_DENIED;
-    // file should be empty
-    if (UDFGetFileSize(DirInfo)) {
-        if ( DirInfo->FileIdent &&
-           (DirInfo->FileIdent->fileCharacteristics & FILE_DIRECTORY)) return STATUS_FILE_IS_A_DIRECTORY;
-        return STATUS_NOT_A_DIRECTORY;
-    }
+    if (!DirInfo || !DirInfo->Dloc || !DirInfo->Dloc->FileEntry ||
+        !DirInfo->Dloc->FELoc.Mapping || !DirInfo->ParentFile ||
+        !DirInfo->ParentFile->Dloc || !DirInfo->ParentFile->Dloc->FileEntry ||
+        !DirInfo->ParentFile->Dloc->FELoc.Mapping)
+        return STATUS_INVALID_PARAMETER;
+    if (UDFIsAStreamDir(DirInfo->ParentFile)) return STATUS_ACCESS_DENIED;
+    if (UDFGetFileSize(DirInfo))
+        return DirInfo->FileIdent && (DirInfo->FileIdent->fileCharacteristics & FILE_DIRECTORY) ?
+               STATUS_FILE_IS_A_DIRECTORY : STATUS_NOT_A_DIRECTORY;
     if (DirInfo->Dloc->DirIndex) return STATUS_FILE_IS_A_DIRECTORY;
-    // create empty DirIndex
-    if (DirInfo->FileIdent) DirInfo->FileIdent->fileCharacteristics |= FILE_DIRECTORY;
-    // FID of subdir parent counts as a link to the parent
-    UDFIncFileLinkCount(DirInfo->ParentFile);
-    if ((CurDirNdx = UDFDirIndex(UDFGetDirIndexByFileInfo(DirInfo),DirInfo->Index)))
-        CurDirNdx->FileCharacteristics |= FILE_DIRECTORY;
-    ((icbtag*)(DirInfo->Dloc->FileEntry+1))->fileType = UDF_FILE_TYPE_DIRECTORY;
-    // init temporary FileInfo
-    RtlZeroMemory(&FileInfo, sizeof(UDF_FILE_INFO));
-    RtlZeroMemory(&Dloc, sizeof(Dloc));
-    FileInfo.Dloc = &Dloc;
-    FileInfo.Dloc->FileEntry = DirInfo->ParentFile->Dloc->FileEntry;
-    FileInfo.Dloc->FileEntryLen = DirInfo->ParentFile->Dloc->FileEntryLen;
-    FileInfo.Dloc->DataLoc = DirInfo->Dloc->DataLoc;
-    FileInfo.Dloc->FELoc = DirInfo->Dloc->FELoc;
-    FileInfo.ParentFile = DirInfo;
-    // prepare FileIdent for 'parent Dir'
-    lba = DirInfo->Dloc->FELoc.Mapping[0].extLocation;
-    ASSERT(lba);
-    PartNum = UDFGetRefPartNumByPhysLba(Vcb, lba);
-    TagLoc = UDFPhysLbaToPart(Vcb, PartNum, lba);
-    ParentLBA = DirInfo->ParentFile->Dloc->FELoc.Mapping[0].extLocation;
-    ASSERT(ParentLBA);
-    PartNum = UDFGetRefPartNumByPhysLba(Vcb, ParentLBA);
-    FEicb.extLength = Vcb->SectorSize;
-    FEicb.extLocation.logicalBlockNum = UDFPhysLbaToPart(Vcb, PartNum, ParentLBA);
-    FEicb.extLocation.partitionReferenceNum = (uint16)PartNum;
-    RtlZeroMemory(&(FEicb.impUse), sizeof(FEicb.impUse));
-    ((struct FidADImpUse*)&(FEicb.impUse))->uniqueID 
-        = (uint32)UDFGetFileUID(DirInfo->ParentFile);
-    PName.Buffer = (PWCH)L"";
-    PName.Length = (PName.MaximumLength = sizeof(L"")) - sizeof(WCHAR);
-    if (!NT_SUCCESS(status =
-        UDFBuildFileIdent(Vcb, &PName, &FEicb, 0,
-                &(FileInfo.FileIdent), &(FileInfo.FileIdentLen)) ))
-        return status;
-    FileInfo.FileIdent->fileCharacteristics |= FILE_PARENT;
-    if (!UDFIsAStreamDir(DirInfo)) {
-        FileInfo.FileIdent->fileCharacteristics |= FILE_DIRECTORY;
-    }
-    UDFDecFileCounter(Vcb);
-    UDFIncDirCounter(Vcb);
-    // init structure
-    UDFSetUpTag(
-        Vcb, &(FileInfo.FileIdent->descTag), (uint16)(FileInfo.FileIdentLen), TagLoc, 0);
-    FileInfo.Dloc->DataLoc.Flags |= EXTENT_FLAG_VERIFY; // for metadata
-    // flush
-    status = UDFWriteFile__(IrpContext, Vcb, DirInfo, 0, FileInfo.FileIdentLen, FALSE, (int8*)(FileInfo.FileIdent), &WrittenBytes);
-//    status = UDFFlushFI(Vcb, &FileInfo, PartNum);
-
-    ASSERT(UDFGetFileSize(DirInfo) <= UDFGetExtentLength(DirInfo->Dloc->DataLoc.Mapping));
-
-    MyFreePool__(FileInfo.FileIdent);
-    if (!NT_SUCCESS(status)) return status;
-    if (CurDirNdx) CurDirNdx->FileCharacteristics =
-        DirInfo->FileIdent->fileCharacteristics;
-    return UDFIndexDirectory(IrpContext, Vcb, DirInfo);
+    if (UDFGetFileLinkCount(DirInfo->ParentFile) >= 0x7fff)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    StreamDirectory = UDFIsAStreamDir(DirInfo);
+    ChildLba = DirInfo->Dloc->FELoc.Mapping[0].extLocation;
+    ParentLba = DirInfo->ParentFile->Dloc->FELoc.Mapping[0].extLocation;
+    ChildPart = UDFGetRefPartNumByPhysLba(Vcb, ChildLba);
+    ParentPart = UDFGetRefPartNumByPhysLba(Vcb, ParentLba);
+    if (ChildPart >= Vcb->PartitionMaps || ParentPart >= Vcb->PartitionMaps || ParentPart > MAXUSHORT)
+        return STATUS_FILE_CORRUPT_ERROR;
+    TagLoc = UDFPhysLbaToPart(Vcb, ChildPart, ChildLba);
+    RtlZeroMemory(&ParentIcb, sizeof(ParentIcb));
+    ParentIcb.extLength = Vcb->SectorSize;
+    ParentIcb.extLocation.logicalBlockNum = UDFPhysLbaToPart(Vcb, ParentPart, ParentLba);
+    ParentIcb.extLocation.partitionReferenceNum = (uint16)ParentPart;
+    if (TagLoc == LBA_OUT_OF_EXTENT || ParentIcb.extLocation.logicalBlockNum == LBA_OUT_OF_EXTENT)
+        return STATUS_FILE_CORRUPT_ERROR;
+    ((struct FidADImpUse*)&ParentIcb.impUse)->uniqueID = (uint32)UDFGetFileUID(DirInfo->ParentFile);
+    ParentName.Buffer = (PWCH)L"";
+    ParentName.Length = 0;
+    ParentName.MaximumLength = sizeof(WCHAR);
+    Status = UDFBuildFileIdent(Vcb, &ParentName, &ParentIcb, 0, &ParentFid, &FidLength);
+    if (!NT_SUCCESS(Status)) return Status;
+    _SEH2_TRY {
+        ParentFid->fileCharacteristics |= FILE_PARENT;
+        if (!StreamDirectory) ParentFid->fileCharacteristics |= FILE_DIRECTORY;
+        UDFSetUpTag(Vcb, &ParentFid->descTag, (uint16)FidLength, TagLoc, 0);
+        /* Preparation errors above change no link/count/type. Record the
+         * intended identity before the first complete directory FE write. */
+        if (DirInfo->FileIdent) {
+            DirInfo->FileIdent->fileCharacteristics |= FILE_DIRECTORY;
+            DirNdx = UDFDirIndex(UDFGetDirIndexByFileInfo(DirInfo), DirInfo->Index);
+        }
+        if (DirNdx) DirNdx->FileCharacteristics |= FILE_DIRECTORY;
+        UDFIncFileLinkCount(DirInfo->ParentFile);
+        ((icbtag*)(DirInfo->Dloc->FileEntry + 1))->fileType =
+            StreamDirectory ? UDF_FILE_TYPE_STREAMDIR : UDF_FILE_TYPE_DIRECTORY;
+        DirInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+        /* Stream directories had a cancelling adjustment in the caller.
+         * Exclude them here instead, including every early failure path. */
+        if (!StreamDirectory) {
+            UDFDecFileCounter(Vcb);
+            UDFIncDirCounter(Vcb);
+        }
+        Status = UDFWriteFile__(IrpContext, Vcb, DirInfo, 0, FidLength,
+                                 FALSE, (int8*)ParentFid, &Written);
+        if (Status == STATUS_SUCCESS && Written != FidLength) Status = STATUS_IO_DEVICE_ERROR;
+        if (Status != STATUS_SUCCESS) {
+            if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+            _SEH2_LEAVE;
+        }
+        if (DirNdx) DirNdx->FileCharacteristics = DirInfo->FileIdent->fileCharacteristics;
+        Status = UDFIndexDirectory(IrpContext, Vcb, DirInfo);
+    } _SEH2_FINALLY {
+        MyFreePool__(ParentFid);
+    } _SEH2_END;
+    return Status;
 } // end UDFRecordDirectory__()
 
 /* The dense physical bitmap is normally checkpointed after the namespace.
@@ -5193,8 +7553,143 @@ done:
     return status;
 }
 
-/* This is the old in-memory resize body.  The public wrapper below orders
- * physical frees with the on-disk bitmap and the shortened FE. */
+/* Prepare inline bytes and exact old data/AED owners before changing the
+ * live FE mode or either map. The FE buffer address stays stable for callers
+ * holding it under the existing file writer domain. */
+static NTSTATUS
+UDFResizeFileToInline(PIRP_CONTEXT IrpContext, PVCB Vcb,
+                       PUDF_FILE_INFO FileInfo, int64 NewLength)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    EXTENT_INFO DataPlan, AllocPlan;
+    PUDF_EXTENT_RETIREMENT DataRetired = NULL, AllocRetired = NULL, Retired;
+    PEXTENT_MAP InlineMap = NULL, OldDataMap, OldAllocMap;
+    int8* InlineFe = NULL;
+    uint32 PartNum, DataPartNum, FeLba, Added, i, Copy;
+    uint16 Ident;
+    NTSTATUS Status = STATUS_SUCCESS;
+    BOOLEAN Published = FALSE;
+
+    RtlZeroMemory(&DataPlan, sizeof(DataPlan));
+    RtlZeroMemory(&AllocPlan, sizeof(AllocPlan));
+    Ident = Dloc->FileEntry ? Dloc->FileEntry->tagIdent : 0;
+    if (!Dloc->FELoc.Mapping || Dloc->FELoc.Mapping[0].extLength != Vcb->SectorSize ||
+        Dloc->FELoc.Mapping[1].extLength || !Dloc->DataLoc.Mapping || Dloc->DataLoc.Offset ||
+        (Dloc->AllocLoc.Mapping && Dloc->AllocLoc.Mapping == Dloc->DataLoc.Mapping) ||
+        (!Dloc->AllocLoc.Mapping && Dloc->AllocLoc.Length) ||
+        (Ident != TID_FILE_ENTRY && Ident != TID_EXTENDED_FILE_ENTRY) ||
+        Dloc->FileEntryLen < (Ident == TID_FILE_ENTRY ? sizeof(FILE_ENTRY) : sizeof(EXTENDED_FILE_ENTRY)) ||
+        Dloc->FileEntryLen > Vcb->SectorSize || NewLength < 0 ||
+        NewLength >= Dloc->DataLoc.Length ||
+        (uint64)NewLength > Vcb->SectorSize - Dloc->FileEntryLen)
+        return STATUS_FILE_CORRUPT_ERROR;
+    FeLba = Dloc->FELoc.Mapping[0].extLocation;
+    PartNum = UDFGetRefPartNumByPhysLba(Vcb, FeLba);
+    if (PartNum >= Vcb->PartitionMaps) return STATUS_FILE_CORRUPT_ERROR;
+    DataPartNum = PartNum;
+    if (Vcb->MetadataFileInfo && PartNum == Vcb->MetadataRef && !UDFIsADirectory(FileInfo))
+        DataPartNum = Vcb->MetadataPhysRef;
+
+    _SEH2_TRY {
+        InlineFe = (int8*)MyAllocatePool__(NonPagedPool, Vcb->SectorSize);
+        InlineMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                                                    2 * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+        if (!InlineFe || !InlineMap) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            goto inline_exit;
+        }
+        RtlCopyMemory(InlineFe, Dloc->FileEntry, Vcb->SectorSize);
+        RtlZeroMemory(InlineFe + Dloc->FileEntryLen, Vcb->SectorSize - Dloc->FileEntryLen);
+        if (NewLength) {
+            Status = UDFReadExtent(IrpContext, Vcb, &Dloc->DataLoc, 0,
+                (SIZE_T)NewLength, FALSE, InlineFe + Dloc->FileEntryLen);
+            if (!NT_SUCCESS(Status)) goto inline_exit;
+        }
+        Status = UDFPrepareExtentShrink(Vcb, DataPartNum, 0, FALSE,
+                                          &Dloc->DataLoc, &DataPlan, &DataRetired);
+        if (!NT_SUCCESS(Status)) goto inline_exit;
+        if (Dloc->AllocLoc.Mapping) {
+            Status = UDFPrepareExtentShrink(Vcb, PartNum, 0, TRUE,
+                                              &Dloc->AllocLoc, &AllocPlan, &AllocRetired);
+            if (!NT_SUCCESS(Status)) goto inline_exit;
+        }
+        /* A malformed flattened map must not retire the owner FE itself.
+         * Ordinary AD maps keep that first sector via their inline Offset. */
+        for (Copy = 0; Copy < 2; Copy++) {
+            Retired = Copy ? AllocRetired : DataRetired;
+            if (!Retired) continue;
+            for (i = 0; i < Retired->Count; i++) {
+                uint64 End = (uint64)Retired->Ranges[i].extLocation +
+                    ((Retired->Ranges[i].extLength & UDF_EXTENT_LENGTH_MASK) >> Vcb->SectorShift);
+                if ((uint64)FeLba >= Retired->Ranges[i].extLocation && (uint64)FeLba < End) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    goto inline_exit;
+                }
+            }
+        }
+        RtlZeroMemory(InlineMap, 2 * sizeof(EXTENT_MAP));
+        InlineMap[0] = Dloc->FELoc.Mapping[0];
+        ((PFILE_ENTRY)InlineFe)->icbTag.flags &= ~ICB_FLAG_ALLOC_MASK;
+        ((PFILE_ENTRY)InlineFe)->icbTag.flags |= ICB_FLAG_AD_IN_ICB;
+        Added = (DataRetired != NULL) + (AllocRetired != NULL);
+        UDFAcquireResourceExclusive(&Vcb->BitMapResource1, TRUE);
+        _SEH2_TRY {
+            if (Vcb->PendingExtentRetirements < 0 ||
+                Added > (ULONG)(MAXLONG - Vcb->PendingExtentRetirements)) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                _SEH2_LEAVE;
+            }
+            if (DataRetired) {
+                DataRetired->Next = Dloc->RetiredExtents;
+                Dloc->RetiredExtents = DataRetired;
+                DataRetired = NULL;
+                InterlockedIncrement(&Vcb->PendingExtentRetirements);
+            }
+            if (AllocRetired) {
+                AllocRetired->Next = Dloc->RetiredExtents;
+                Dloc->RetiredExtents = AllocRetired;
+                AllocRetired = NULL;
+                InterlockedIncrement(&Vcb->PendingExtentRetirements);
+            }
+            OldDataMap = Dloc->DataLoc.Mapping;
+            OldAllocMap = Dloc->AllocLoc.Mapping;
+            Dloc->DataLoc.Mapping = InlineMap;
+            InlineMap = NULL;
+            Dloc->DataLoc.Offset = Dloc->FileEntryLen;
+            Dloc->DataLoc.Length = NewLength;
+            Dloc->DataLoc.Modified = TRUE;
+            Dloc->DataLoc.Flags &= ~(EXTENT_FLAG_PREALLOCATED | EXTENT_FLAG_CUT_PREALLOCATED);
+            Dloc->AllocLoc.Mapping = NULL;
+            Dloc->AllocLoc.Length = 0;
+            Dloc->AllocLoc.Offset = 0;
+            Dloc->AllocLoc.Modified = TRUE;
+            RtlCopyMemory(Dloc->FileEntry, InlineFe, Vcb->SectorSize);
+            Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+            if (FileInfo->Fcb) FileInfo->Fcb->FcbState |= UDF_FCB_EMBEDDED_DATA;
+            Published = TRUE;
+            MyFreePool__(OldDataMap);
+            if (OldAllocMap) MyFreePool__(OldAllocMap);
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&Vcb->BitMapResource1);
+        } _SEH2_END;
+inline_exit:
+        NOTHING;
+    } _SEH2_FINALLY {
+        if (DataPlan.Mapping) MyFreePool__(DataPlan.Mapping);
+        if (AllocPlan.Mapping) MyFreePool__(AllocPlan.Mapping);
+        if (DataRetired) MyFreePool__(DataRetired);
+        if (AllocRetired) MyFreePool__(AllocRetired);
+        if (InlineMap) MyFreePool__(InlineMap);
+        if (InlineFe) MyFreePool__(InlineFe);
+        if (_SEH2_AbnormalTermination() && Published)
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    } _SEH2_END;
+    return Status;
+}
+
+/* Dispatch file resizing to private extent/inline plans. The public wrapper
+ * below retains its bounded physical prefree protocol; old range owners are
+ * released by FE/barrier retirement, not by this in-memory transition. */
 static NTSTATUS
 UDFResizeFileUnordered__(
     IN PIRP_CONTEXT IrpContext,
@@ -5206,13 +7701,18 @@ UDFResizeFileUnordered__(
     SIZE_T WrittenBytes;
     NTSTATUS status;
     uint32 PartNum;
-    int8* OldInIcb = NULL;
-    PEXTENT_MAP NewMap;
 
     UDFPrint(("UDFResizeFile__: FI %x, -> %I64x\n", FileInfo, NewLength));
     ValidateFileInfo(FileInfo);
 //    ASSERT(FileInfo->RefCount >= 1);
 
+    if (NewLength < 0 || FileInfo->Dloc->FileEntryLen > Vcb->SectorSize)
+        return STATUS_INVALID_PARAMETER;
+    if (NewLength != FileInfo->Dloc->DataLoc.Length &&
+        (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    if (NewLength != FileInfo->Dloc->DataLoc.Length && (Vcb->Vat || Vcb->CDR_Mode))
+        return STATUS_NOT_SUPPORTED;
     status = UDFFlushDirectoryAppend(IrpContext, Vcb, FileInfo);
     if (!NT_SUCCESS(status))
         return status;
@@ -5233,79 +7733,7 @@ UDFResizeFileUnordered__(
     if (NewLength <= (Vcb->SectorSize - FileInfo->Dloc->FileEntryLen)) {
         // check if we are already in IN_ICB mode
         if ((((PFILE_ENTRY)(FileInfo->Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK) != ICB_FLAG_AD_IN_ICB) {
-            // read data from old location
-            if (NewLength) {
-                OldInIcb = (int8*)MyAllocatePool__(NonPagedPool, (uint32)NewLength);
-                if (!OldInIcb) return STATUS_INSUFFICIENT_RESOURCES;
-                status = UDFReadExtent(IrpContext, Vcb, &FileInfo->Dloc->DataLoc, 0, (uint32)NewLength, FALSE, OldInIcb);
-                if (!NT_SUCCESS(status)) {
-                    MyFreePool__(OldInIcb);
-                    return status;
-                }
-            } else {
-                OldInIcb = NULL;
-            }
-            // allocate storage for new mapping
-            NewMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , 2*sizeof(EXTENT_MAP),
-                                                               MEM_EXTMAP_TAG);
-            if (!(NewMap)) {
-                MyFreePool__(OldInIcb);
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            // free old location...
-            if (FileInfo->Dloc->DataLoc.Mapping[0].extLocation !=
-               FileInfo->Dloc->FELoc.Mapping[0].extLocation) {
-               ASSERT(FileInfo->Dloc->FELoc.Mapping[0].extLocation);
-mark_data_map_0:
-                UDFMarkSpaceAsXXX(Vcb, FileInfo->Dloc, FileInfo->Dloc->DataLoc.Mapping, AS_DISCARDED); // free
-            } else {
-                if ((FileInfo->Dloc->DataLoc.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK)
-                       > Vcb->SectorSize) {
-                    BrutePoint();
-                    FileInfo->Dloc->DataLoc.Mapping[0].extLength -= Vcb->SectorSize;
-                    FileInfo->Dloc->DataLoc.Mapping[0].extLocation += 1;
-                    goto mark_data_map_0;
-                }
-                UDFMarkSpaceAsXXX(Vcb, FileInfo->Dloc, &(FileInfo->Dloc->DataLoc.Mapping[1]), AS_DISCARDED); // free
-            }
-            if (FileInfo->Dloc->AllocLoc.Mapping) {
-                if ((FileInfo->Dloc->AllocLoc.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK)
-                       > Vcb->SectorSize) {
-                    FileInfo->Dloc->AllocLoc.Mapping[0].extLength -= Vcb->SectorSize;
-                    FileInfo->Dloc->AllocLoc.Mapping[0].extLocation += 1;
-                    UDFMarkSpaceAsXXX(Vcb, FileInfo->Dloc, FileInfo->Dloc->AllocLoc.Mapping, AS_DISCARDED); // free
-                } else {
-                    UDFMarkSpaceAsXXX(Vcb, FileInfo->Dloc, &(FileInfo->Dloc->AllocLoc.Mapping[1]), AS_DISCARDED); // free
-                }
-                MyFreePool__(FileInfo->Dloc->AllocLoc.Mapping);
-            }
-            MyFreePool__(FileInfo->Dloc->DataLoc.Mapping);
-            FileInfo->Dloc->AllocLoc.Mapping = NULL;
-            FileInfo->Dloc->AllocLoc.Length = 0;
-            FileInfo->Dloc->AllocLoc.Offset = 0;
-            FileInfo->Dloc->AllocLoc.Modified = TRUE;
-            // switch to IN_ICB mode
-            ((PFILE_ENTRY)(FileInfo->Dloc->FileEntry))->icbTag.flags &= ~ICB_FLAG_ALLOC_MASK;
-            ((PFILE_ENTRY)(FileInfo->Dloc->FileEntry))->icbTag.flags |= ICB_FLAG_AD_IN_ICB;
-            // Set embedded data flag since file is now in ICB mode
-            // Fcb may be NULL during directory operations (FCB not yet created)
-            if (FileInfo->Fcb) {
-                FileInfo->Fcb->FcbState |= UDF_FCB_EMBEDDED_DATA;
-            }
-            // init new data location descriptors
-            FileInfo->Dloc->DataLoc.Mapping = NewMap;
-            RtlZeroMemory((int8*)(FileInfo->Dloc->DataLoc.Mapping), 2*sizeof(EXTENT_MAP));
-            FileInfo->Dloc->DataLoc.Mapping[0] = FileInfo->Dloc->FELoc.Mapping[0];
-            FileInfo->Dloc->DataLoc.Length = NewLength;
-            FileInfo->Dloc->DataLoc.Offset = FileInfo->Dloc->FileEntryLen;
-            // write data to new location
-            if (OldInIcb) {
-                status = UDFWriteFileData(IrpContext, Vcb, FileInfo, 0, (uint32)NewLength, FALSE, OldInIcb, &WrittenBytes);
-            } else {
-                status = STATUS_SUCCESS;
-            }
-            FileInfo->Dloc->DataLoc.Modified = TRUE;
-            if (OldInIcb) MyFreePool__(OldInIcb);
+            status = UDFResizeFileToInline(IrpContext, Vcb, FileInfo, NewLength);
         } else {
             // just modify Length field
             FileInfo->Dloc->DataLoc.Length = NewLength;
@@ -5318,7 +7746,7 @@ mark_data_map_0:
         if (Vcb->MetadataFileInfo && PartNum == Vcb->MetadataRef &&
             !UDFIsADirectory(FileInfo))
             PartNum = Vcb->MetadataPhysRef;
-        status = UDFResizeExtent(IrpContext, Vcb, PartNum, NewLength, FALSE, &FileInfo->Dloc->DataLoc);
+        status = UDFResizeExtent(IrpContext, Vcb, FileInfo, PartNum, NewLength, FALSE, &FileInfo->Dloc->DataLoc);
         FileInfo->Dloc->DataLoc.Modified = TRUE;
         FileInfo->Dloc->AllocLoc.Modified = TRUE;
     }
@@ -5342,9 +7770,12 @@ UDFResizeFile__(PIRP_CONTEXT IrpContext, PVCB Vcb,
     BOOLEAN possiblyModified = FALSE;
     BOOLEAN txnInitialized = FALSE;
 
-    if (!FileInfo || !FileInfo->Dloc || !FileInfo->Dloc->DataLoc.Mapping ||
-        NewLength < 0 ||
-        NewLength >= FileInfo->Dloc->DataLoc.Length ||
+    if (!Vcb || !FileInfo || !FileInfo->Dloc || !FileInfo->Dloc->FileEntry ||
+        !FileInfo->Dloc->DataLoc.Mapping || !FileInfo->Dloc->FELoc.Mapping ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) || NewLength < 0)
+        return STATUS_INVALID_PARAMETER;
+    if (NewLength >= FileInfo->Dloc->DataLoc.Length ||
         UDFIsADirectory(FileInfo) ||
         (FileInfo->Dloc->FE_Flags & UDF_FE_FLAG_NEW_UNPUBLISHED))
         return UDFResizeFileUnordered__(IrpContext, Vcb, FileInfo, NewLength);
@@ -5428,205 +7859,205 @@ UDFResizeFile__(PIRP_CONTEXT IrpContext, PVCB Vcb,
 /*
     This routine loads VAT.
  */
-NTSTATUS
-UDFLoadVAT(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 PartNdx
-    )
+/* A decoded table owns its allocation independently of the live VCB.
+ * Publish it only after the entire payload has passed bounds validation. */
+typedef struct _UDF_VAT_IMAGE {
+    uint32* Entries;
+    uint32 Count;
+    uint16 MinRead, MinWrite, MaxWrite;
+    uint32 Files, Directories;
+} UDF_VAT_IMAGE;
+
+static NTSTATUS
+UDFReadVATImage(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                uint16 MapType, uint32 Root, uint32 PartitionLength,
+                UDF_VAT_IMAGE* Image)
 {
-    lb_addr VatFELoc;
-    NTSTATUS status;
-    PUDF_FILE_INFO VatFileInfo;
-    uint32 len, i=0, j, to_read;
-    uint32 Offset, hdrOffset;
-    uint32 root;
-    uint16 PartNum;
-//    uint32 VatFirstLba = 0;
-    int8* VatOldData;
-    uint32 VatLba[6] = { Vcb->SessionEndLba,
-                        Vcb->SessionEndLba - 2,
-                        Vcb->SessionEndLba - 3,
-                        Vcb->SessionEndLba - 5,
-                        Vcb->SessionEndLba - 7,
-                        0 };
-
-    if (Vcb->Vat) return STATUS_SUCCESS;
-    if (!Vcb->CDR_Mode) return STATUS_SUCCESS;
-    // disable VAT for now. We'll reenable it if VAT is successfuly loaded
-    Vcb->CDR_Mode = FALSE;
-    PartNum = Vcb->Partitions[PartNdx].PartitionNum;
-    root = Vcb->Partitions[PartNdx].PartitionRoot;
-
-    if ((Vcb->LastTrackNum > 1) &&
-       (Vcb->SessionEndLba == Vcb->TrackMap[Vcb->LastTrackNum-1].LastLba)) {
-        UDFPrint(("Hardware Read-only volume\n"));
-        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
-    }
-
-    VatFileInfo = Vcb->VatFileInfo = (PUDF_FILE_INFO)MyAllocatePoolTag__(UDF_FILE_INFO_MT, sizeof(UDF_FILE_INFO), MEM_VATFINF_TAG);
-    if (!VatFileInfo) return STATUS_INSUFFICIENT_RESOURCES;
-    RtlZeroMemory(VatFileInfo, sizeof(UDF_FILE_INFO));
-    VatFileInfo->NextLinkedFile = VatFileInfo->PrevLinkedFile = VatFileInfo;
-    // load VAT FE (we know its location)
-    VatFELoc.partitionReferenceNum = PartNum;
-retry_load_vat:
-    VatFELoc.logicalBlockNum = UDFPhysLbaToPart(Vcb, PartNum, VatLba[i]);
-    if (!NT_SUCCESS(status = UDFOpenRootFile__(IrpContext, Vcb, &VatFELoc, VatFileInfo))) {
-        UDFCleanUpFile__(Vcb, VatFileInfo);
-        // try another location
-        i++;
-        if ( VatLba[i] &&
-           (status != STATUS_FILE_CORRUPT_ERROR) &&
-           (status != STATUS_CRC_ERROR)) goto retry_load_vat;
-        MyFreePool__(VatFileInfo);
-        Vcb->VatFileInfo = NULL;
-        return status;
-    }
-    len = (uint32)UDFGetFileSize(VatFileInfo);
-    if (Vcb->Partitions[PartNdx].PartitionType == UDF_VIRTUAL_MAP15) {
-        // load Vat 1.50 header
-        UDFPrint(("Load VAT 1.50\n"));
-        struct VirtualAllocationTable15* Buf;
-        if (((icbtag*)(VatFileInfo->Dloc->FileEntry+1))->fileType != UDF_FILE_TYPE_VAT15) {
-            status = STATUS_FILE_CORRUPT_ERROR;
-            goto err_vat_15;
-        }
-        Buf = (struct VirtualAllocationTable15*)MyAllocatePool__(NonPagedPool, sizeof(struct VirtualAllocationTable15));
-        if (!Buf) {
-err_vat_15_2:
-            status = STATUS_INSUFFICIENT_RESOURCES;
-err_vat_15:
-            UDFCloseFile__(IrpContext, Vcb, VatFileInfo);
-            UDFCleanUpFile__(Vcb, VatFileInfo);
-            MyFreePool__(VatFileInfo);
-            Vcb->VatFileInfo = NULL;
-            return status;
-        }
+    uint64 FileBytes;
+    uint32 Offset, DataBytes, i;
+    uint32* Entries = NULL;
+    NTSTATUS Status;
+    RtlZeroMemory(Image, sizeof(*Image));
+    if (!FileInfo || !FileInfo->Dloc || !FileInfo->Dloc->FileEntry)
+        return STATUS_FILE_CORRUPT_ERROR;
+    FileBytes = UDFGetFileSize(FileInfo);
+    if (FileBytes > MAXULONG || !PartitionLength || Root > Vcb->SessionEndLba)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (MapType == UDF_VIRTUAL_MAP15) {
+        struct VirtualAllocationTable15 Trailer;
+        if (FileBytes < sizeof(Trailer) ||
+            ((icbtag*)(FileInfo->Dloc->FileEntry + 1))->fileType != UDF_FILE_TYPE_VAT15)
+            return STATUS_FILE_CORRUPT_ERROR;
+        DataBytes = (uint32)FileBytes - sizeof(Trailer);
+        Status = UDFReadFile__(IrpContext, Vcb, FileInfo, DataBytes,
+                               sizeof(Trailer), FALSE, (int8*)&Trailer);
+        if (Status != STATUS_SUCCESS)
+            return NT_SUCCESS(Status) ? STATUS_IO_DEVICE_ERROR : Status;
+        if (RtlCompareMemory(Trailer.ident.ident, UDF_ID_ALLOC,
+                             sizeof(UDF_ID_ALLOC) - 1) != sizeof(UDF_ID_ALLOC) - 1)
+            return STATUS_FILE_CORRUPT_ERROR;
         Offset = 0;
-        to_read =
-        hdrOffset = len - sizeof(struct VirtualAllocationTable15);
-        MyFreePool__(Buf);
-
-        Vcb->minUDFReadRev  =
-        Vcb->minUDFWriteRev =
-        Vcb->maxUDFWriteRev = 0x0150;
-
-        Vcb->numFiles =
-        Vcb->numDirs  = -1;
-
-    } else
-    if (Vcb->Partitions[PartNdx].PartitionType == UDF_VIRTUAL_MAP20) {
-        // load Vat 2.00 header
-        UDFPrint(("Load VAT 2.00\n"));
-        struct VirtualAllocationTable20* Buf;
-        if (((icbtag*)(VatFileInfo->Dloc->FileEntry+1))->fileType != UDF_FILE_TYPE_VAT20) {
-            status = STATUS_FILE_CORRUPT_ERROR;
-            goto err_vat_15;
-        }
-        Buf = (struct VirtualAllocationTable20*)MyAllocatePool__(NonPagedPool, sizeof(struct VirtualAllocationTable20));
-        if (!Buf) goto err_vat_15_2;
-        Offset = Buf->lengthHeader;
-        to_read = len - Offset;
-        hdrOffset = 0;
-        MyFreePool__(Buf);
-
-        //TODO: Read VirtualAllocationTable20
-        //TODO: fix Use-After-Free
-
-        Vcb->minUDFReadRev  = Buf->minReadRevision;
-        Vcb->minUDFWriteRev = Buf->minWriteRevision;
-        Vcb->maxUDFWriteRev = Buf->maxWriteRevision;
-
-        Vcb->numFiles = Buf->numFIDSFiles;
-        Vcb->numDirs  = Buf->numFIDSDirectories;
-
+        Image->MinRead = Image->MinWrite = Image->MaxWrite = 0x0150;
+        Image->Files = Image->Directories = (uint32)-1;
+    } else if (MapType == UDF_VIRTUAL_MAP20) {
+        struct VirtualAllocationTable20 Header;
+        if (FileBytes < sizeof(Header) ||
+            ((icbtag*)(FileInfo->Dloc->FileEntry + 1))->fileType != UDF_FILE_TYPE_VAT20)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Status = UDFReadFile__(IrpContext, Vcb, FileInfo, 0,
+                               sizeof(Header), FALSE, (int8*)&Header);
+        if (Status != STATUS_SUCCESS)
+            return NT_SUCCESS(Status) ? STATUS_IO_DEVICE_ERROR : Status;
+        if (Header.lengthHeader != sizeof(Header) + Header.lengthImpUse ||
+            Header.lengthHeader > FileBytes || Header.reserved ||
+            (Header.lengthImpUse &&
+             (Header.lengthImpUse < 32 || (Header.lengthImpUse & 3))))
+            return STATUS_FILE_CORRUPT_ERROR;
+        if (Header.minReadRevision > 0x0201)
+            return STATUS_NOT_SUPPORTED; /* no VAT 2.50 capability via its header */
+        Offset = Header.lengthHeader;
+        DataBytes = (uint32)FileBytes - Offset;
+        Image->MinRead = Header.minReadRevision;
+        Image->MinWrite = Header.minWriteRevision;
+        Image->MaxWrite = Header.maxWriteRevision;
+        Image->Files = Header.numFIDSFiles;
+        Image->Directories = Header.numFIDSDirectories;
     } else {
-        // unknown (or wrong) VAT format
-        UDFPrint(("unknown (or wrong) VAT format\n"));
-        status = STATUS_FILE_CORRUPT_ERROR;
-        goto err_vat_15;
+        return STATUS_NOT_SUPPORTED;
     }
-    // read VAT & remember old version
-    Vcb->Vat = (uint32*)DbgAllocatePool(NonPagedPool, Vcb->FSBM_BitCount*sizeof(uint32) );
-    if (!Vcb->Vat) {
-        goto err_vat_15_2;
-    }
-    // store base version of VAT in memory
-    VatOldData = (int8*)DbgAllocatePool(PagedPool, len);
-    if (!VatOldData) {
-        DbgFreePool(Vcb->Vat);
-        Vcb->Vat = NULL;
-        goto err_vat_15_2;
-    }
-    status = UDFReadFile__(IrpContext, Vcb, VatFileInfo, 0, len, FALSE, VatOldData);
-    if (!NT_SUCCESS(status)) {
-        UDFCloseFile__(IrpContext, Vcb, VatFileInfo);
-        UDFCleanUpFile__(Vcb, VatFileInfo);
-        MyFreePool__(VatFileInfo);
-        DbgFreePool(Vcb->Vat);
-        DbgFreePool(VatOldData);
-        Vcb->Vat = NULL;
-        Vcb->VatFileInfo = NULL;
-    } else {
-        // initialize VAT
-        // !!! NOTE !!!
-        // Both VAT copies - in-memory & on-disc
-        // contain _relative_ addresses
-        len = Vcb->NWA - root;
-        for(i=0; i<=len; i++) {
-            Vcb->Vat[i] = i;
-        }
-        RtlCopyMemory(Vcb->Vat, VatOldData+Offset, to_read);
-        Vcb->InitVatCount =
-        Vcb->VatCount = to_read/sizeof(uint32);
-        Vcb->VatPartNdx = PartNdx;
-        Vcb->CDR_Mode = TRUE;
-        len = Vcb->VatCount;
-        RtlFillMemory(&(Vcb->Vat[Vcb->NWA-root]), (Vcb->FSBM_BitCount-(Vcb->NWA-root))*sizeof(uint32), 0xff);
-        // sync VAT and FSBM (bitmap is LBN-indexed)
-        for(i=0; i<len; i++) {
-            if (Vcb->Vat[i] == UDF_VAT_FREE_ENTRY) {
-                if (Vcb->BitmapFcb) {
-                    UDFPinBitmapPage(Vcb, i);
-                    RtlSetBits(&Vcb->BitmapRtl, i - Vcb->BitmapPageStartLbn, 1);
-                    UDFDirtyBitmapPage(Vcb);
-                } else {
-                    UDFSetFreeBit(Vcb->FSBM_Bitmap, i);
-                }
+    if (DataBytes & (sizeof(uint32) - 1))
+        return STATUS_FILE_CORRUPT_ERROR;
+    Image->Count = DataBytes / sizeof(uint32);
+    /* The physical partition length is an upper bound, not an allocation
+     * request. No writer expands this immutable mounted table. */
+    Entries = (uint32*)DbgAllocatePool(NonPagedPool, max(Image->Count, 1) * sizeof(uint32));
+    if (!Entries)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlFillMemory(Entries, max(Image->Count, 1) * sizeof(uint32), 0xff);
+    Status = STATUS_SUCCESS;
+    _SEH2_TRY {
+        if (DataBytes) {
+            Status = UDFReadFile__(IrpContext, Vcb, FileInfo, Offset,
+                                   DataBytes, FALSE, (int8*)Entries);
+            if (Status != STATUS_SUCCESS) {
+                if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+                _SEH2_LEAVE;
             }
         }
-        UDFUnpinBitmapPage(Vcb);
-        len = root + Vcb->FSBM_BitCount;  // end of partition in PSN (bitmap is LBN-indexed)
-        // "pre-format" reserved area
-        for(i=Vcb->NWA; i<len;) {
-            for (j = 0; (j < PACKETSIZE_UDF) && (i < len); j++, i++)
-            {
-                ULONG lbn_pf = i - root;
-                if (Vcb->BitmapFcb) {
-                    UDFPinBitmapPage(Vcb, lbn_pf);
-                    RtlSetBits(&Vcb->BitmapRtl, lbn_pf - Vcb->BitmapPageStartLbn, 1);
-                    UDFDirtyBitmapPage(Vcb);
-                } else {
-                    UDFSetFreeBit(Vcb->FSBM_Bitmap, lbn_pf);
-                }
-            }
-            for (j = 0; (j < 7) && (i < len); j++, i++)
-            {
-                ULONG lbn_pf = i - root;
-                if (Vcb->BitmapFcb) {
-                    UDFPinBitmapPage(Vcb, lbn_pf);
-                    RtlClearBits(&Vcb->BitmapRtl, lbn_pf - Vcb->BitmapPageStartLbn, 1);
-                    UDFDirtyBitmapPage(Vcb);
-                } else {
-                    UDFSetUsedBit(Vcb->FSBM_Bitmap, lbn_pf);
-                }
+        for (i = 0; i < Image->Count; i++) {
+            uint32 Physical = Entries[i];
+            if (Physical != UDF_VAT_FREE_ENTRY &&
+                (Physical >= PartitionLength ||
+                 Physical > Vcb->SessionEndLba - Root)) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
             }
         }
-        UDFUnpinBitmapPage(Vcb);
-        DbgFreePool(VatOldData);
+        Image->Entries = Entries;
+        Entries = NULL;
+    } _SEH2_FINALLY {
+        if (Entries) DbgFreePool(Entries);
+    } _SEH2_END;
+    return Status;
+}
+
+NTSTATUS
+UDFLoadVAT(PIRP_CONTEXT IrpContext, PVCB Vcb, uint32 PartNdx)
+{
+    static const uint32 Delta[] = { 0, 2, 3, 5, 7 };
+    UDF_VAT_IMAGE Image;
+    lb_addr VatFELoc;
+    uint32 i, Root, Candidate, PhysicalRef = LBA_OUT_OF_EXTENT;
+    uint16 MapType;
+    NTSTATUS Status = STATUS_FILE_CORRUPT_ERROR, CleanupStatus;
+    PUDFPartMap Part;
+    if (!Vcb->Partitions || PartNdx >= Vcb->PartitionMaps || PartNdx > MAXUSHORT)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Part = &Vcb->Partitions[PartNdx];
+    MapType = Part->PartitionType;
+    if (MapType != UDF_VIRTUAL_MAP15 && MapType != UDF_VIRTUAL_MAP20)
+        return STATUS_NOT_SUPPORTED;
+    for (i = 0; i < Vcb->PartitionMaps; i++) {
+        PUDFPartMap Physical = &Vcb->Partitions[i];
+        if (Physical->PartitionType == UDF_TYPE1_MAP15 &&
+            Physical->PartitionNum == Part->PartitionNum &&
+            Physical->VolumeSeqNum == Part->VolumeSeqNum &&
+            Physical->PartitionRoot == Part->PartitionRoot &&
+            Physical->PartitionLen == Part->PartitionLen) {
+            PhysicalRef = i;
+            break;
+        }
     }
-    return status;
+    if (PhysicalRef == LBA_OUT_OF_EXTENT || PhysicalRef > MAXUSHORT)
+        return STATUS_NOT_SUPPORTED;
+    if (InterlockedCompareExchangePointer((PVOID volatile*)&Vcb->Vat, NULL, NULL)) {
+        return Vcb->VatPartNdx == PartNdx && Vcb->VatPhysPartNdx == PhysicalRef &&
+            Vcb->VatPartitionRoot == Part->PartitionRoot &&
+            Vcb->VatPartitionLength == Part->PartitionLen &&
+            Vcb->VatPartitionNumber == Part->PartitionNum &&
+            Vcb->VatVolumeSequence == Part->VolumeSeqNum ? STATUS_SUCCESS : STATUS_WRONG_VOLUME;
+    }
+    if (Vcb->VatFileInfo)
+        return STATUS_DEVICE_BUSY;
+    Root = Part->PartitionRoot;
+    if (!Part->PartitionLen || Root > Vcb->SessionEndLba)
+        return STATUS_FILE_CORRUPT_ERROR;
+
+    /* A VAT ICB is physical, even when the namespace ICBs it describes are
+     * virtual. Use its explicit physical alias, never a global CDR toggle
+     * that makes an unbound virtual partition look like physical space. */
+    VatFELoc.partitionReferenceNum = (uint16)PhysicalRef;
+    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    for (i = 0; i < RTL_NUMBER_OF(Delta); i++) {
+        PUDF_FILE_INFO FileInfo;
+        if (Vcb->SessionEndLba < Delta[i])
+            continue;
+        Candidate = Vcb->SessionEndLba - Delta[i];
+        if (Candidate < Root || Candidate - Root >= Part->PartitionLen)
+            continue;
+        FileInfo = (PUDF_FILE_INFO)MyAllocatePoolTag__(UDF_FILE_INFO_MT,
+                                      sizeof(*FileInfo), MEM_VATFINF_TAG);
+        if (!FileInfo)
+            return STATUS_INSUFFICIENT_RESOURCES;
+        RtlZeroMemory(FileInfo, sizeof(*FileInfo));
+        FileInfo->NextLinkedFile = FileInfo->PrevLinkedFile = FileInfo;
+        Vcb->VatFileInfo = FileInfo;
+        VatFELoc.logicalBlockNum = Candidate - Root;
+        Status = UDFOpenRootFile__(IrpContext, Vcb, &VatFELoc, FileInfo);
+        if (Status == STATUS_SUCCESS)
+            Status = UDFReadVATImage(IrpContext, Vcb, FileInfo, MapType,
+                                     Root, Part->PartitionLen, &Image);
+        if (Status != STATUS_SUCCESS && NT_SUCCESS(Status))
+            Status = STATUS_IO_DEVICE_ERROR;
+        if (NT_SUCCESS(Status)) {
+            Vcb->VatCapacity = max(Image.Count, 1);
+            Vcb->VatPartNdx = PartNdx;
+            Vcb->VatPhysPartNdx = PhysicalRef;
+            Vcb->VatPartitionRoot = Root;
+            Vcb->VatPartitionLength = Part->PartitionLen;
+            Vcb->VatPartitionNumber = Part->PartitionNum;
+            Vcb->VatVolumeSequence = Part->VolumeSeqNum;
+            Vcb->InitVatCount = Vcb->VatCount = Image.Count;
+            Vcb->minUDFReadRev = Image.MinRead;
+            Vcb->minUDFWriteRev = Image.MinWrite;
+            Vcb->maxUDFWriteRev = Image.MaxWrite;
+            Vcb->numFiles = Image.Files;
+            Vcb->numDirs = Image.Directories;
+            Vcb->CDR_Mode = TRUE;
+            /* Reader acquire observes the completed geometry/count tuple.
+             * No live writer or namespace-free path mutates this generation. */
+            InterlockedExchangePointer((PVOID volatile*)&Vcb->Vat, Image.Entries);
+            UDFPrint(("UDFS: immutable VAT read-only view; sequential recording is not implemented\n"));
+            return STATUS_SUCCESS;
+        }
+        UDFPrint(("UDFS: VAT candidate at %x rejected: %x\n", Candidate, Status));
+        CleanupStatus = UDFReleaseInternalFile(IrpContext, Vcb, &Vcb->VatFileInfo);
+        if (!NT_SUCCESS(CleanupStatus) || Vcb->VatFileInfo)
+            return Status;
+        if (Status == STATUS_INSUFFICIENT_RESOURCES || Status == STATUS_NOT_SUPPORTED)
+            return Status;
+    }
+    return Status;
 } // end UDFLoadVAT()
 
 NTSTATUS
@@ -5639,73 +8070,280 @@ UDFOpenMetadataFile(
     OUT PUDF_FILE_INFO* FileInfo
 )
 {
-    NTSTATUS status;
-    PUDF_FILE_INFO fi;
+    NTSTATUS status = STATUS_UNSUCCESSFUL, ReleaseStatus;
+    PUDF_FILE_INFO fi = NULL;
     lb_addr FELoc;
 
+    if (!FileInfo) return STATUS_INVALID_PARAMETER;
     *FileInfo = NULL;
-
-    fi = (PUDF_FILE_INFO)MyAllocatePoolTag__(UDF_FILE_INFO_MT, sizeof(UDF_FILE_INFO), MEM_VATFINF_TAG);
-
-    if (!fi)
-        return STATUS_INSUFFICIENT_RESOURCES;
-    
-    RtlZeroMemory(fi, sizeof(UDF_FILE_INFO));
+    if (!IrpContext || !Vcb || !Vcb->Partitions ||
+        PhysRef >= Vcb->PartitionMaps || PhysRef > MAXUSHORT ||
+        (FileType != UDF_FILE_TYPE_METADATA &&
+         FileType != UDF_FILE_TYPE_METADATA_MIRROR &&
+         FileType != UDF_FILE_TYPE_METADATA_BITMAP))
+        return STATUS_INVALID_PARAMETER;
+    fi = (PUDF_FILE_INFO)MyAllocatePoolTag__(UDF_FILE_INFO_MT,
+                                            sizeof(UDF_FILE_INFO), MEM_VATFINF_TAG);
+    if (!fi) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(fi, sizeof(*fi));
     fi->NextLinkedFile = fi->PrevLinkedFile = fi;
-    
     FELoc.partitionReferenceNum = (uint16)PhysRef;
     FELoc.logicalBlockNum = FELbn;
-    
-    status = UDFOpenRootFile__(IrpContext, Vcb, &FELoc, fi);
 
-    if (
-        NT_SUCCESS(status) &&
-        (((icbtag*)((fi->Dloc->FileEntry)+1))->fileType != FileType)
-    ) {
-        UDFPrint(("UDFOpenMetadataFile: unexpected type at %x got %x, expected %x\n",
-            FELbn, ((icbtag*)((fi->Dloc->FileEntry)+1))->fileType, FileType));
-    
-        UDFCloseFile__(IrpContext, Vcb, fi);
-        status = STATUS_FILE_CORRUPT_ERROR;
-    }
-
-    if (!NT_SUCCESS(status)) {
-        UDFCleanUpFile__(Vcb, fi);
-        MyFreePool__(fi);
-        return status;
-    }
-
+    _SEH2_TRY {
+        _SEH2_TRY {
+            status = UDFOpenRootFileWithParent__(IrpContext, Vcb, &FELoc,
+                                                 NULL, FileType, fi);
+            if (status != STATUS_SUCCESS && NT_SUCCESS(status)) status = STATUS_IO_DEVICE_ERROR;
+        } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                      EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+            status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) status = STATUS_FILE_CORRUPT_ERROR;
+        if (status != STATUS_SUCCESS) {
+            /* The type check precedes completion: this is a failed FI
+             * constructor, never an ordinary open to close again. The
+             * shared failure handoff retains its exact indexed hold and
+             * keeps the caller's error output NULL even after an exception. */
+            ReleaseStatus = UDFRetainFailedStreamOpen(Vcb, &fi);
+            if (NT_SUCCESS(status) && !NT_SUCCESS(ReleaseStatus)) status = ReleaseStatus;
+        }
+    } _SEH2_END;
+    if (status != STATUS_SUCCESS) return status;
     *FileInfo = fi;
-    
     return STATUS_SUCCESS;
 }
 
-void
-UDFReleaseMetadata(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb
-)
+/* A named NonAlloc open owns a parent reference. Transfer checkpoint
+ * access to a new parentless FI before closing that open, rather than
+ * retaining a weak ParentFile into an already retired root/SystemSDir.
+ * The Dloc is shared through the normal checked acquisition protocol. */
+NTSTATUS
+UDFHoldResidualNonAlloc(PVCB Vcb)
 {
-    PUDF_FILE_INFO* Files[3] = { 
-        &Vcb->MetadataBitmapFileInfo,
-        &Vcb->MetadataMirrorFileInfo,
-        &Vcb->MetadataFileInfo 
-    };
-
-    uint32 i;
-    for (i = 0;i < 3; i++) {
-
-        if (*(Files[i])) {
-            
-            UDFCloseFile__(IrpContext, Vcb, *(Files[i]));
-            UDFCleanUpFile__(Vcb, *(Files[i]));
-            MyFreePool__(*(Files[i]));
-
-            *(Files[i]) = NULL;
-        }
-
+    PUDF_FILE_INFO Source = Vcb->NonAllocFileInfo, Hold;
+    NTSTATUS Status;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    if (Vcb->NonAllocCheckpointFileInfo || !Source)
+        return STATUS_SUCCESS;
+    if (Vcb->ResidualRetirementStarted || Source->InternalOpenReleased ||
+        !Source->Dloc || !Source->RefCount || Source->Fcb ||
+        Source->Dloc->CommonFcb || Source->Dloc->DirIndex ||
+        Source->Dloc->DeleteCommitted)
+        return STATUS_DEVICE_BUSY;
+    Hold = (PUDF_FILE_INFO)MyAllocatePoolTag__(UDF_FILE_INFO_MT,
+                                               sizeof(*Hold), MEM_FINF_TAG);
+    if (!Hold)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(Hold, sizeof(*Hold));
+    Hold->Dloc = Source->Dloc;
+    Status = UDFReferenceClonedFile(Vcb, Hold, Source);
+    if (!NT_SUCCESS(Status)) {
+        MyFreePool__(Hold); /* no reference or shared buffer was acquired */
+        return Status;
     }
+    Vcb->NonAllocCheckpointFileInfo = Hold;
+    return STATUS_SUCCESS;
+}
 
+#define UDF_RESIDUAL_FILE_COUNT 5
+
+static VOID
+UDFResidualFileSlots(PVCB Vcb, PUDF_FILE_INFO** Slots)
+{
+    Slots[0] = &Vcb->NonAllocCheckpointFileInfo;
+    Slots[1] = &Vcb->VatFileInfo;
+    Slots[2] = &Vcb->MetadataBitmapFileInfo;
+    Slots[3] = &Vcb->MetadataMirrorFileInfo;
+    Slots[4] = &Vcb->MetadataFileInfo;
+}
+
+/* Both Dloc resources and the exclusive VCB are held. This is an exact
+ * owner census, not permission to discard arbitrary clean cached FIs.
+ * Only these five parentless, non-FCB internal opens may remain. */
+static NTSTATUS
+UDFCheckResidualFilesLocked(PVCB Vcb, BOOLEAN RequireClean)
+{
+    PUDF_FILE_INFO* Slots[UDF_RESIDUAL_FILE_COUNT];
+    BOOLEAN Seen[UDF_RESIDUAL_FILE_COUNT] = { FALSE };
+    uint32 i, j;
+    NTSTATUS Status;
+    if (Vcb->DlocCount && !Vcb->DlocList)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Vcb->RootIndexFcb || Vcb->NonAllocFileInfo || Vcb->SysSDirFileInfo ||
+        Vcb->UniqueIDMapFileInfo || Vcb->FcbTeardownCount ||
+        Vcb->ClosedFcbRetryCount || Vcb->RetainedOpenCount || Vcb->PendingNamespaceCount ||
+        Vcb->PendingDeleteCount || Vcb->RetainedDeleteCount ||
+        Vcb->FailedZeroDataCount || Vcb->DeletePrefreeList)
+        return STATUS_DEVICE_BUSY;
+    Status = (NTSTATUS)InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                                  STATUS_SUCCESS, STATUS_SUCCESS);
+    if (!NT_SUCCESS(Status))
+        return Status; /* reading this inventory must not consume its error */
+    UDFResidualFileSlots(Vcb, Slots);
+    for (i = 0; i < UDF_RESIDUAL_FILE_COUNT; i++) {
+        PUDF_FILE_INFO FileInfo = *Slots[i];
+        PUDF_DATALOC_INFO Dloc;
+        uint32 Expected;
+        if (!FileInfo)
+            continue;
+        Dloc = FileInfo->Dloc;
+        Expected = FileInfo->InternalOpenReleased ? 0 : 1;
+        if (!Dloc || !Dloc->FileEntry || !Dloc->FELoc.Mapping ||
+            !Dloc->DataLoc.Mapping || FileInfo->ParentFile || FileInfo->Index ||
+            FileInfo->FileIdent || FileInfo->ListPtr || FileInfo->Fcb ||
+            FileInfo->OpenCount || FileInfo->RefCount != Expected ||
+            (FileInfo->InternalOpenReleased && !Vcb->ResidualRetirementStarted) ||
+            FileInfo->NextLinkedFile != FileInfo ||
+            FileInfo->PrevLinkedFile != FileInfo ||
+            Dloc->LinkedFileInfo != FileInfo || Dloc->LinkRefCount != Expected ||
+            FileInfo->Constructing || FileInfo->ConstructionFailed ||
+            FileInfo->ConstructionReferenceOwned || FileInfo->ConstructionParent ||
+            FileInfo->TemporaryRetired || FileInfo->NamespaceStaged ||
+            FileInfo->LinkDeleteCommitted || Dloc->CommonFcb ||
+            Dloc->CleanupOwner || Dloc->AllocationReleaseActive ||
+            !NT_SUCCESS(Dloc->AllocationReleaseError) || Dloc->DeleteCommitted || Dloc->DeletePrefree ||
+            Dloc->DirIndex || Dloc->SDirInfo || Dloc->DirectoryAppend ||
+            Dloc->DirectoryFECheckpoint || Dloc->NamespaceScratch ||
+            Dloc->NamespaceTarget || Dloc->NamespaceFileInfo ||
+            Dloc->NamespaceTargetState != UdfNamespaceTargetNone ||
+            !NT_SUCCESS(Dloc->NamespaceTargetError) ||
+            Dloc->NamespacePhase != UdfNamespaceNone ||
+            Dloc->NamespaceScratchOwner || Dloc->StreamDeleteOwner ||
+            Dloc->StreamDeleteContextOwner || Dloc->StreamCreate || !NT_SUCCESS(Dloc->ZeroDataError) ||
+            (Dloc->FE_Flags & (UDF_FE_FLAG_UNDER_INIT | UDF_FE_FLAG_FREE_DEFERRED |
+                UDF_FE_FLAG_NEW_UNPUBLISHED | UDF_FE_FLAG_CACHED_DATA_PENDING |
+                UDF_FE_FLAG_HAS_SDIR | UDF_FE_FLAG_IS_SDIR |
+                UDF_FE_FLAG_HAS_DEL_SDIR | UDF_FE_FLAG_IS_DEL_SDIR)))
+            return STATUS_DEVICE_BUSY;
+        if (RequireClean && (Dloc->RetiredExtents ||
+            Dloc->DataLoc.Modified || Dloc->AllocLoc.Modified ||
+            Dloc->FELoc.Modified || (Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED) ||
+            (Dloc->FE_Flags & (UDF_FE_FLAG_FE_MODIFIED | UDF_FE_FLAG_DIR_MODIFIED))))
+            return STATUS_DEVICE_BUSY;
+        for (j = 0; j < i; j++) {
+            if (*Slots[j] && (*Slots[j])->Dloc == Dloc)
+                return STATUS_FILE_CORRUPT_ERROR; /* not two independent owners */
+        }
+    }
+    for (i = 0; i < Vcb->DlocCount; i++) {
+        PUDF_DATALOC_INFO Dloc = Vcb->DlocList[i].Dloc;
+        if (!Dloc)
+            continue;
+        for (j = 0; j < UDF_RESIDUAL_FILE_COUNT; j++) {
+            if (*Slots[j] && (*Slots[j])->Dloc == Dloc)
+                break;
+        }
+        if (j == UDF_RESIDUAL_FILE_COUNT)
+            return STATUS_DEVICE_BUSY; /* an unaccounted lifetime, even if clean */
+        if (Seen[j])
+            return STATUS_FILE_CORRUPT_ERROR;
+        Seen[j] = TRUE;
+    }
+    for (i = 0; i < UDF_RESIDUAL_FILE_COUNT; i++) {
+        if (*Slots[i] && !Seen[i])
+            return STATUS_FILE_CORRUPT_ERROR;
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+UDFCheckResidualFiles(PVCB Vcb, BOOLEAN RequireClean)
+{
+    NTSTATUS Status;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource, TRUE);
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    Status = UDFCheckResidualFilesLocked(Vcb, RequireClean);
+    UDFReleaseResource(&Vcb->DlocResource2);
+    UDFReleaseResource(&Vcb->DlocResource);
+    return Status;
+}
+
+NTSTATUS
+UDFCheckpointResidualFiles(PIRP_CONTEXT IrpContext, PVCB Vcb)
+{
+    PUDF_FILE_INFO* Slots[UDF_RESIDUAL_FILE_COUNT];
+    NTSTATUS Status;
+    BOOLEAN CloseDeferred = FALSE;
+    uint32 i;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    if (Vcb->ResidualCheckpointComplete && !Vcb->Modified &&
+        !Vcb->BitmapModified && !Vcb->MetadataBitmapModified &&
+        !Vcb->PreallocCache && !Vcb->PreallocCacheMaxSize)
+        return UDFCheckResidualFiles(Vcb, TRUE);
+    if (Vcb->ResidualRetirementStarted ||
+        (Vcb->BitmapFcb && Vcb->BitmapCacheState != UdfBitmapCacheActive))
+        return STATUS_FILE_CORRUPT_ERROR; /* never reopen a detached cache */
+    Vcb->ResidualCheckpointComplete = FALSE;
+    Status = UDFCheckResidualFiles(Vcb, FALSE);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    /* No new generation was produced after the previous checkpoint. This
+     * also permits memory-only unwind of an unpublished, never-written
+     * mount with no target device; do not invent a device flush there. */
+    if (!Vcb->Modified && !Vcb->BitmapModified && !Vcb->MetadataBitmapModified &&
+        !Vcb->PreallocCache && !Vcb->PreallocCacheMaxSize &&
+        UDFCheckResidualFiles(Vcb, TRUE) == STATUS_SUCCESS) {
+        Vcb->ResidualCheckpointComplete = TRUE;
+        return STATUS_SUCCESS;
+    }
+    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY) {
+        /* Read-only closes can retire clean memory, not repair dirty media. */
+        Status = UDFCheckResidualFiles(Vcb, TRUE);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        if (Vcb->Modified || Vcb->BitmapModified || Vcb->MetadataBitmapModified)
+            return STATUS_MEDIA_WRITE_PROTECTED;
+        if (Vcb->PreallocCache || Vcb->PreallocCacheMaxSize)
+            return STATUS_DEVICE_BUSY;
+    } else {
+        if (!Vcb->TargetDeviceObject)
+            return STATUS_DEVICE_NOT_CONNECTED;
+        Status = UDFFlushAllCachedAllocations(Vcb, UDF_PREALLOC_CLASS_DIR);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        UDFResidualFileSlots(Vcb, Slots);
+        for (i = 0; i < UDF_RESIDUAL_FILE_COUNT; i++) {
+            if (*Slots[i]) {
+                Status = UDFFlushFile__(IrpContext, Vcb, *Slots[i], 0);
+                if (!NT_SUCCESS(Status))
+                    return Status;
+            }
+        }
+        Status = UDFFlushMetadataBitmap(IrpContext, Vcb);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        Status = UDFCheckResidualFiles(Vcb, TRUE);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        /* Do not let a metadata-only dirty flag bypass UDFUmount__'s gate. */
+        if (!Vcb->Modified && (Vcb->BitmapModified || Vcb->MetadataBitmapModified))
+            UDFSetModified(Vcb);
+        Status = UDFUmount__(IrpContext, Vcb, &CloseDeferred);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        if (CloseDeferred)
+            return STATUS_DEVICE_BUSY;
+        Status = UDFCheckResidualFiles(Vcb, TRUE);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        if (Vcb->MetadataBitmapModified)
+            return STATUS_DEVICE_BUSY;
+        Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        UDFPreClrModified(Vcb);
+        UDFClrModified(Vcb);
+    }
+    Vcb->ResidualCheckpointComplete = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static VOID
+UDFReleaseMetadataBuffers(PVCB Vcb)
+{
+    UDFInstallMetadataView(Vcb, NULL);
     if (Vcb->MetadataBitmap) {
         DbgFreePool(Vcb->MetadataBitmap);
         Vcb->MetadataBitmap = NULL;
@@ -5714,11 +8352,102 @@ UDFReleaseMetadata(
         DbgFreePool(Vcb->MetadataPendingAlloc);
         Vcb->MetadataPendingAlloc = NULL;
     }
-
+    Vcb->MetadataBitmapByteCount = 0;
     Vcb->MetadataBitCount = 0;
     Vcb->MetadataFreeCount = 0;
     Vcb->MetadataHint = 0;
     Vcb->MetadataBitmapModified = FALSE;
+}
+
+/* This terminal phase owns only clean parentless internal opens. Detach
+ * them from the Dloc index under its two resources, consume each acquired
+ * hold once, and release memory. No generic cleanup, allocation freeing,
+ * bitmap pinning (including debug checks), FE flush or device I/O here. */
+NTSTATUS
+UDFRetireResidualFiles(PVCB Vcb)
+{
+    PUDF_FILE_INFO* Slots[UDF_RESIDUAL_FILE_COUNT];
+    NTSTATUS Status;
+    uint32 i, j;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    if (!Vcb->ResidualCheckpointComplete || Vcb->Modified || Vcb->BitmapModified ||
+        Vcb->MetadataBitmapModified || Vcb->BitmapFcb ||
+        Vcb->BitmapStreamFileObject || Vcb->BitmapCacheState != UdfBitmapCacheAbsent ||
+        Vcb->PreallocCache || Vcb->PreallocCacheMaxSize)
+        return STATUS_INVALID_DEVICE_STATE;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource, TRUE);
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        Status = UDFCheckResidualFilesLocked(Vcb, TRUE);
+        if (!NT_SUCCESS(Status))
+            _SEH2_LEAVE;
+        Vcb->ResidualRetirementStarted = TRUE;
+        UDFResidualFileSlots(Vcb, Slots);
+        for (i = 0; i < UDF_RESIDUAL_FILE_COUNT; i++) {
+            PUDF_FILE_INFO FileInfo = *Slots[i];
+            if (FileInfo && !FileInfo->InternalOpenReleased) {
+                Status = UDFDereferenceFileLocked(Vcb, FileInfo);
+                if (!NT_SUCCESS(Status))
+                    _SEH2_LEAVE;
+                FileInfo->InternalOpenReleased = TRUE;
+            }
+        }
+        for (i = 0; i < UDF_RESIDUAL_FILE_COUNT; i++) {
+            PUDF_FILE_INFO FileInfo = *Slots[i];
+            PUDF_DATALOC_INFO Dloc;
+            if (!FileInfo)
+                continue;
+            Dloc = FileInfo->Dloc;
+            for (j = 0; j < Vcb->DlocCount; j++) {
+                if (Vcb->DlocList[j].Dloc == Dloc)
+                    break;
+            }
+            /* Membership was proved before any destructive action. */
+            NT_ASSERT(j < Vcb->DlocCount);
+            if (j == Vcb->DlocCount) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE; /* keep the remaining consumed, indexed holds */
+            }
+            RtlZeroMemory(&Vcb->DlocList[j], sizeof(Vcb->DlocList[j]));
+            Vcb->DlocFreeHint = min(Vcb->DlocFreeHint, j);
+            *Slots[i] = NULL;
+            if (Dloc->DataLoc.Mapping) MyFreePool__(Dloc->DataLoc.Mapping);
+            if (Dloc->AllocLoc.Mapping) MyFreePool__(Dloc->AllocLoc.Mapping);
+            if (Dloc->FELoc.Mapping) MyFreePool__(Dloc->FELoc.Mapping);
+            MyFreePool__(Dloc->FileEntry);
+            MyFreePool__(Dloc);
+            MyFreePool__(FileInfo);
+        }
+        UDFReleaseMetadataBuffers(Vcb);
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+        UDFReleaseResource(&Vcb->DlocResource);
+    } _SEH2_END;
+    return Status;
+}
+
+NTSTATUS
+UDFReleaseMetadata(
+    IN PIRP_CONTEXT IrpContext,
+    IN PVCB Vcb
+)
+{
+    PUDF_FILE_INFO* Files[3] = {
+        &Vcb->MetadataBitmapFileInfo,
+        &Vcb->MetadataMirrorFileInfo,
+        &Vcb->MetadataFileInfo
+    };
+    NTSTATUS Status = STATUS_SUCCESS;
+    uint32 i;
+    for (i = 0; i < 3; i++) {
+        NTSTATUS Current = UDFReleaseInternalFile(IrpContext, Vcb, Files[i]);
+        if (NT_SUCCESS(Status)) Status = Current;
+    }
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    UDFReleaseMetadataBuffers(Vcb);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -5730,9 +8459,13 @@ UDFLoadMetadata(
 {
     NTSTATUS status;
     PSPACE_BITMAP_DESC Sbd;
+    PUDF_METADATA_VIEW View = NULL;
     uint32 i, len, n, PhysRef = (uint32)-1;
 
     if (Vcb->MetadataFileInfo) {
+        View = UDFAcquireMetadataView(Vcb);
+        if (!View) return STATUS_FILE_CORRUPT_ERROR;
+        UDFReleaseMetadataView(View);
         return STATUS_SUCCESS;
     }
 
@@ -5842,6 +8575,13 @@ UDFLoadMetadata(
         Vcb->MetadataHint = 0;
     }
 
+    status = UDFCreateMetadataView(Vcb,
+        Vcb->MetadataFileInfo->Dloc->DataLoc.Mapping,
+        Vcb->MetadataMirrorFileInfo->Dloc->DataLoc.Mapping, &View);
+    if (!NT_SUCCESS(status))
+        goto err_metadata;
+    UDFInstallMetadataView(Vcb, View); /* before any metadata-partition FSD lookup */
+    View = NULL;
     Vcb->MetadataBitmapModified = FALSE;
     UDFPrint(("UDFLoadMetadata: metadata partition: ref %x, %x blocks, %x free\n",
         PartNdx, Vcb->Partitions[PartNdx].PartitionLen, Vcb->MetadataFreeCount));
@@ -6052,39 +8792,36 @@ UDFIsDirEmpty(
 /*
     Calc logicalBlocksRecorded from recorded extents of mapping (zero for in ICB data)
 */
-static
-void
-UDFSetRecordedBlocks(
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO FileInfo
-    )
+static NTSTATUS
+UDFSetRecordedBlocks(PVCB Vcb, PUDF_FILE_INFO FileInfo)
 {
-    uint64 Total = 0;
-    uint16 AllocMode;
-    PFILE_ENTRY FE = NULL;
-    PEXTENDED_FILE_ENTRY EFE = NULL;
-    PEXTENT_MAP Extent = NULL;
-    
-    FE = (PFILE_ENTRY)(FileInfo->Dloc->FileEntry);
-
-    AllocMode = FE->icbTag.flags & ICB_FLAG_ALLOC_MASK;
-
-    Extent = FileInfo->Dloc->DataLoc.Mapping;
-
-    if (Extent && AllocMode != ICB_FLAG_AD_IN_ICB) {
-        while (Extent->extLength) {
-            Total += ((Extent->extLength >> 30) == EXTENT_RECORDED_ALLOCATED) *
-                (((Extent->extLength & UDF_EXTENT_LENGTH_MASK) + Vcb->SectorSize - 1) >> Vcb->SectorShift);
-            Extent++;
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    uint32 Bytes, Count, i;
+    uint64 Total = 0, Blocks, Previous;
+    uint16 Mode = ((PFILE_ENTRY)Dloc->FileEntry)->icbTag.flags & ICB_FLAG_ALLOC_MASK;
+    NTSTATUS Status;
+    if (Mode != ICB_FLAG_AD_IN_ICB) {
+        Status = UDFGetMappingByteCount(Dloc->DataLoc.Mapping, &Bytes);
+        if (!NT_SUCCESS(Status)) return Status;
+        Count = Bytes / sizeof(EXTENT_MAP) - 1;
+        for (i = 0; i < Count; i++) {
+            if ((Dloc->DataLoc.Mapping[i].extLength >> 30) != EXTENT_RECORDED_ALLOCATED)
+                continue;
+            Blocks = ((uint64)(Dloc->DataLoc.Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK) +
+                       Vcb->SectorSize - 1) >> Vcb->SectorShift;
+            if (Total > (uint64)MAXLONGLONG - Blocks) return STATUS_FILE_CORRUPT_ERROR;
+            Total += Blocks;
         }
     }
-
-    if (FileInfo->Dloc->FileEntry->tagIdent == TID_FILE_ENTRY) {
-        FE->logicalBlocksRecorded = Total;
-    } else if (FileInfo->Dloc->FileEntry->tagIdent == TID_EXTENDED_FILE_ENTRY) {
-        EFE = (PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry);
-        EFE->logicalBlocksRecorded = Total;
+    if (Dloc->FileEntry->tagIdent == TID_FILE_ENTRY) {
+        Previous = ((PFILE_ENTRY)Dloc->FileEntry)->logicalBlocksRecorded;
+        ((PFILE_ENTRY)Dloc->FileEntry)->logicalBlocksRecorded = Total;
+    } else {
+        Previous = ((PEXTENDED_FILE_ENTRY)Dloc->FileEntry)->logicalBlocksRecorded;
+        ((PEXTENDED_FILE_ENTRY)Dloc->FileEntry)->logicalBlocksRecorded = Total;
     }
+    if (Previous != Total) Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+    return STATUS_SUCCESS;
 }
 
 static
@@ -6144,60 +8881,49 @@ UDFSyncInIcbData(
     );
 }
 
-static
-uint32
-UDFSerializeFEBlock(
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO FileInfo,
-    IN uint32 PartNum
-)
+static NTSTATUS
+UDFSerializeFEBlock(PVCB Vcb, PUDF_FILE_INFO FileInfo, uint32 PartNum, uint32* WriteLength)
 {
-    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
-
-    uint32 FELen = Dloc->FileEntryLen;
-    int8* FEBuf = (int8*)(Dloc->FileEntry);
-    
-    uint16 AllocMode;
-    uint32 TailLen, WriteLen;
-    int64 InfoLen;
-    uint32 lba = Dloc->FELoc.Mapping[0].extLocation;
-
-    UDFSetAllocDescLen(Vcb, FileInfo);
-    UDFSetRecordedBlocks(Vcb, FileInfo);
-
-    if (Dloc->FileEntry->tagIdent == TID_FILE_ENTRY)
-        InfoLen = ((PFILE_ENTRY)(Dloc->FileEntry))->informationLength;
-    else
-        InfoLen = ((PEXTENDED_FILE_ENTRY)(Dloc->FileEntry))->informationLength;
-
-    if (InfoLen != Dloc->DataLoc.Length)
-        UDFSetFileSize(FileInfo, Dloc->DataLoc.Length);
-
-    if (Dloc->FileEntry->tagIdent == TID_FILE_ENTRY)
-        TailLen = ((PFILE_ENTRY)(Dloc->FileEntry))->lengthAllocDescs;
-    else
-        TailLen = ((PEXTENDED_FILE_ENTRY)(Dloc->FileEntry))->lengthAllocDescs;
-
-    AllocMode = ((PFILE_ENTRY)(Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK;
-
-    if (
-        (
-            (AllocMode == ICB_FLAG_AD_IN_ICB) || 
-            UDFAllocDescsStartInFEBlock(Vcb, FileInfo)
-        ) &&
-        (FELen + TailLen <= Vcb->SectorSize)
-    ) {
-        RtlZeroMemory(FEBuf + FELen + TailLen, Vcb->SectorSize - FELen - TailLen);
-        WriteLen = Vcb->SectorSize;
+    PUDF_DATALOC_INFO Dloc;
+    uint32 Header, Tail, Lba, Location;
+    uint64 Information;
+    NTSTATUS Status;
+    if (!WriteLength) return STATUS_INVALID_PARAMETER;
+    *WriteLength = 0;
+    Status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+    if (!NT_SUCCESS(Status)) return Status;
+    Dloc = FileInfo->Dloc;
+    if (!Vcb->Partitions || PartNum >= Vcb->PartitionMaps ||
+        Vcb->SectorSize > MAXUSHORT || !Dloc->FELoc.Mapping || Dloc->FELoc.Offset ||
+        Dloc->FELoc.Length < 0 || (uint64)Dloc->FELoc.Length > Vcb->SectorSize ||
+        Dloc->DataLoc.Length < 0 ||
+        (Dloc->FELoc.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) != Vcb->SectorSize ||
+        (Dloc->FELoc.Mapping[0].extLength >> 30) > EXTENT_NOT_RECORDED_ALLOCATED ||
+        Dloc->FELoc.Mapping[1].extLength)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Lba = Dloc->FELoc.Mapping[0].extLocation;
+    Location = UDFPhysLbaToPart(Vcb, PartNum, Lba);
+    if (Location == LBA_OUT_OF_EXTENT || Location >= Vcb->Partitions[PartNum].PartitionLen)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Status = UDFSetAllocDescLen(Vcb, FileInfo);
+    if (!NT_SUCCESS(Status)) return Status;
+    Status = UDFSetRecordedBlocks(Vcb, FileInfo);
+    if (!NT_SUCCESS(Status)) return Status;
+    if (Dloc->FileEntry->tagIdent == TID_FILE_ENTRY) {
+        Information = ((PFILE_ENTRY)Dloc->FileEntry)->informationLength;
+        Tail = ((PFILE_ENTRY)Dloc->FileEntry)->lengthAllocDescs;
     } else {
-        TailLen = 0;
-        WriteLen = (uint32)(Dloc->FELoc.Length);
+        Information = ((PEXTENDED_FILE_ENTRY)Dloc->FileEntry)->informationLength;
+        Tail = ((PEXTENDED_FILE_ENTRY)Dloc->FileEntry)->lengthAllocDescs;
     }
-
-    UDFSetUpTag(Vcb, Dloc->FileEntry, (uint16)(FELen + TailLen), UDFPhysLbaToPart(Vcb, PartNum, lba), 0);
-    UDFPrint(("Desc CRC Len %x\n", Dloc->FileEntry->descCRCLength));
-
-    return WriteLen;
+    if (Information > MAXLONGLONG || Tail > Vcb->SectorSize - Header)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Information != (uint64)Dloc->DataLoc.Length)
+        UDFSetFileSize(FileInfo, Dloc->DataLoc.Length);
+    RtlZeroMemory((int8*)Dloc->FileEntry + Header + Tail, Vcb->SectorSize - Header - Tail);
+    UDFSetUpTag(Vcb, Dloc->FileEntry, (uint16)(Header + Tail), Location, 0);
+    *WriteLength = Vcb->SectorSize;
+    return STATUS_SUCCESS;
 }
 
 static
@@ -6208,12 +8934,20 @@ UDFWriteFEBlock(PIRP_CONTEXT IrpContext, PVCB Vcb,
     PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
     uint32 WriteLen;
     SIZE_T WrittenBytes = 0;
-    NTSTATUS status = UDFFlushDirectoryAppend(IrpContext, Vcb, FileInfo);
+    NTSTATUS status = UDFStreamCreateWriteStatus(FileInfo);
+    if (status != STATUS_SUCCESS) return status;
+    status = UDFFlushDirectoryAppend(IrpContext, Vcb, FileInfo);
     if (!NT_SUCCESS(status)) {
         UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, status);
         return status;
     }
-    WriteLen = UDFSerializeFEBlock(Vcb, FileInfo, PartNum);
+    /* External maps require AD preparation and initialization ordering in
+     * UDFFlushFEInternal. The direct inline-data caller cannot bypass it. */
+    if ((((PFILE_ENTRY)Dloc->FileEntry)->icbTag.flags & ICB_FLAG_ALLOC_MASK) != ICB_FLAG_AD_IN_ICB &&
+        (Dloc->DataLoc.Modified || Dloc->AllocLoc.Modified))
+        return STATUS_DEVICE_BUSY;
+    status = UDFSerializeFEBlock(Vcb, FileInfo, PartNum, &WriteLen);
+    if (!NT_SUCCESS(status)) return status;
     /* A failed or short write may have replaced part of the old sector.
      * It must never leave an eligible old attribute-only checkpoint. */
     UDFDirectoryFEWriteStarting(Dloc);
@@ -6245,18 +8979,26 @@ UDFWriteFileData(
 )
 {
     NTSTATUS status;
-    uint32 PartNum;
+    uint32 PartNum, Header;
     PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
 
-    if (
-        ((((PFILE_ENTRY)(Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK) != ICB_FLAG_AD_IN_ICB) ||
-        (Dloc->DataLoc.Offset != Dloc->FileEntryLen) ||
-        (Offset + (int64)Length > Dloc->DataLoc.Length) ||
-        ((PartNum = UDFGetRefPartNumByPhysLba(Vcb, Dloc->FELoc.Mapping[0].extLocation)) == (uint32)-1)
-    )
-        return UDFWriteExtent(IrpContext, Vcb, &Dloc->DataLoc, Offset, Length, Direct, Buffer, WrittenBytes);
-
+    if (!WrittenBytes) return STATUS_INVALID_PARAMETER;
     *WrittenBytes = 0;
+    if (Offset < 0 || (uint64)Length > (uint64)MAXLONGLONG - (uint64)Offset ||
+        (Length && !Buffer))
+        return STATUS_INVALID_PARAMETER;
+    if ((((PFILE_ENTRY)Dloc->FileEntry)->icbTag.flags & ICB_FLAG_ALLOC_MASK) != ICB_FLAG_AD_IN_ICB)
+        return UDFWriteExtent(IrpContext, Vcb, &Dloc->DataLoc, Offset, Length, Direct, Buffer, WrittenBytes);
+    status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+    if (!NT_SUCCESS(status)) return status;
+    if (!Dloc->FELoc.Mapping || !Vcb->Partitions || !Vcb->PartitionMaps ||
+        Dloc->DataLoc.Offset != Header || Dloc->DataLoc.Length < 0 ||
+        (uint64)Dloc->DataLoc.Length > Vcb->SectorSize - Header ||
+        (uint64)Offset > (uint64)Dloc->DataLoc.Length ||
+        Length > (uint64)Dloc->DataLoc.Length - (uint64)Offset)
+        return STATUS_FILE_CORRUPT_ERROR;
+    PartNum = UDFGetRefPartNumByPhysLba(Vcb, Dloc->FELoc.Mapping[0].extLocation);
+    if (PartNum >= Vcb->PartitionMaps) return STATUS_FILE_CORRUPT_ERROR;
 
     /* New File Entries are zero-initialized, and an opened File Entry was
        read as a complete sector.  Every in-ICB write through this routine
@@ -6270,14 +9012,12 @@ UDFWriteFileData(
             return status;
     }
     
-    if ((Dloc->FE_Flags & UDF_FE_FLAG_NEW_UNPUBLISHED) &&
-        (Offset < 0 || Dloc->DataLoc.Length < 0 ||
-         (uint64)Dloc->FileEntryLen + (uint64)Dloc->DataLoc.Length > Vcb->SectorSize ||
-         (uint64)Offset > (uint64)Dloc->DataLoc.Length ||
-         Length > (uint64)Dloc->DataLoc.Length - (uint64)Offset))
-        return STATUS_FILE_CORRUPT_ERROR;
-    if (Length)
-        RtlCopyMemory((int8*)(Dloc->FileEntry) + Dloc->FileEntryLen + (uint32)Offset, Buffer, Length);
+    if (Length) {
+        /* An in-memory payload change is dirty even when the following
+         * full FE write fails. Do not lose it on a clean-flag overwrite. */
+        Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+        RtlCopyMemory((int8*)Dloc->FileEntry + Header + (SIZE_T)Offset, Buffer, Length);
+    }
 
     if (UDFDeferNewFileMetadata(IrpContext, Vcb, FileInfo)) {
         Dloc->DataLoc.Modified = TRUE;
@@ -6286,6 +9026,8 @@ UDFWriteFileData(
         return STATUS_SUCCESS;
     }
     status = UDFWriteFEBlock(IrpContext, Vcb, FileInfo, PartNum);
+    if (!NT_SUCCESS(status))
+        UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, status);
 
     if (NT_SUCCESS(status)) {
         *WrittenBytes = Length;
@@ -6312,6 +9054,59 @@ UDFWriteFileData(
 
 /*
  */
+/* Keep the first, FE-resident AD bytes private until the final complete
+ * FE write. Only external AED bytes are submitted/barriered here. */
+static NTSTATUS
+UDFWriteAllocationDescriptorBytes(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO FileInfo, int8* Buffer, uint32 Capacity, uint16 AllocMode)
+{
+    PEXTENT_INFO Alloc = &FileInfo->Dloc->AllocLoc;
+    uint32 Prefix = 0, Bytes, External;
+    SIZE_T Written = 0;
+    NTSTATUS Status;
+    if (!Buffer)
+        return AllocMode == ICB_FLAG_AD_IN_ICB ? STATUS_SUCCESS : STATUS_FILE_CORRUPT_ERROR;
+    if (AllocMode == ICB_FLAG_AD_IN_ICB || Alloc->Length < 0 ||
+        (uint64)Alloc->Length > Capacity || !Alloc->Mapping ||
+        Alloc->Offset > Vcb->SectorSize)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Bytes = (uint32)Alloc->Length;
+    if (!Bytes && Alloc->Offset == Vcb->SectorSize &&
+        FileInfo->Dloc->FileEntryLen == Vcb->SectorSize)
+        return STATUS_SUCCESS;
+    if (UDFAllocDescsInFEBlock(Vcb, FileInfo)) {
+        if (Bytes > Vcb->SectorSize - Alloc->Offset)
+            return STATUS_FILE_CORRUPT_ERROR;
+        RtlCopyMemory((int8*)FileInfo->Dloc->FileEntry + Alloc->Offset, Buffer, Bytes);
+        RtlZeroMemory((int8*)FileInfo->Dloc->FileEntry + Alloc->Offset + Bytes,
+                       Vcb->SectorSize - Alloc->Offset - Bytes);
+        return STATUS_SUCCESS;
+    }
+    if (Alloc->Mapping[0].extLocation == FileInfo->Dloc->FELoc.Mapping[0].extLocation &&
+        !UDFAllocDescsStartInFEBlock(Vcb, FileInfo))
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (UDFAllocDescsStartInFEBlock(Vcb, FileInfo)) {
+        Prefix = min(Bytes, Vcb->SectorSize - Alloc->Offset);
+        if (Alloc->Mapping[0].extLocation != FileInfo->Dloc->FELoc.Mapping[0].extLocation ||
+            (Alloc->Mapping[0].extLength >> 30) > EXTENT_NOT_RECORDED_ALLOCATED ||
+            (Alloc->Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) < Vcb->SectorSize)
+            return STATUS_FILE_CORRUPT_ERROR;
+    }
+    External = Bytes - Prefix;
+    if (!External) return STATUS_FILE_CORRUPT_ERROR;
+    Status = UDFPadLastSector(IrpContext, Vcb, Alloc);
+    if (!NT_SUCCESS(Status)) return Status;
+    Status = UDFWriteExtent(IrpContext, Vcb, Alloc, Prefix, External,
+                              FALSE, Buffer + Prefix, &Written);
+    if (NT_SUCCESS(Status) && Written != External) Status = STATUS_IO_DEVICE_ERROR;
+    if (!NT_SUCCESS(Status)) return Status;
+    Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+    if (!NT_SUCCESS(Status)) return Status;
+    if (Prefix)
+        RtlCopyMemory((int8*)FileInfo->Dloc->FileEntry + Alloc->Offset, Buffer, Prefix);
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS
 UDFFlushFEInternal(
     IN PIRP_CONTEXT IrpContext,
@@ -6322,11 +9117,17 @@ UDFFlushFEInternal(
     PBOOLEAN Staged
     )
 {
-    int8* NewAllocDescs;
+    int8* NewAllocDescs = NULL;
     NTSTATUS status;
-    SIZE_T WrittenBytes = 0;
     uint16 AllocMode;
-    uint32 lba;
+    uint32 lba, AllocCapacity = 0, SerializedLength;
+
+    status = UDFStreamCreateWriteStatus(FileInfo);
+    if (status != STATUS_SUCCESS) return status;
+
+    if (!NT_SUCCESS(FileInfo->Dloc->ZeroDataError) &&
+        !UDFIsZeroDataRetry(FileInfo->Dloc))
+        return FileInfo->Dloc->ZeroDataError;
 
     AllocMode = ((PFILE_ENTRY)(FileInfo->Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK;
 #ifdef UDF_DBG
@@ -6361,8 +9162,15 @@ retry_flush_FE:
     if (FileInfo->Dloc->DataLoc.Modified ||
        FileInfo->Dloc->AllocLoc.Modified) {
         ASSERT(PartNum != (uint32)(-1));
+        /* Recorded activation follows completed external data writes. Order
+         * that initialized payload before serializing/publishing its new ADs;
+         * a successful write request alone is not a lower cache barrier. */
+        if (FileInfo->Dloc->DataLoc.Modified && !FileInfo->Dloc->DataLoc.Offset) {
+            status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+            if (!NT_SUCCESS(status)) return status;
+        }
         // prepare new AllocDescs for flushing...
-        if (!NT_SUCCESS(status = UDFBuildAllocDescs(IrpContext, Vcb, PartNum, FileInfo, &NewAllocDescs))) {
+        if (!NT_SUCCESS(status = UDFBuildAllocDescs(IrpContext, Vcb, PartNum, FileInfo, &NewAllocDescs, &AllocCapacity))) {
             UDFPrint(("  FlushFE: UDFBuildAllocDescs() faliled (%x)\n", status));
             if (NewAllocDescs)
                 MyFreePool__(NewAllocDescs);
@@ -6374,46 +9182,15 @@ retry_flush_FE:
 #endif // UDF_DBG
         // initiate update of lengthAllocDescs
         FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
-        if (NewAllocDescs && UDFAllocDescsInFEBlock(Vcb, FileInfo)) {
-            int8* feBuffer;
-
-            feBuffer = (int8*)FileInfo->Dloc->FileEntry;
-            
-            RtlCopyMemory(feBuffer + FileInfo->Dloc->AllocLoc.Offset, NewAllocDescs, (uint32)(FileInfo->Dloc->AllocLoc.Length));
-            RtlZeroMemory(
-                feBuffer + (FileInfo->Dloc->AllocLoc.Offset + (uint32)(FileInfo->Dloc->AllocLoc.Length)), 
-                Vcb->SectorSize - (FileInfo->Dloc->AllocLoc.Offset + (uint32)(FileInfo->Dloc->AllocLoc.Length))
-            );
-            
-            MyFreePool__(NewAllocDescs);
-        } else if (NewAllocDescs) {
-            ASSERT(AllocMode != ICB_FLAG_AD_IN_ICB);
-            status = UDFPadLastSector(IrpContext, Vcb, &FileInfo->Dloc->AllocLoc);
-            if (!NT_SUCCESS(status)) {
-                MyFreePool__(NewAllocDescs);
-                return status;
-            }
-            // ... and flush it
-            status = UDFWriteExtent(IrpContext, Vcb, &FileInfo->Dloc->AllocLoc, 0, (uint32)(FileInfo->Dloc->AllocLoc.Length), FALSE, NewAllocDescs, &WrittenBytes);
-            if (UDFAllocDescsStartInFEBlock(Vcb, FileInfo)) {
-                RtlCopyMemory((int8*)(FileInfo->Dloc->FileEntry) + FileInfo->Dloc->AllocLoc.Offset, 
-                                NewAllocDescs,
-                                min(
-                                 (uint32)(FileInfo->Dloc->AllocLoc.Length),
-                                 Vcb->SectorSize - FileInfo->Dloc->AllocLoc.Offset
-                                )
-                );
-            }
-            MyFreePool__(NewAllocDescs);
-            if (!NT_SUCCESS(status)) {
-                UDFPrint(("  FlushFE: UDFWriteExtent() faliled (%x)\n", status));
-                return status;
-            }
-#ifdef UDF_DBG
-        } else {
-            ASSERT(AllocMode == ICB_FLAG_AD_IN_ICB);
-#endif // UDF_DBG
-        }
+        _SEH2_TRY {
+            AllocMode = ((PFILE_ENTRY)FileInfo->Dloc->FileEntry)->icbTag.flags & ICB_FLAG_ALLOC_MASK;
+            status = UDFWriteAllocationDescriptorBytes(IrpContext, Vcb,
+                                                        FileInfo, NewAllocDescs, AllocCapacity, AllocMode);
+        } _SEH2_FINALLY {
+            if (NewAllocDescs) MyFreePool__(NewAllocDescs);
+            NewAllocDescs = NULL;
+        } _SEH2_END;
+        if (!NT_SUCCESS(status)) return status;
         FileInfo->Dloc->DataLoc.Modified = FALSE;
         FileInfo->Dloc->AllocLoc.Modified = FALSE;
     } else {
@@ -6438,7 +9215,7 @@ retry_flush_FE:
                (FileInfo->Dloc->FELoc.Mapping[0].extLocation - 0x580));
     }*/
     if ((FileInfo->Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED) ||
-        FileInfo->Dloc->FELoc.Modified) {
+        FileInfo->Dloc->FELoc.Modified || FileInfo->Dloc->RetiredExtents) {
         ASSERT(PartNum != (uint32)(-1));
         // UDF 2.50 File Entries may live in the metadata partition, whose
         // partition map is distinct from the physical partition map.
@@ -6446,13 +9223,19 @@ retry_flush_FE:
         if (PartNum == (uint32)(-1) || PartNum == (uint32)(-2)) {
             UDFPrint(("  bad PartNum: %d\n", PartNum));
         }
+        if (PartNum >= Vcb->PartitionMaps)
+            return STATUS_FILE_CORRUPT_ERROR;
         // flush FileEntry
 
         // if FE is located in remapped block, place it to reliable space
         lba = FileInfo->Dloc->FELoc.Mapping[0].extLocation;
         if (Vcb->BSBM_Bitmap) {
+            if (lba < Vcb->Partitions[0].PartitionRoot ||
+                lba - Vcb->Partitions[0].PartitionRoot >= Vcb->FSBM_BitCount)
+                return STATUS_FILE_CORRUPT_ERROR;
             if (UDFGetBadBit((uint32*)(Vcb->BSBM_Bitmap), lba - Vcb->Partitions[0].PartitionRoot)) {
                 AdPrint(("  bad block under FE @%x\n", lba));
+                status = STATUS_DEVICE_DATA_ERROR;
                 goto relocate_FE;
             }
         }
@@ -6478,11 +9261,15 @@ retry_flush_FE:
             }
 
         }
-        if (StageBuffer && UDFCanStageFileEntry(Vcb, FileInfo) &&
-            UDFSerializeFEBlock(Vcb, FileInfo, PartNum) == 512) {
-            RtlCopyMemory(StageBuffer, FileInfo->Dloc->FileEntry, 512);
-            *Staged = TRUE;
-            return STATUS_SUCCESS;
+        if (StageBuffer && !FileInfo->Dloc->RetiredExtents &&
+            UDFCanStageFileEntry(Vcb, FileInfo)) {
+            status = UDFSerializeFEBlock(Vcb, FileInfo, PartNum, &SerializedLength);
+            if (!NT_SUCCESS(status)) return status;
+            if (SerializedLength == 512) {
+                RtlCopyMemory(StageBuffer, FileInfo->Dloc->FileEntry, 512);
+                *Staged = TRUE;
+                return STATUS_SUCCESS;
+            }
         }
         status = UDFWriteFEBlock(IrpContext, Vcb, FileInfo, PartNum);
 
@@ -6490,6 +9277,33 @@ retry_flush_FE:
             UDFPrint(("  FlushFE: UDFWriteExtent(2) failed (%x)\n", status));
             if (status == STATUS_DEVICE_DATA_ERROR) {
 relocate_FE:
+                /* A parentless metadata/VAT/by-ID/checkpoint FI has no
+                 * namespace FID that this branch can retarget. Likewise a
+                 * multi-link FE needs all reverse references updated, not
+                 * only the current name. Preserve the dirty generation
+                 * and original error before allocating or freeing anything. */
+                if (!FileInfo->ParentFile || FileInfo->Index < 2 ||
+                    !FileInfo->FileIdent ||
+                    UDFGetFileNameLinkCount(FileInfo) != 1 ||
+                    !UDFDirIndex(UDFGetDirIndexByFileInfo(FileInfo), FileInfo->Index))
+                    return STATUS_DEVICE_DATA_ERROR;
+                /* Old AED/data retirements are rooted at the current FE.
+                 * Moving that root before the parent FID commits would let
+                 * the ordinary FE barrier release blocks still reachable
+                 * through the old namespace. A loaded AD map's Length may
+                 * describe only its FE prefix: inspect the actual map too.
+                 * Preserve the failed generation until a complete ordered
+                 * FE/FID relocation protocol exists for these states. */
+                AllocMode = ((PFILE_ENTRY)FileInfo->Dloc->FileEntry)->icbTag.flags & ICB_FLAG_ALLOC_MASK;
+                if (FileInfo->Dloc->RetiredExtents ||
+                    (AllocMode != ICB_FLAG_AD_IN_ICB &&
+                     (!FileInfo->Dloc->AllocLoc.Mapping ||
+                      (FileInfo->Dloc->AllocLoc.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) != Vcb->SectorSize ||
+                      FileInfo->Dloc->AllocLoc.Mapping[1].extLength))) {
+                    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                    UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, STATUS_DEVICE_DATA_ERROR);
+                    return STATUS_DEVICE_DATA_ERROR;
+                }
                 UDFPrint(("  try to relocate\n"));
 
                 EXTENT_INFO _FEExtInfo;
@@ -6552,7 +9366,9 @@ relocate_FE:
         ASSERT(AllocMode == ICB_FLAG_AD_IN_ICB);
     }
 #endif // UDF_DBG
-    return STATUS_SUCCESS;
+    /* Old allocation ownership survives every failed FE write/barrier.
+     * Commit also covers a nonstaged call through UDFStageNewFileEntry. */
+    return UDFCommitExtentRetirements(IrpContext, Vcb, FileInfo);
 } // end UDFFlushFEInternal()
 
 NTSTATUS
@@ -6589,11 +9405,19 @@ UDFFlushFI(
     // use WrittenBytes variable to store LBA of FI to be recorded
     #define lba   WrittenBytes
 
+    if (FileInfo->Dloc && !NT_SUCCESS(FileInfo->Dloc->ZeroDataError) &&
+        !UDFIsZeroDataRetry(FileInfo->Dloc))
+        return FileInfo->Dloc->ZeroDataError;
+
 //    ASSERT(FileInfo->Dloc->FELoc.Mapping[0].extLocation);
     // some files has no FI
     if (!DirInfo || UDFIsAStreamDir(FileInfo))
         return STATUS_SUCCESS;
     DirNdx = UDFDirIndex(DirInfo->Dloc->DirIndex, FileInfo->Index);
+    if (FileInfo->NamespaceStaged &&
+        (!FileInfo->FileIdent || !(DirNdx->FileCharacteristics & FILE_DELETED) ||
+         !(FileInfo->FileIdent->fileCharacteristics & FILE_DELETED)))
+        return STATUS_FILE_CORRUPT_ERROR; /* a private stage cannot publish */
 //    ASSERT(FileInfo->FileIdent->lengthFileIdent < 0x80);
 #ifdef UDF_DBG
     if (DirNdx->FileCharacteristics & FILE_DELETED) {
@@ -6741,7 +9565,7 @@ UDFFlushFile__Internal(
         if (!(FlushFlags & UDF_FLUSH_FLAGS_LITE)) {
             if (FileInfo->Dloc->DataLoc.Flags & EXTENT_FLAG_PREALLOCATED) {
                 FileInfo->Dloc->DataLoc.Flags |= EXTENT_FLAG_CUT_PREALLOCATED;
-                status = UDFResizeExtent(IrpContext, Vcb, PartNum, UDFGetFileSize(FileInfo), FALSE, &(FileInfo->Dloc->DataLoc));
+                status = UDFResizeExtent(IrpContext, Vcb, FileInfo, PartNum, UDFGetFileSize(FileInfo), FALSE, &(FileInfo->Dloc->DataLoc));
                 FileInfo->Dloc->DataLoc.Flags &= ~EXTENT_FLAG_CUT_PREALLOCATED;
                 if (!NT_SUCCESS(status))
                     return status;
@@ -6770,6 +9594,9 @@ UDFFlushFile__Internal(
 NTSTATUS
 UDFFlushFile__(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO FileInfo, ULONG FlushFlags)
 {
+    if (FileInfo && FileInfo->Dloc && !NT_SUCCESS(FileInfo->Dloc->ZeroDataError) &&
+        !UDFIsZeroDataRetry(FileInfo->Dloc))
+        return FileInfo->Dloc->ZeroDataError;
     NTSTATUS status = UDFFlushFile__Internal(IrpContext, Vcb, FileInfo, FlushFlags);
     UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, status);
     return status;
@@ -6925,6 +9752,12 @@ UDFCrc(
 /*
     Read the first block of a tagged descriptor & check it.
 */
+static unsigned int
+UDFDescriptorCrcFast(const unsigned char *Bytes, unsigned int Length)
+{
+    return UDFCrc((uint8*)Bytes, Length, 0);
+}
+
 static BOOLEAN
 UDFTaggedSectorValid(
     IN PVCB Vcb,
@@ -6932,27 +9765,9 @@ UDFTaggedSectorValid(
     IN uint32 Location
     )
 {
-    const tag* Tag = (const tag*)Buf;
-    const uint8* Bytes = (const uint8*)Buf;
-    uint8 Checksum = 0;
-    uint32 i;
-
-    if (Vcb->SectorSize < sizeof(tag) ||
-        Tag->tagLocation != Location ||
-        (Tag->descVersion != 2 && Tag->descVersion != 3) ||
-        Tag->descCRCLength > Vcb->SectorSize - sizeof(tag))
-        return FALSE;
-
-    for (i = 0; i < sizeof(tag); i++) {
-        if (i != 4)
-            Checksum += Bytes[i];
-    }
-    if (Checksum != Tag->tagChecksum)
-        return FALSE;
-
-    return !Tag->descCRC ||
-           Tag->descCRC == UDFCrc((uint8*)Bytes + sizeof(tag),
-                                   Tag->descCRCLength, 0);
+    return UdfValidateDescriptorEx((const unsigned char*)Buf, Vcb->SectorSize,
+                                    UDF_DESCRIPTOR_ANY_ID, Location,
+                                    UDFDescriptorCrcFast) != 0;
 }
 
 NTSTATUS
@@ -6971,38 +9786,33 @@ UDFReadTagged(
     uint8 checksum;
     unsigned int i;
     int8* tb;
-    uint32 MetadataLbn, MirrorLba, MirrorFlags;
-    int8* MirrorBuf;
+    uint32 MetadataLbn, MirrorLba;
+    PUDF_METADATA_VIEW View = NULL;
+    int8* MirrorBuf = NULL;
     NTSTATUS MirrorStatus;
+    BOOLEAN DescriptorValid;
 
     // Read the block
+    *Ident = 0;
     if (Block == 0xFFFFFFFF)
-        return 0;
+        return STATUS_FILE_CORRUPT_ERROR;
 
     _SEH2_TRY {
+        View = UDFAcquireMetadataView(Vcb);
         RC = UDFReadSectors(IrpContext, Vcb, FALSE, Block, 1, FALSE, Buf);
+        DescriptorValid = NT_SUCCESS(RC) && UDFTaggedSectorValid(Vcb, Buf, Location);
         if (!NT_SUCCESS(RC)) {
             UDFPrint(("UDF: Block=%x, Location=%x: read failed\n", Block, Location));
-            try_return(RC);
         }
 
         // A duplicated UDF 2.50 metadata partition is a recovery copy, not
         // merely reserved space.  On a bad primary descriptor, validate the
         // corresponding mirror sector before exposing it to the caller.
-        if ((Vcb->MetadataFlags & UDF_METADATA_DUPLICATED) &&
-            Vcb->MetadataFileInfo && Vcb->MetadataMirrorFileInfo &&
-            Vcb->MetadataMirrorFileInfo->Dloc &&
-            Vcb->MetadataMirrorFileInfo->Dloc->DataLoc.Mapping &&
-            !UDFTaggedSectorValid(Vcb, Buf, Location)) {
-            MetadataLbn = UDFPhysLbaToMetadata(Vcb, Block);
+        if (View && (View->Flags & UDF_METADATA_DUPLICATED) && !DescriptorValid) {
+            MetadataLbn = UDFMetadataViewPhysToLba(View, Block);
             if (MetadataLbn != LBA_OUT_OF_EXTENT) {
-                MirrorLba = UDFExtentOffsetToLba(
-                    Vcb, Vcb->MetadataMirrorFileInfo->Dloc->DataLoc.Mapping,
-                    ((int64)MetadataLbn) << Vcb->SectorShift,
-                    NULL, NULL, &MirrorFlags, NULL);
-                if (MirrorLba != LBA_OUT_OF_EXTENT &&
-                    MirrorLba != Block &&
-                    MirrorFlags == EXTENT_RECORDED_ALLOCATED) {
+                MirrorLba = UDFMetadataViewLbaToPhys(View, MetadataLbn, TRUE, NULL);
+                if (MirrorLba != LBA_OUT_OF_EXTENT && MirrorLba != Block) {
                     MirrorBuf = (int8*)DbgAllocatePool(NonPagedPool,
                                                        Vcb->SectorSize);
                     if (MirrorBuf) {
@@ -7012,14 +9822,20 @@ UDFReadTagged(
                         if (NT_SUCCESS(MirrorStatus) &&
                             UDFTaggedSectorValid(Vcb, MirrorBuf, Location)) {
                             RtlCopyMemory(Buf, MirrorBuf, Vcb->SectorSize);
+                            RC = STATUS_SUCCESS;
+                            DescriptorValid = TRUE;
                             UDFPrint(("UDF: recovered metadata descriptor %x "
                                       "from mirror %x\n", Block, MirrorLba));
                         }
                         DbgFreePool(MirrorBuf);
+                        MirrorBuf = NULL;
                     }
                 }
             }
         }
+
+        if (!NT_SUCCESS(RC))
+            try_return(RC);
 
         *Ident = PTag->tagIdent;
 
@@ -7049,10 +9865,7 @@ UDFReadTagged(
         }
 
         // Verify the descriptor CRC
-        if (((PTag->descCRCLength) + sizeof(tag) <= Vcb->SectorSize) &&
-            (((PTag->descCRC) == UDFCrc((uint8 *)Buf + sizeof(tag),
-                                       PTag->descCRCLength, 0)) ||
-             !(PTag->descCRC)))
+        if (DescriptorValid)
         {
             /*        UDFPrint(("Tag ID: %x, ver %x\t", PTag->tagIdent, PTag->descVersion ));
                     if ((i == TID_FILE_ENTRY) ||
@@ -7070,7 +9883,8 @@ UDFReadTagged(
 try_exit:    NOTHING;
 
     } _SEH2_FINALLY {
-        ;
+        if (MirrorBuf) DbgFreePool(MirrorBuf);
+        UDFReleaseMetadataView(View);
     } _SEH2_END
 
     return RC;
@@ -7085,169 +9899,140 @@ UDFHardLinkFile__(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
     IN BOOLEAN IgnoreCase,
-    IN OUT BOOLEAN* Replace,        // replace if destination file exists
-    IN PUNICODE_STRING fn,       // destination
+    IN OUT BOOLEAN* Replace,
+    IN PUNICODE_STRING fn,
     IN OUT PUDF_FILE_INFO DirInfo1,
     IN OUT PUDF_FILE_INFO DirInfo2,
-    IN OUT PUDF_FILE_INFO FileInfo  // source (opened)
+    IN OUT PUDF_FILE_INFO FileInfo,
+    OUT PBOOLEAN TargetRemoved,
+    OUT PBOOLEAN LinkCreated
     )
 {
-    PUDF_FILE_INFO FileInfo2;
-    NTSTATUS status;
-    PDIR_INDEX_ITEM DirNdx1;
-    PDIR_INDEX_ITEM DirNdx2;
-    uint_di i;
-    BOOLEAN Recovery = FALSE;
-    BOOLEAN SameFE = FALSE;
-    uint32 NTAttr = 0;
+    _SEH2_VOLATILE PUDF_FILE_INFO Link = NULL;
+    _SEH2_VOLATILE PUDF_FILE_INFO Scratch = NULL;
+    _SEH2_VOLATILE BOOLEAN HoldOwned = FALSE;
+    _SEH2_VOLATILE BOOLEAN Converted = FALSE;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS CloseStatus;
+    PDIR_INDEX_ITEM SourceEntry, LinkEntry;
+    uint_di Index;
+    BOOLEAN ReplaceRequested = *Replace;
     ULONGLONG NewFidUniqueId;
 
-    // validate FileInfo
+    *TargetRemoved = *LinkCreated = FALSE;
+    *Replace = FALSE;
+    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY)
+        return STATUS_ACCESS_DENIED;
     ValidateFileInfo(DirInfo1);
     ValidateFileInfo(DirInfo2);
     ValidateFileInfo(FileInfo);
-    if (FileInfo->Dloc->FE_Flags & UDF_FE_FLAG_NEW_UNPUBLISHED) {
-        status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
-        if (!NT_SUCCESS(status))
-            return status;
-    }
-
-
-    if (UDFGetFileLinkCount(FileInfo) >= UDF_MAX_LINK_COUNT) {
-        // too many links to file...
+    if (!FileInfo->ParentFile || !FileInfo->FileIdent || UDFIsADirectory(FileInfo))
+        return STATUS_INVALID_PARAMETER;
+    if (FileInfo->Dloc->NamespaceScratch || FileInfo->Dloc->NamespaceTarget ||
+        FileInfo->Dloc->NamespaceTargetState != UdfNamespaceTargetNone ||
+        !NT_SUCCESS(FileInfo->Dloc->NamespaceTargetError) ||
+        FileInfo->Dloc->NamespaceScratchOwner)
+        return STATUS_SHARING_VIOLATION;
+    if (UDFGetFileLinkCount(FileInfo) >= UDF_MAX_LINK_COUNT)
         return STATUS_TOO_MANY_LINKS;
+    if (FileInfo->Dloc->FE_Flags & UDF_FE_FLAG_NEW_UNPUBLISHED) {
+        Status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+        if (!NT_SUCCESS(Status))
+            return Status;
     }
+    Index = 0;
+    if (DirInfo1->Dloc == DirInfo2->Dloc &&
+        NT_SUCCESS(UDFFindFile(Vcb, IgnoreCase, TRUE, fn, DirInfo2, &Index)) &&
+        Index == FileInfo->Index)
+        return STATUS_OBJECT_NAME_COLLISION;
 
-    i = 0;
-    if (DirInfo1 == DirInfo2) {
-        if (NT_SUCCESS(status = UDFFindFile(Vcb, IgnoreCase, TRUE, fn, DirInfo2, &i)) &&
-           (i==FileInfo->Index) ) {
-            // case-only difference
-            return STATUS_OBJECT_NAME_COLLISION;
+    /* Reserve the extra owner before any target can be removed. */
+    Scratch = MyAllocatePoolTag__(UDF_FILE_INFO_MT, sizeof(UDF_FILE_INFO), MEM_FE_TAG);
+    if (!Scratch)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(Scratch, sizeof(*Scratch));
+    _SEH2_TRY {
+        Status = UDFAllocateFileUID(IrpContext, Vcb, &NewFidUniqueId);
+        if (!NT_SUCCESS(Status))
+            _SEH2_LEAVE;
+
+        Status = UDFStageNamespaceDestination(IrpContext, Vcb, IgnoreCase,
+            ReplaceRequested, TRUE, fn, DirInfo2, FileInfo, (uint_di)-1,
+            (PUDF_FILE_INFO*)&Link, TargetRemoved);
+        *Replace = *TargetRemoved;
+        if (!NT_SUCCESS(Status) || !Link)
+            _SEH2_LEAVE; /* same-FE replacement is a no-op */
+        /* The stage owns the original temporary FI hold until adoption.
+         * A failed conversion retains that owner instead of closing it. */
+        Status = UDFAdoptHardLinkScratch(Vcb, FileInfo, Link, Scratch);
+        if (!NT_SUCCESS(Status)) {
+            /* The prepared stage retains its exact FI/parent hold. */
+            HoldOwned = FALSE;
+            Status = UDFQuarantineNamespace(Vcb, Status);
+            _SEH2_LEAVE;
         }
-    }
+        Scratch = NULL; /* now owned by Source.Dloc, never by this stack */
+        Converted = TRUE;
+        HoldOwned = TRUE; /* newly acquired exact Link/source-Dloc hold */
+        SourceEntry = UDFDirIndex(DirInfo1->Dloc->DirIndex, FileInfo->Index);
+        LinkEntry = UDFDirIndex(DirInfo2->Dloc->DirIndex, Link->Index);
+        Link->FileIdent->icb = FileInfo->FileIdent->icb;
+        Link->FileIdent->fileVersionNum = FileInfo->FileIdent->fileVersionNum;
+        ((struct FidADImpUse*)&Link->FileIdent->icb.impUse)->uniqueID = (uint32)NewFidUniqueId;
+        LinkEntry->FileEntryLoc = SourceEntry->FileEntryLoc;
+        LinkEntry->FI_Flags = (LinkEntry->FI_Flags & ~UDF_FI_FLAG_SYS_ATTR) |
+            UDF_FI_FLAG_FI_MODIFIED | UDF_FI_FLAG_LINKED;
+        Status = UDFPublishNamespaceStage(Vcb, Link,
+            SourceEntry->FileCharacteristics & ~FILE_DELETED);
+        if (!NT_SUCCESS(Status))
+            _SEH2_LEAVE;
+        SourceEntry->FI_Flags |= UDF_FI_FLAG_LINKED;
+        FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+        UDFIncFileLinkCount(FileInfo);
+        *LinkCreated = TRUE;
 
-    /* Acquire the replacement FID's ID before phase 0 so a failed durable
-     * high-water reservation cannot strand a half-linked object. */
-    status = UDFAllocateFileUID(IrpContext, Vcb, &NewFidUniqueId);
-    if (!NT_SUCCESS(status))
-        return status;
-
-    // PHASE 0
-    // try to create new FileIdent & FileEntry in Dir2
-
-HLinkRetry:
-    if (!NT_SUCCESS(status = UDFCreateFile__(IrpContext, Vcb, IgnoreCase, fn, UDFGetFileEALength(FileInfo),
-                    0, (FileInfo->Dloc->FileEntry->tagIdent == TID_EXTENDED_FILE_ENTRY),
-                    TRUE, DirInfo2, &FileInfo2))) {
-        if (UDFCleanUpFile__(Vcb, FileInfo2) && FileInfo2)
-            MyFreePool__(FileInfo2);
-        if (status == STATUS_ACCESS_DENIED) {
-            // try to recover >;->
-            if ((*Replace) && !Recovery) {
-                Recovery = TRUE;
-                status = UDFOpenFile__(IrpContext, Vcb, IgnoreCase, TRUE, fn, DirInfo2, &FileInfo2, NULL);
-                if (NT_SUCCESS(status)) {
-                    status = UDFDoesOSAllowFileToBeTargetForHLink__(FileInfo2);
-                    if (!NT_SUCCESS(status)) {
-                        UDFCloseFile__(IrpContext, Vcb, FileInfo2);
-                        goto cleanup_and_abort_hlink;
-                    }
-                    if ((FileInfo->Dloc == FileInfo2->Dloc)  &&
-                       (FileInfo != FileInfo2)) {
-                        SameFE = TRUE;
-                        // 'status' is already STATUS_SUCCESS here
-                    } else {
-                        status = UDFUnlinkFile__(IrpContext, Vcb, FileInfo2, TRUE);
-                    }
-                    UDFCloseFile__(IrpContext, Vcb, FileInfo2);
-                    if (UDFCleanUpFile__(Vcb, FileInfo2)) {
-                        MyFreePool__(FileInfo2);
-                        FileInfo2 = NULL;
-                        if (SameFE)
-                            return STATUS_SUCCESS;
-                    } else {
-                        // we get here if the FileInfo has associated
-                        // system-specific Fcb
-                        // Such fact means that not all system references
-                        // has already gone (except Linked file case)
-                        if (SameFE)
-                            return STATUS_SUCCESS;
-                        if (!NT_SUCCESS(status) ||
-                           (UDFGetFileLinkCount(FileInfo) < 1))
-                            status = STATUS_ACCESS_DENIED;
-                    }
-                    if (NT_SUCCESS(status)) goto HLinkRetry;
-                }
-cleanup_and_abort_hlink:
-                if (FileInfo2 && UDFCleanUpFile__(Vcb, FileInfo2)) {
-                    MyFreePool__(FileInfo2);
-                    FileInfo2 = NULL;
-                }
-            } else {
-                status = STATUS_OBJECT_NAME_COLLISION;
+        /* Only successful FE/FID publication plus the lower barrier lets
+         * the old FE become allocatable. Retire all its inner buffers. */
+        FileInfo->Dloc->NamespacePhase = UdfNamespaceDestinationSubmitted;
+        Status = UDFFlushFile__(IrpContext, Vcb, Link, 0);
+        if (NT_SUCCESS(Status))
+            Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+        if (NT_SUCCESS(Status)) {
+            FileInfo->Dloc->NamespacePhase = UdfNamespaceCommitted;
+            Status = UDFRetireNamespaceTarget(IrpContext, Vcb, FileInfo->Dloc);
+        }
+        if (NT_SUCCESS(Status))
+            Status = UDFRetireNamespaceScratch(IrpContext, Vcb, FileInfo);
+        if (!NT_SUCCESS(Status))
+            Status = UDFQuarantineNamespace(Vcb, Status);
+    } _SEH2_FINALLY {
+        BOOLEAN Abnormal = _SEH2_AbnormalTermination();
+        if (Abnormal && (Converted || *TargetRemoved || Vcb->PendingNamespaceCount))
+            UDFQuarantineNamespace(Vcb, STATUS_UNSUCCESSFUL);
+        _SEH2_TRY {
+            if (Link && HoldOwned) {
+                /* No second decrement if late close writeback raises. */
+                HoldOwned = FALSE;
+                CloseStatus = UDFDereferenceFileChecked(Vcb, Link);
+                if (NT_SUCCESS(CloseStatus) && !Abnormal && NT_SUCCESS(Status))
+                    CloseStatus = UDFCompleteFileClose(IrpContext, Vcb, Link);
+                if (!Abnormal && NT_SUCCESS(Status)) Status = CloseStatus;
             }
-        }
-        return status;
-    }
-    // update pointers
-    DirNdx1 = UDFDirIndex(DirInfo1->Dloc->DirIndex, FileInfo->Index);
-    DirNdx2 = UDFDirIndex(DirInfo2->Dloc->DirIndex, FileInfo2->Index);
-
-    // copy file attributes to newly created FileIdent
-    NTAttr = UDFAttributesToNT(DirNdx1, FileInfo->Dloc->FileEntry);
-    FileInfo2->FileIdent->fileVersionNum = FileInfo->FileIdent->fileVersionNum;
-
-    // PHASE 1
-    // copy all necessary info from FileInfo to FileInfo2
-
-    FileInfo2->FileIdent->icb = FileInfo->FileIdent->icb;
-    FileInfo2->FileIdent->fileCharacteristics = FileInfo->FileIdent->fileCharacteristics;
-    FileInfo2->FileIdent->fileVersionNum = FileInfo->FileIdent->fileVersionNum;
-
-    DirNdx2->FileCharacteristics = DirNdx1->FileCharacteristics & ~FILE_DELETED;
-    DirNdx2->FileEntryLoc = DirNdx1->FileEntryLoc;
-    DirNdx2->FI_Flags = (DirNdx1->FI_Flags & ~UDF_FI_FLAG_SYS_ATTR) | UDF_FI_FLAG_FI_MODIFIED | UDF_FI_FLAG_LINKED;
-
-    UDFAttributesToUDF(DirNdx2, FileInfo2->Dloc->FileEntry, NTAttr);
-
-    // PHASE 2
-    // update FileInfo
-
-    FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
-    DirNdx1->FI_Flags = DirNdx2->FI_Flags;
-    UDFIncFileLinkCount(FileInfo); // increase to 1
-//    UDFUpdateModifyTime(Vcb, FileInfo);
-    FileInfo->Dloc->LinkRefCount += FileInfo2->Dloc->LinkRefCount;
-    if (FileInfo2->FileIdent)
-        ((struct FidADImpUse*)&(FileInfo2->FileIdent->icb.impUse))->uniqueID = (uint32)NewFidUniqueId;
-
-    // PHASE 3
-    // drop all unnecessary info from FileInfo2
-
-    UDFFreeFESpace(Vcb, DirInfo2, &(FileInfo2->Dloc->FELoc));
-    UDFRemoveDloc(Vcb, FileInfo2->Dloc);
-
-    // PHASE 4
-    // perform in-memory linkage (update driver's tree structures) and flush
-
-    FileInfo2->Dloc = FileInfo->Dloc;
-    UDFInsertLinkedFile(FileInfo2, FileInfo);
-
-    UDFCloseFile__(IrpContext, Vcb, FileInfo2);
-    if (UDFCleanUpFile__(Vcb, FileInfo2)) {
-        MyFreePool__(FileInfo2);
-    }
-    // return 'delete target' status
-    (*Replace) = Recovery;
-
-    return STATUS_SUCCESS;
+            if (Link && !Abnormal && (UDFCleanUpFile__(Vcb, Link) & UDF_FREE_FILEINFO))
+                MyFreePool__(Link);
+        } _SEH2_FINALLY {
+            if (Scratch)
+                MyFreePool__(Scratch);
+        } _SEH2_END;
+    } _SEH2_END;
+    return Status;
 } // end UDFHardLinkFile__()
 
 /*
-    This routine allocates FileEntry with in-ICB zero-sized data
-    If it returns status != STATUS_SUCCESS caller should call UDFCleanUpFile__
-    for returned pointer *WITHOUT* using UDFCloseFile__
+    This internal constructor allocates an in-ICB zero-sized FE but leaves
+    it UNDER_INIT/Constructing even on success. The stream-create owner must
+    bind its exact parent before UDFCompleteFileInfoConstruction. A failed
+    constructor does not own a successful-open reference to close.
  */
 NTSTATUS
 UDFCreateRootFile__(
@@ -7304,97 +10089,249 @@ UDFCreateRootFile__(
     FileInfo->Dloc->DataLoc.Mapping[0].extLength &= UDF_EXTENT_LENGTH_MASK;
     FileInfo->Dloc->FELoc.Mapping[0].extLength &= UDF_EXTENT_LENGTH_MASK;
     status = UDFWriteData(IrpContext, Vcb, TRUE, ((int64)(FileInfo->Dloc->FELoc.Mapping[0].extLocation)) << Vcb->SectorShift, Vcb->SectorSize, FALSE, Vcb->ZBuffer, &ReadBytes);
-    if (!NT_SUCCESS(status))
-        return status;
+    if (status == STATUS_SUCCESS && ReadBytes != Vcb->SectorSize)
+        status = STATUS_IO_DEVICE_ERROR;
+    if (status != STATUS_SUCCESS)
+        return NT_SUCCESS(status) ? STATUS_IO_DEVICE_ERROR : status;
 
-    UDFReferenceFile__(FileInfo);
-    UDFReleaseDloc(Vcb, FileInfo->Dloc);
+    /* The sole stream-directory caller must bind its parent and operation
+     * owner before publishing the first successful FI reference. */
     return STATUS_SUCCESS;
 } // end UDFCreateRootFile__()
 
-/*
-    This routine tries to create StreamDirectory associated with given file
-    Caller should use UDFCleanUpFile__ if returned status != STATUS_SUCCESS
- */
+/* Reserve a lifetime owner before any child allocation or I/O. Existing
+ * Main/VCB writer ownership serializes the base representation; DlocResource2
+ * serializes the exact FI hold and the global no-CLOSED count. */
+static NTSTATUS
+UDFReserveStreamCreate(PVCB Vcb, PUDF_FILE_INFO BaseFile,
+                        PUDF_STREAM_CREATE_CONTEXT* Result)
+{
+    PUDF_DATALOC_INFO Dloc = BaseFile->Dloc;
+    PUDF_STREAM_CREATE_CONTEXT Context;
+    NTSTATUS Status = STATUS_SUCCESS;
+    *Result = NULL;
+    Context = (PUDF_STREAM_CREATE_CONTEXT)MyAllocatePool__(NonPagedPool, sizeof(*Context));
+    if (!Context) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(Context, sizeof(*Context));
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (Dloc->StreamCreate) {
+            Status = NT_SUCCESS(Dloc->StreamCreate->FirstError) ? STATUS_DEVICE_BUSY :
+                     Dloc->StreamCreate->FirstError;
+            _SEH2_LEAVE;
+        }
+        if (Dloc->CleanupOwner || Dloc->StreamDeleteOwner || Dloc->StreamDeleteContextOwner ||
+            Dloc->NamespaceScratch || Dloc->NamespaceTarget || Dloc->NamespaceScratchOwner ||
+            Dloc->DeleteCommitted || Vcb->PendingNamespaceCount < 0 ||
+            Vcb->PendingNamespaceCount == MAXLONG || BaseFile->RefCount >= MAXLONG ||
+            Dloc->LinkRefCount >= MAXLONG ||
+            (BaseFile->ParentFile && BaseFile->ParentFile->OpenCount >= MAXLONG)) {
+            Status = STATUS_DEVICE_BUSY;
+            _SEH2_LEAVE;
+        }
+        Status = UDFReferenceFileChecked(Vcb, BaseFile);
+        if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+        Context->BaseFile = BaseFile;
+        Context->Thread = PsGetCurrentThread();
+        Context->Phase = UdfStreamCreateReserved;
+        Dloc->StreamCreate = Context;
+        InterlockedIncrement(&Vcb->PendingNamespaceCount);
+        *Result = Context;
+        Context = NULL;
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+        if (Context) MyFreePool__(Context);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Non-I/O transfer. A successful child open goes to the caller exactly once;
+ * an empty failed attempt can release just its extra base hold. Never close
+ * or unlink a possibly written child from a finally/unwind path. */
+static NTSTATUS
+UDFFinishStreamCreate(PVCB Vcb, PUDF_STREAM_CREATE_CONTEXT* OwnedContext,
+                       PUDF_FILE_INFO* ChildResult)
+{
+    PUDF_STREAM_CREATE_CONTEXT Context = *OwnedContext;
+    PUDF_FILE_INFO BaseFile = Context->BaseFile, Child = Context->Child;
+    PUDF_DATALOC_INFO Dloc = BaseFile->Dloc;
+    NTSTATUS Status;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (Dloc->StreamCreate != Context || Vcb->PendingNamespaceCount <= 0 ||
+            (Child && (Context->Phase != UdfStreamCreateCommitted || !ChildResult ||
+                       !Child->Dloc || Child->Dloc->StreamCreate != Context ||
+                       Child->Constructing || !Child->RefCount))) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
+        }
+        Status = UDFDereferenceFileLocked(Vcb, BaseFile);
+        if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+        if (Child) Child->Dloc->StreamCreate = NULL;
+        Dloc->StreamCreate = NULL;
+        InterlockedDecrement(&Vcb->PendingNamespaceCount);
+        Context->BaseFile = Context->Child = NULL;
+        *OwnedContext = NULL;
+        if (ChildResult) *ChildResult = Child;
+    } _SEH2_FINALLY {
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    if (!*OwnedContext) MyFreePool__(Context);
+    return Status;
+}
+
+/* Child FE -> barrier -> base streamDirectoryICB FE -> barrier. A failed
+ * generation retains its exact constructor/open/base owners and first error;
+ * it is not converted to a successful destructive best-effort unlink. */
 NTSTATUS
 UDFCreateStreamDir__(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN PUDF_FILE_INFO FileInfo,    // file containing stream-dir
-    OUT PUDF_FILE_INFO* _SDirInfo  // this is to be filled & doesn't contain
-                                   // any pointers
+    IN PUDF_FILE_INFO FileInfo,
+    OUT PUDF_FILE_INFO* _SDirInfo
     )
 {
-    NTSTATUS status;
-    PUDF_FILE_INFO SDirInfo;
-    uint16 Ident;
+    PUDF_DATALOC_INFO Dloc;
+    PUDF_STREAM_CREATE_CONTEXT Context = NULL;
+    PUDF_FILE_INFO Child;
+    PEXTENDED_FILE_ENTRY BaseEntry;
+    PFCB Fcb;
+    uint32 PartNum, Lbn, Header;
+    NTSTATUS Status, ReleaseStatus;
 
+    if (!_SDirInfo) return STATUS_INVALID_PARAMETER;
     *_SDirInfo = NULL;
-    ValidateFileInfo(FileInfo);
-    // check currently recorded UDF revision
-    if (!UDFIsStreamsSupported(Vcb))
+    if (!IrpContext || !Vcb || !FileInfo || !(Dloc = FileInfo->Dloc))
         return STATUS_INVALID_PARAMETER;
-    // check if we are allowed to associate Stream Dir with this file
-    if ((FileInfo->ParentFile && UDFIsAStreamDir(FileInfo->ParentFile)) ||
-        UDFHasAStreamDir(FileInfo))
+    if (!UDFIsStreamsSupported(Vcb)) return STATUS_NOT_SUPPORTED;
+    if (Dloc->StreamCreate)
+        return NT_SUCCESS(Dloc->StreamCreate->FirstError) ? STATUS_DEVICE_BUSY : Dloc->StreamCreate->FirstError;
+    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY) return STATUS_MEDIA_WRITE_PROTECTED;
+    if ((FileInfo->ParentFile && UDFIsAStreamDir(FileInfo->ParentFile)) || UDFHasAStreamDir(FileInfo))
         return STATUS_FILE_DELETED;
-    // check if we have Deleted SDir
-    if (FileInfo->Dloc->SDirInfo &&
-       UDFIsSDirDeleted(FileInfo->Dloc->SDirInfo))
-        return STATUS_ACCESS_DENIED;
-    // check if this file has ExtendedFileEntry
-    if ((Ident = FileInfo->Dloc->FileEntry->tagIdent) != TID_EXTENDED_FILE_ENTRY) {
-        if (!NT_SUCCESS(status = UDFConvertFEToExtended(IrpContext, Vcb, FileInfo)))
-            return status;
+    if (Dloc->SDirInfo) return STATUS_ACCESS_DENIED;
+    Fcb = Dloc->CommonFcb;
+    if (Fcb) {
+        if (!Fcb->FcbNonpaged || !Fcb->FileInfo || Fcb->FileInfo->Dloc != Dloc ||
+            !ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource) ||
+            ExIsResourceAcquiredSharedLite(&Fcb->FcbNonpaged->FcbPagingIoResource))
+            return STATUS_INVALID_DEVICE_STATE;
+    } else if (FileInfo->Fcb || !ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource)) {
+        return STATUS_INVALID_DEVICE_STATE;
     }
-
-    uint32 PartNum = UDFGetRefPartNumByPhysLba(Vcb, FileInfo->Dloc->FELoc.Mapping[0].extLocation);
-    // create stream directory file
-    if (!NT_SUCCESS(status = UDFCreateRootFile__(IrpContext, Vcb, PartNum, 0,0, TRUE, &SDirInfo)))
-        return status;
-    // link objects
-    SDirInfo->ParentFile = FileInfo;
-    // record directory structure
-    SDirInfo->Dloc->FE_Flags |= (UDF_FE_FLAG_FE_MODIFIED | UDF_FE_FLAG_IS_SDIR);
-
-    status = UDFRecordDirectory__(IrpContext, Vcb, SDirInfo);
-    UDFIncFileCounter(Vcb);
-    UDFDecDirCounter(Vcb);
-
-    InterlockedIncrement((PLONG)&FileInfo->OpenCount);
-    if (!NT_SUCCESS(status)) {
-        UDFUnlinkFile__(IrpContext, Vcb, SDirInfo, TRUE);
-        UDFCloseFile__(IrpContext, Vcb, SDirInfo);
-        UDFCleanUpFile__(Vcb, SDirInfo);
-        MyFreePool__(SDirInfo);
-        ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLength = 0;
-        ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLocation.partitionReferenceNum = 0;
-        ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLocation.logicalBlockNum = 0;
-        return status;
+    if (!Dloc->FileEntry || Dloc->FileEntry->tagIdent != TID_EXTENDED_FILE_ENTRY) {
+        Status = UDFConvertFEToExtended(IrpContext, Vcb, FileInfo);
+        if (!NT_SUCCESS(Status)) return Status;
     }
-    *_SDirInfo = SDirInfo;
-    // do some init
-    ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLength = Vcb->SectorSize;
-    ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLocation.partitionReferenceNum = (uint16)PartNum;
-    ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLocation.logicalBlockNum =
-        UDFPhysLbaToPart(Vcb, PartNum, SDirInfo->Dloc->FELoc.Mapping[0].extLocation);
-
-    if (SDirInfo->Dloc->FileEntry->tagIdent == TID_FILE_ENTRY) {
-        ((PFILE_ENTRY)(SDirInfo->Dloc->FileEntry))->icbTag.fileType = UDF_FILE_TYPE_STREAMDIR;
-        ((PFILE_ENTRY)(SDirInfo->Dloc->FileEntry))->uniqueID =
-            ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->uniqueID;
-    }
-    else {
-        ((PEXTENDED_FILE_ENTRY)(SDirInfo->Dloc->FileEntry))->icbTag.fileType = UDF_FILE_TYPE_STREAMDIR;
-        ((PEXTENDED_FILE_ENTRY)(SDirInfo->Dloc->FileEntry))->uniqueID =
-            ((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->uniqueID;
-    }
-
-    UDFDecFileLinkCount(SDirInfo);
-    FileInfo->Dloc->FE_Flags |= (UDF_FE_FLAG_FE_MODIFIED | UDF_FE_FLAG_HAS_SDIR);
-    // open & finalize linkage
-    FileInfo->Dloc->SDirInfo = SDirInfo;
-    return STATUS_SUCCESS;
+    Status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+    if (!NT_SUCCESS(Status)) return Status;
+    BaseEntry = (PEXTENDED_FILE_ENTRY)Dloc->FileEntry;
+    if (BaseEntry->streamDirectoryICB.extLength || !Dloc->FELoc.Mapping || !Vcb->Partitions)
+        return STATUS_FILE_CORRUPT_ERROR;
+    PartNum = UDFGetRefPartNumByPhysLba(Vcb, Dloc->FELoc.Mapping[0].extLocation);
+    if (PartNum >= Vcb->PartitionMaps || PartNum > MAXUSHORT)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Status = UDFReserveStreamCreate(Vcb, FileInfo, &Context);
+    if (!NT_SUCCESS(Status)) return Status;
+    _SEH2_TRY {
+    _SEH2_TRY {
+        /* Constructor output belongs to Context even if allocation or I/O
+         * fails/raises before an ordinary child open has been completed. */
+        Status = UDFCreateRootFile__(IrpContext, Vcb, PartNum, 0, 0, TRUE, &Context->Child);
+        Child = Context->Child;
+        if (Child && Child->Dloc) {
+            UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+            Child->Dloc->StreamCreate = Context;
+            UDFReleaseResource(&Vcb->DlocResource2);
+        }
+        if (!NT_SUCCESS(Status)) goto stream_create_exit;
+        if (!Child || !Child->Dloc || !Child->Dloc->FileEntry ||
+            Child->Dloc->FileEntry->tagIdent != TID_EXTENDED_FILE_ENTRY) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto stream_create_exit;
+        }
+        Context->Phase = UdfStreamCreateConstructed;
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        _SEH2_TRY {
+            if (FileInfo->OpenCount >= MAXLONG || !Child->Constructing ||
+                Child->ConstructionReferenceOwned || Child->RefCount) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            Status = UDFSetFileInfoConstructionParent(Vcb, Child, FileInfo);
+            if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+            /* This first successful child reference acquires the exact
+             * parent OpenCount before any directory payload can be written. */
+            Status = UDFCompleteFileInfoConstruction(Vcb, Child);
+            if (NT_SUCCESS(Status)) Context->Phase = UdfStreamCreateChildOpen;
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&Vcb->DlocResource2);
+        } _SEH2_END;
+        if (!NT_SUCCESS(Status)) goto stream_create_exit;
+        Child->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED | UDF_FE_FLAG_IS_SDIR;
+        ((PEXTENDED_FILE_ENTRY)Child->Dloc->FileEntry)->icbTag.fileType = UDF_FILE_TYPE_STREAMDIR;
+        ((PEXTENDED_FILE_ENTRY)Child->Dloc->FileEntry)->uniqueID = BaseEntry->uniqueID;
+        UDFDecFileLinkCount(Child); /* stream directories have no ordinary name link */
+        Status = UDFRecordDirectory__(IrpContext, Vcb, Child);
+        if (!NT_SUCCESS(Status)) goto stream_create_exit;
+        Status = UDFFlushFE(IrpContext, Vcb, Child, PartNum);
+        if (NT_SUCCESS(Status)) Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+        if (!NT_SUCCESS(Status)) goto stream_create_exit;
+        Context->Phase = UdfStreamCreateChildDurable;
+        Lbn = UDFPhysLbaToPart(Vcb, PartNum, Child->Dloc->FELoc.Mapping[0].extLocation);
+        if (Lbn == LBA_OUT_OF_EXTENT) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto stream_create_exit;
+        }
+        RtlZeroMemory(&BaseEntry->streamDirectoryICB, sizeof(BaseEntry->streamDirectoryICB));
+        BaseEntry->streamDirectoryICB.extLength = Vcb->SectorSize;
+        BaseEntry->streamDirectoryICB.extLocation.partitionReferenceNum = (uint16)PartNum;
+        BaseEntry->streamDirectoryICB.extLocation.logicalBlockNum = Lbn;
+        Dloc->SDirInfo = Child;
+        Dloc->FE_Flags &= ~UDF_FE_FLAG_HAS_DEL_SDIR;
+        Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED | UDF_FE_FLAG_HAS_SDIR;
+        Context->Phase = UdfStreamCreateBasePrepared;
+        Status = UDFFlushFE(IrpContext, Vcb, FileInfo, PartNum);
+        if (NT_SUCCESS(Status)) Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+        if (!NT_SUCCESS(Status)) goto stream_create_exit;
+        Context->Phase = UdfStreamCreateCommitted;
+        Status = UDFFinishStreamCreate(Vcb, &Context, _SDirInfo);
+stream_create_exit:
+        if (Status != STATUS_SUCCESS && NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) Status = STATUS_FILE_CORRUPT_ERROR;
+        if (Context) {
+            Child = Context->Child;
+            if (Child && !Child->Dloc) {
+                /* The root constructor's unbound shell has no inner
+                 * allocations or successful-open hold to close. */
+                MyFreePool__(Child);
+                Context->Child = NULL;
+            }
+            if (!Context->Child) {
+                ReleaseStatus = UDFFinishStreamCreate(Vcb, &Context, NULL);
+                if (NT_SUCCESS(Status) && !NT_SUCCESS(ReleaseStatus)) Status = ReleaseStatus;
+            }
+            if (Context) {
+                UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+                if (Context->Child && Context->Child->Dloc)
+                    Context->Child->Dloc->StreamCreate = Context;
+                if (NT_SUCCESS(Context->FirstError))
+                    Context->FirstError = NT_SUCCESS(Status) ? STATUS_FILE_CORRUPT_ERROR : Status;
+                Context->Thread = NULL;
+                UDFReleaseResource(&Vcb->DlocResource2);
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                            Context->FirstError, STATUS_SUCCESS);
+                if (NT_SUCCESS(Status)) Status = Context->FirstError;
+            }
+        }
+    } _SEH2_END;
+    return Status;
 } // end UDFCreateStreamDir__()
 
 /*
@@ -7409,13 +10346,23 @@ UDFOpenStreamDir__(
                                    // any pointers
     )
 {
-    NTSTATUS status;
+    NTSTATUS status, ReleaseStatus;
+    BOOLEAN ClonedReference = FALSE;
     PUDF_FILE_INFO SDirInfo;
     PUDF_FILE_INFO ParSDirInfo;
     uint16 Ident;
+    uint32 Header;
 
+    if (!_SDirInfo) return STATUS_INVALID_PARAMETER;
     *_SDirInfo = NULL;
+    if (!IrpContext || !Vcb || !FileInfo || !FileInfo->Dloc)
+        return STATUS_INVALID_PARAMETER;
+    status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+    if (!NT_SUCCESS(status)) return status;
     ValidateFileInfo(FileInfo);
+    if (FileInfo->Dloc->StreamCreate)
+        return NT_SUCCESS(FileInfo->Dloc->StreamCreate->FirstError) ? STATUS_DEVICE_BUSY :
+               FileInfo->Dloc->StreamCreate->FirstError;
     // check if this file has ExtendedFileEntry
     if ((Ident = FileInfo->Dloc->FileEntry->tagIdent) != TID_EXTENDED_FILE_ENTRY) {
         return STATUS_NOT_FOUND;
@@ -7430,22 +10377,32 @@ UDFOpenStreamDir__(
         // All right. Look for parallel SDir (if any)
         if (SDirInfo->ParentFile != FileInfo) {
             ParSDirInfo = UDFLocateParallelFI(FileInfo, 0, SDirInfo);
-            BrutePoint();
-            if (ParSDirInfo->ParentFile != FileInfo) {
+            if (!ParSDirInfo || ParSDirInfo->ParentFile != FileInfo) {
                 SDirInfo = (PUDF_FILE_INFO)MyAllocatePoolTag__(UDF_FILE_INFO_MT,sizeof(UDF_FILE_INFO), MEM_SDFINF_TAG);
                 *_SDirInfo = SDirInfo;
                 if (!SDirInfo) return STATUS_INSUFFICIENT_RESOURCES;
                 RtlCopyMemory(SDirInfo, FileInfo->Dloc->SDirInfo, sizeof(UDF_FILE_INFO));
     //          SDirInfo->NextLinkedFile = FileInfo->Dloc->SDirInfo->NextLinkedFile; // is already done
-                UDFInsertLinkedFile(SDirInfo, FileInfo->Dloc->SDirInfo);
                 SDirInfo->RefCount = 0;
+                SDirInfo->OpenCount = 0;
+                SDirInfo->ListPtr = NULL;
                 SDirInfo->ParentFile = FileInfo;
                 SDirInfo->Fcb = NULL;
+                status = UDFReferenceClonedFile(Vcb, SDirInfo, FileInfo->Dloc->SDirInfo);
+                if (!NT_SUCCESS(status)) {
+                    MyFreePool__(SDirInfo);
+                    *_SDirInfo = NULL;
+                    return status;
+                }
+                ClonedReference = TRUE;
             } else {
                 SDirInfo = ParSDirInfo;
             }
         }
-        UDFReferenceFile__(SDirInfo);
+        if (!ClonedReference) {
+            status = UDFReferenceFileChecked(Vcb, SDirInfo);
+            if (!NT_SUCCESS(status)) return status;
+        }
         *_SDirInfo = SDirInfo;
         return STATUS_SUCCESS;
     }
@@ -7454,341 +10411,69 @@ UDFOpenStreamDir__(
         return STATUS_NOT_FOUND;
     SDirInfo = (PUDF_FILE_INFO)MyAllocatePoolTag__(UDF_FILE_INFO_MT,sizeof(UDF_FILE_INFO), MEM_SDFINF_TAG);
     if (!SDirInfo) return STATUS_INSUFFICIENT_RESOURCES;
-    *_SDirInfo = SDirInfo;
-    status = UDFOpenRootFile__(IrpContext, Vcb, &(((PEXTENDED_FILE_ENTRY)(FileInfo->Dloc->FileEntry))->streamDirectoryICB.extLocation) ,SDirInfo);
-    if (!NT_SUCCESS(status)) return status;
-    // open & finalize linkage
+    RtlZeroMemory(SDirInfo, sizeof(*SDirInfo));
+    status = STATUS_UNSUCCESSFUL;
+    _SEH2_TRY {
+        _SEH2_TRY {
+            status = UDFOpenRootFileWithParent__(IrpContext, Vcb,
+                &((PEXTENDED_FILE_ENTRY)FileInfo->Dloc->FileEntry)->streamDirectoryICB.extLocation,
+                FileInfo, UDF_FILE_TYPE_STREAMDIR, SDirInfo);
+            if (status != STATUS_SUCCESS && NT_SUCCESS(status)) status = STATUS_IO_DEVICE_ERROR;
+        } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                      EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+            status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) status = STATUS_FILE_CORRUPT_ERROR;
+        if (status != STATUS_SUCCESS) {
+            /* These failures precede constructor completion; no ordinary
+             * open is closed twice or silently dropped by a caller which
+             * ignores its failure output. Preserve the exact constructor
+             * hold/parent for the existing failed-generation collector. */
+            ReleaseStatus = UDFRetainFailedStreamOpen(Vcb, &SDirInfo);
+            if (NT_SUCCESS(status) && !NT_SUCCESS(ReleaseStatus)) status = ReleaseStatus;
+        }
+    } _SEH2_END;
+    if (status != STATUS_SUCCESS) return status;
+    /* The successful constructor already owns its exact parent count and
+     * indexed with that context. Publish only the weak cache link here. */
     FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_HAS_SDIR;
-    SDirInfo->Dloc->FE_Flags |= UDF_FE_FLAG_IS_SDIR;
     FileInfo->Dloc->SDirInfo = SDirInfo;
-    SDirInfo->ParentFile = FileInfo;
-
-    InterlockedIncrement((PLONG)&FileInfo->OpenCount);
+    *_SDirInfo = SDirInfo;
 
     return STATUS_SUCCESS;
 } // end UDFOpenStreamDir__()
 
 /*
-    This routine records VAT & VAT Icb at the end of session
+    Sequential VAT checkpoint contract; the append backend is unavailable.
  */
 NTSTATUS
-UDFRecordVAT(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb
-    )
+UDFRecordVAT(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb)
 {
-    uint32 Offset;
-    uint32 to_read;
-    uint32 hdrOffset, hdrOffsetNew;
-    uint32 hdrLen;
-    NTSTATUS status;
-    SIZE_T WrittenBytes;
-    uint32 len;
-    uint16 PartNdx = (uint16)Vcb->VatPartNdx;
-    uint16 PartNum = UDFGetPartNumByPartRef(Vcb, PartNdx);
-    uint32 root = UDFPartStart(Vcb, PartNum);
-    PUDF_FILE_INFO VatFileInfo = Vcb->VatFileInfo;
-    uint32 i;
-    PEXTENT_MAP Mapping;
-    uint32 off, BS, NWA;
-    int8* Old;
-    int8* New;
-    uint32* Vat;
-    uint8 AllocMode;
-    uint32 VatLen;
-    uint32 PacketOffset;
-    uint32 MaxPacket = PACKETSIZE_UDF;
-    uint32 OldLen;
-    EntityID* eID;
-
-    if (!(Vat = Vcb->Vat) || !VatFileInfo) return STATUS_INVALID_PARAMETER;
-    // Disable VAT-based translation
-    Vcb->Vat = NULL;
-    // sync VAT and FSBM
-    // Bitmap is LBN-indexed, VAT index i is already partition-relative
-    len = min(UDFPartLen(Vcb, PartNum), Vcb->FSBM_BitCount);
-    len = min(Vcb->VatCount, len);
-    for(i=0; i<len; i++) {
-        BOOLEAN isFree;
-        if (Vcb->BitmapFcb) {
-            isFree = UDFIsBitmapBitFree(Vcb, i);
-        } else {
-            isFree = UDFGetFreeBit(Vcb->FSBM_Bitmap, i);
-        }
-        if (isFree)
-            Vat[i] = UDF_VAT_FREE_ENTRY;
-    }
-    UDFUnpinBitmapPage(Vcb);
-    // Ok, now we shall construct new VAT image...
-    // !!! NOTE !!!
-    // Both VAT copies - in-memory & on-disc
-    // contain _relative_ addresses
-    OldLen = len = (uint32)UDFGetFileSize(Vcb->VatFileInfo);
-    VatLen = (Vcb->SessionEndLba - root + 1) * sizeof(uint32);
-    Old = (int8*)DbgAllocatePool(PagedPool, OldLen);
-    if (!Old) {
-        DbgFreePool(Vat);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    // read old one
-    status = UDFReadFile__(IrpContext, Vcb, VatFileInfo, 0, OldLen, FALSE, Old);
-    if (!NT_SUCCESS(status)) {
-        DbgFreePool(Vat);
-        DbgFreePool(Old);
-        return status;
-    }
-    // prepare some pointers
-    // and fill headers
-    if (Vcb->Partitions[PartNdx].PartitionType == UDF_VIRTUAL_MAP15) {
-        Offset = 0;
-        to_read =
-        hdrOffset = len - sizeof(struct VirtualAllocationTable15);
-        hdrLen = sizeof(struct VirtualAllocationTable15);
-        hdrOffsetNew = VatLen;
-        New = (int8*)DbgAllocatePool(PagedPool, VatLen + hdrLen);
-        if (!New) {
-            DbgFreePool(Vat);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        RtlCopyMemory(New+hdrOffsetNew, Old+hdrOffset, hdrLen);
-        ((struct VirtualAllocationTable15*)(New + hdrOffset))->previousVATICB =
-            VatFileInfo->Dloc->FELoc.Mapping[0].extLocation - root;
-        eID = &(((struct VirtualAllocationTable15*)(New + hdrOffset))->ident);
-
-        UDFSetEntityID_imp(eID, UDF_ID_ALLOC);
-
-/*        RtlCopyMemory((int8*)&(eID->ident), UDF_ID_ALLOC, sizeof(UDF_ID_ALLOC) );
-        iis = (impIdentSuffix*)&(eID->identSuffix);
-        iis->OSClass = UDF_OS_CLASS_WINNT;
-        iis->OSIdent = UDF_OS_ID_WINNT;*/
-    } else {
-        struct VirtualAllocationTable20* Buf;
-
-        Offset = ((struct VirtualAllocationTable20*)Old)->lengthHeader;
-        to_read = len - Offset;
-        hdrOffset = 0;
-        hdrLen = sizeof(struct VirtualAllocationTable20);
-        hdrOffsetNew = 0;
-        New = (int8*)DbgAllocatePool(PagedPool, VatLen + hdrLen);
-        if (!New) {
-            DbgFreePool(Vat);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        RtlCopyMemory(New+hdrOffsetNew, Old+hdrOffset, hdrLen);
-        ((struct VirtualAllocationTable20*)New)->previousVatICBLoc =
-            VatFileInfo->Dloc->FELoc.Mapping[0].extLocation - root;
-
-        Buf = (struct VirtualAllocationTable20*)New;
-
-        Buf->minReadRevision  = Vcb->minUDFReadRev;
-        Buf->minWriteRevision = Vcb->minUDFWriteRev;
-        Buf->maxWriteRevision = Vcb->maxUDFWriteRev;
-
-        Buf->numFIDSFiles       = Vcb->numFiles;
-        Buf->numFIDSDirectories = Vcb->numDirs;
-    }
-
-    RtlCopyMemory(New+Offset, Vat, VatLen);
-    //
-    if (VatFileInfo->Dloc->FileEntry->tagIdent == TID_EXTENDED_FILE_ENTRY) {
-        eID = &(((PEXTENDED_FILE_ENTRY)(VatFileInfo->Dloc->FileEntry))->impIdent);
-    } else {
-        eID = &(((PFILE_ENTRY)(VatFileInfo->Dloc->FileEntry))->impIdent);
-    }
-
-#if 0
-    UDFSetEntityID_imp(eID, UDF_ID_DEVELOPER);
-#endif
-
-/*    RtlCopyMemory((int8*)&(eID->ident), UDF_ID_DEVELOPER, sizeof(UDF_ID_DEVELOPER) );
-    iis = (impIdentSuffix*)&(eID->identSuffix);
-    iis->OSClass = UDF_OS_CLASS_WINNT;
-    iis->OSIdent = UDF_OS_ID_WINNT;*/
-
-    VatFileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
-    // drop VAT
-    DbgFreePool(Vat);
-    len = VatLen;
-    // the operation of resize can modifiy WriteCount in WCache due to movement
-    // of the data from FE. That's why we should remember PacketOffset now
-    if (to_read < VatLen) {
-        status = UDFResizeFile__(IrpContext, Vcb, VatFileInfo, len = hdrLen + VatLen);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
-        UDFMarkSpaceAsXXX(Vcb, VatFileInfo->Dloc, VatFileInfo->Dloc->DataLoc.Mapping, AS_DISCARDED); //free
-    }
-    //PacketOffset = WCacheGetWriteBlockCount__(&(Vcb->FastCache));
-    PacketOffset = 0;
-    if ( ((((PFILE_ENTRY)(VatFileInfo->Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK) == ICB_FLAG_AD_IN_ICB) ) {
-        // now we'll place FE & built-in data to the last sector of
-        // the last packet will be recorded
-        if (!PacketOffset) {
-            // add padding
-            UDFWriteData(IrpContext, Vcb, TRUE, ((uint64)Vcb->NWA) << Vcb->SectorShift, 1, FALSE, Old, &WrittenBytes);
-            PacketOffset++;
-        } else {
-            Vcb->Vat = (uint32*)(New+Offset);
-            Vcb->Vat = NULL;
-        }
-        VatFileInfo->Dloc->FELoc.Mapping[0].extLocation =
-        VatFileInfo->Dloc->DataLoc.Mapping[0].extLocation =
-            Vcb->NWA+PacketOffset;
-        VatFileInfo->Dloc->FELoc.Modified = TRUE;
-        // setup descTag
-        ((PFILE_ENTRY)(VatFileInfo->Dloc->FileEntry))->descTag.tagLocation =
-            UDFPhysLbaToPart(Vcb, PartNum, VatFileInfo->Dloc->DataLoc.Mapping[0].extLocation);
-        // record data
-        if (NT_SUCCESS(status = UDFWriteFile__(IrpContext, Vcb, VatFileInfo, 0, VatLen + hdrLen, FALSE, New, &WrittenBytes))) {
-            status = UDFFlushFile__(IrpContext, Vcb, VatFileInfo, 0);
-        }
-        return status;
-    }
-    // We can't fit the whole VAT in FE tail
-    // Now lets 'unpack' VAT's mapping to make updating easier
-    status = UDFUnPackMapping(Vcb, &(VatFileInfo->Dloc->DataLoc));
-    if (!NT_SUCCESS(status)) return status;
-    // update VAT with locations of not flushed blocks
-    if (PacketOffset) {
-        Vcb->Vat = (uint32*)(New+Offset);
-        Vcb->Vat = NULL;
-    }
-
-    Mapping = VatFileInfo->Dloc->DataLoc.Mapping;
-    off=0;
-    BS = Vcb->SectorSize;
-    NWA = Vcb->NWA;
-    VatLen += hdrLen;
-    // record modified parts of VAT & update mapping
-    for(i=0; Mapping[i].extLength; i++) {
-        to_read = (VatLen>=BS) ? BS : VatLen;
-        if ((OldLen < off) || (RtlCompareMemory(Old+off, New+off, to_read) != to_read)) {
-            // relocate frag
-            Mapping[i].extLocation = NWA+PacketOffset;
-            Mapping[i].extLength &= UDF_EXTENT_LENGTH_MASK;
-            PacketOffset++;
-            if (PacketOffset >= MaxPacket) {
-                NWA += (MaxPacket + 7);
-                PacketOffset = 0;
-            }
-            status = UDFWriteFile__(IrpContext, Vcb, VatFileInfo, off, to_read, FALSE, New+off, &WrittenBytes);
-            if (!NT_SUCCESS(status)) {
-                return status;
-            }
-        }
-        VatLen-=BS;
-        off+=BS;
-    }
-    // pack mapping
-    UDFPackMapping(Vcb, &(VatFileInfo->Dloc->DataLoc));
-    len = UDFGetMappingLength(VatFileInfo->Dloc->DataLoc.Mapping)/sizeof(EXTENT_MAP) - 1;
-    // obtain AllocMode
-    AllocMode = ((PFILE_ENTRY)(VatFileInfo->Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK;
-    switch(AllocMode) {
-    case ICB_FLAG_AD_SHORT: {
-        AllocMode = sizeof(SHORT_AD);
-        break;
-    }
-    case ICB_FLAG_AD_LONG: {
-        AllocMode = sizeof(LONG_AD);
-        break;
-    }
-    case ICB_FLAG_AD_EXTENDED: {
-//            break;
-    }
-    default: {
-        return STATUS_INVALID_PARAMETER;
-    }
-    }
-    // calculate actual AllocSequence length (in blocks)
-    len = (len*AllocMode+BS-1+VatFileInfo->Dloc->AllocLoc.Offset) /
-//          (((BS - sizeof(ALLOC_EXT_DESC))/sizeof(SHORT_AD))*sizeof(SHORT_AD));
-        ((BS - sizeof(ALLOC_EXT_DESC) + AllocMode - 1) & ~(AllocMode-1));
-    // Re-init AllocLoc
-    if (VatFileInfo->Dloc->AllocLoc.Mapping) MyFreePool__(VatFileInfo->Dloc->AllocLoc.Mapping);
-    VatFileInfo->Dloc->AllocLoc.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , (len+1)*sizeof(EXTENT_MAP),
-                                                       MEM_EXTMAP_TAG);
-    if (!(VatFileInfo->Dloc->AllocLoc.Mapping)) return STATUS_INSUFFICIENT_RESOURCES;
-
-    VatFileInfo->Dloc->AllocLoc.Offset = (uint32)(VatFileInfo->Dloc->FELoc.Length);
-    VatFileInfo->Dloc->AllocLoc.Length = 0;
-    Mapping = VatFileInfo->Dloc->AllocLoc.Mapping;
-    Mapping[0].extLength = BS-VatFileInfo->Dloc->AllocLoc.Offset;
-//  Mapping[0].extLocation = ???;
-    for(i=1; i<len; i++) {
-        // relocate frag
-        Mapping[i].extLocation = NWA+PacketOffset;
-        Mapping[i].extLength = BS;
-        PacketOffset++;
-        if (PacketOffset >= MaxPacket) {
-            NWA += (MaxPacket + 7);
-            PacketOffset = 0;
-        }
-    }
-    // Terminator
-    Mapping[i].extLocation =
-    Mapping[i].extLength = 0;
-
-    if ( !PacketOffset &&
-        (VatFileInfo->Dloc->AllocLoc.Length <= (Vcb->SectorSize - (uint32)(VatFileInfo->Dloc->AllocLoc.Offset)) ) ) {
-        // add padding
-        UDFWriteData(IrpContext, Vcb, TRUE, ((uint64)NWA) << Vcb->SectorShift, 1, FALSE, Old, &WrittenBytes);
-        PacketOffset++;
-    }
-    // now we'll place FE & built-in data to the last sector of
-    // the last packet will be recorded
-    VatFileInfo->Dloc->FELoc.Mapping[0].extLocation =
-    VatFileInfo->Dloc->AllocLoc.Mapping[0].extLocation =
-        NWA+PacketOffset;
-    VatFileInfo->Dloc->FELoc.Modified = TRUE;
-    // setup descTag
-    ((PFILE_ENTRY)(VatFileInfo->Dloc->FileEntry))->descTag.tagLocation =
-        UDFPhysLbaToPart(Vcb, PartNum, VatFileInfo->Dloc->FELoc.Mapping[0].extLocation);
-    VatFileInfo->Dloc->DataLoc.Modified = TRUE;
-
-    status = UDFFlushFile__(IrpContext, Vcb, VatFileInfo, 0);
-    if (!NT_SUCCESS(status))
-        return status;
-
-    return STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(IrpContext);
+    UNREFERENCED_PARAMETER(Vcb);
+    /* The removed legacy path detached/freed the live translation before
+     * allocation/I/O succeeded, predicted packet addresses without a writer
+     * advancing NWA, and could report success with no durable VAT. Keep the
+     * table, FE and all mappings intact until a real append/checkpoint
+     * backend implements that complete protocol. This is no clean close. */
+    UDFPrint(("UDFS: sequential VAT recording requires an append/checkpoint backend\n"));
+    return STATUS_NOT_SUPPORTED;
 } // end UDFRecordVAT()
 
 /*
-    This routine updates VAT according to RequestedLbaTable (RelocTab) &
-    actual physical address where this data will be stored
+    Sequential VAT completion contract; no current writer invokes it.
  */
 NTSTATUS
-UDFUpdateVAT(
-    IN void* _Vcb,
-    IN uint32 Lba,
-    IN uint32* RelocTab,  // can be NULL
-    IN uint32 BCount
-    )
+UDFUpdateVAT(IN void* _Vcb, IN uint32 Lba, IN uint32* RelocTab, IN uint32 BCount)
 {
-    PVCB Vcb = (PVCB)_Vcb;
-    uint16 PartNdx = (uint16)(Vcb->VatPartNdx);
-    uint16 PartNum = (uint16)(Lba ? UDFGetRefPartNumByPhysLba(Vcb, Lba) : UDFGetPartNumByPartRef(Vcb, PartNdx));
-    if (PartNum != UDFGetPartNumByPartRef(Vcb, PartNdx))
-    {
-        UDFPrint(("UDFUpdateVAT: Write to Write-Protected partition\n"));
-        return STATUS_MEDIA_WRITE_PROTECTED;
-    }
-    // !!! NOTE !!!
-    // Both VAT copies - in-memory & on-disc
-    // contain _relative_ addresses
-    uint32 root = Vcb->Partitions[PartNdx].PartitionRoot;
-    uint32 NWA = Vcb->NWA-root;
-    uint32 i;
-    uint32 CurLba;
-
-    if (!Vcb->Vat) return STATUS_SUCCESS;
-
-    for(i=0; i<BCount; i++, NWA++) {
-        if ((CurLba = (RelocTab ? RelocTab[i] : (Lba+i)) - root) >= Vcb->VatCount)
-            Vcb->VatCount = CurLba+1;
-        Vcb->Vat[CurLba] = NWA;
-    }
-    return STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(_Vcb);
+    UNREFERENCED_PARAMETER(Lba);
+    UNREFERENCED_PARAMETER(RelocTab);
+    UNREFERENCED_PARAMETER(BCount);
+    /* No current I/O completion calls this callback. It cannot acknowledge
+     * or mutate a translation without owning an actual completed append. */
+    return STATUS_NOT_SUPPORTED;
 } // end UDFUpdateVAT()
 
 /*
@@ -7802,102 +10487,262 @@ UDFConvertFEToExtended(
     IN PUDF_FILE_INFO FileInfo
     )
 {
-    PEXTENDED_FILE_ENTRY ExFileEntry;
+    PUDF_DATALOC_INFO Dloc;
     PFILE_ENTRY FileEntry;
-    uint32 Length, NewLength, l;
-    NTSTATUS status;
-    SIZE_T WrittenBytes;
+    PEXTENDED_FILE_ENTRY ExFileEntry = NULL;
+    PFCB Fcb;
+    EXTENT_INFO DataPlan, AllocPlan, Borrowed;
+    PUDF_ALLOCATION_FAILURE Lease = NULL;
+    PEXTENT_MAP OldDataMap = NULL;
+    uint32 Header, NewHeader, PartNum, DataPartNum, Bytes;
+    uint64 NewHeaderBytes, Cover;
+    uint16 Mode;
+    SIZE_T Written = 0;
+    NTSTATUS Status = STATUS_SUCCESS, LeaseStatus;
+    BOOLEAN PagingAcquired = FALSE, Promote = FALSE;
+    BOOLEAN LiveChanged = FALSE, Installed = FALSE;
 
-    if (!FileInfo) return STATUS_INVALID_PARAMETER;
-    ValidateFileInfo(FileInfo);
-    status = UDFFlushDirectoryAppend(IrpContext, Vcb, FileInfo);
-    if (!NT_SUCCESS(status))
-        return status;
-    if (FileInfo->Dloc->FileEntry->tagIdent == TID_EXTENDED_FILE_ENTRY) return STATUS_SUCCESS;
-    if (FileInfo->Dloc->FileEntry->tagIdent != TID_FILE_ENTRY) return STATUS_INVALID_PARAMETER;
-
-/*    if (!NT_SUCCESS(status = UDFFlushFile__(Vcb, FileInfo)))
-        return status;*/
-
-    Length = FileInfo->Dloc->FileEntryLen;
-    NewLength = Length - sizeof(FILE_ENTRY) + sizeof(EXTENDED_FILE_ENTRY);
-    ExFileEntry = (PEXTENDED_FILE_ENTRY)MyAllocatePoolTag__(NonPagedPool, max(NewLength, Vcb->SectorSize), MEM_XFE_TAG);
-    if (!ExFileEntry) return STATUS_INSUFFICIENT_RESOURCES;
-    FileEntry = (PFILE_ENTRY)(FileInfo->Dloc->FileEntry);
-    RtlZeroMemory(ExFileEntry, max(NewLength, Vcb->SectorSize));
-
-    ExFileEntry->descTag.tagIdent = TID_EXTENDED_FILE_ENTRY;
-    ExFileEntry->icbTag = FileEntry->icbTag;
-    ExFileEntry->uid = FileEntry->uid;
-    ExFileEntry->gid = FileEntry->gid;
-    ExFileEntry->permissions = FileEntry->permissions;
-    ExFileEntry->fileLinkCount = FileEntry->fileLinkCount;
-    ExFileEntry->recordFormat = FileEntry->recordFormat;
-    ExFileEntry->recordDisplayAttr = FileEntry->recordDisplayAttr;
-    ExFileEntry->recordLength = FileEntry->recordLength;
-    ExFileEntry->informationLength = FileEntry->informationLength;
-    ExFileEntry->logicalBlocksRecorded = FileEntry->logicalBlocksRecorded;
-    ExFileEntry->accessTime = FileEntry->accessTime;
-    ExFileEntry->modificationTime = FileEntry->modificationTime;
-    ExFileEntry->attrTime = FileEntry->attrTime;
-    ExFileEntry->checkpoint = FileEntry->checkpoint;
-    ExFileEntry->extendedAttrICB = FileEntry->extendedAttrICB;
-    ExFileEntry->impIdent = FileEntry->impIdent;
-    ExFileEntry->uniqueID = FileEntry->uniqueID;
-    ExFileEntry->lengthExtendedAttr = FileEntry->lengthExtendedAttr;
-    ExFileEntry->lengthAllocDescs = FileEntry->lengthAllocDescs;
-    RtlCopyMemory(ExFileEntry+1, FileEntry+1, FileEntry->lengthExtendedAttr);
-    RtlCopyMemory((int8*)(ExFileEntry+1)+FileEntry->lengthExtendedAttr, (int8*)(FileEntry+1)+FileEntry->lengthExtendedAttr, FileEntry->lengthAllocDescs);
-
-    if ((((PFILE_ENTRY)(FileInfo->Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK) == ICB_FLAG_AD_IN_ICB) {
-
-        if ((l = (uint32)(FileInfo->Dloc->DataLoc.Length))) {
-
-            int8* tmp_buff = (int8*)MyAllocatePool__(NonPagedPool, l);
-            if (!tmp_buff) {
-                MyFreePool__(ExFileEntry);
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            if (!NT_SUCCESS(status = UDFReadFile__(IrpContext, Vcb, FileInfo, 0, l, FALSE, tmp_buff)) ||
-               !NT_SUCCESS(status = UDFResizeFile__(IrpContext, Vcb, FileInfo, 0)) ) {
-                MyFreePool__(ExFileEntry);
-                MyFreePool__(tmp_buff);
-                return status;
-            }
-            FileInfo->Dloc->FELoc.Length =
-            FileInfo->Dloc->DataLoc.Offset = NewLength;
-            FileInfo->Dloc->FELoc.Modified =
-            FileInfo->Dloc->DataLoc.Modified = TRUE;
-            MyFreePool__(FileInfo->Dloc->FileEntry);
-            FileInfo->Dloc->FileEntry = (tag*)ExFileEntry;
-            if (!NT_SUCCESS(status = UDFResizeFile__(IrpContext, Vcb, FileInfo, l)) ||
-               !NT_SUCCESS(status = UDFWriteFile__(IrpContext, Vcb, FileInfo, 0, l, FALSE, tmp_buff, &WrittenBytes)) ) {
-                MyFreePool__(ExFileEntry);
-                MyFreePool__(tmp_buff);
-                return status;
-            }
-            MyFreePool__(tmp_buff);
-        } else {
-            FileInfo->Dloc->FELoc.Length =
-            FileInfo->Dloc->DataLoc.Offset = NewLength;
-            FileInfo->Dloc->FELoc.Modified =
-            FileInfo->Dloc->DataLoc.Modified = TRUE;
-            MyFreePool__(FileInfo->Dloc->FileEntry);
-            FileInfo->Dloc->FileEntry = (tag*)ExFileEntry;
-        }
-    } else {
-        FileInfo->Dloc->FELoc.Length =
-        FileInfo->Dloc->AllocLoc.Offset = NewLength;
-        FileInfo->Dloc->FELoc.Modified =
-        FileInfo->Dloc->AllocLoc.Modified = TRUE;
-        MyFreePool__(FileInfo->Dloc->FileEntry);
-        FileInfo->Dloc->FileEntry = (tag*)ExFileEntry;
+    if (!IrpContext || !Vcb || !FileInfo || !(Dloc = FileInfo->Dloc))
+        return STATUS_INVALID_PARAMETER;
+    RtlZeroMemory(&DataPlan, sizeof(DataPlan));
+    RtlZeroMemory(&AllocPlan, sizeof(AllocPlan));
+    RtlZeroMemory(&Borrowed, sizeof(Borrowed));
+    /* The create path owns the canonical Main resource. An internal FI
+     * without an FCB requires the exclusive volume writer domain instead.
+     * Do not silently upgrade shared locks or enter Cc under Paging. */
+    Fcb = Dloc->CommonFcb;
+    if (Fcb) {
+        if ((FileInfo->Fcb && FileInfo->Fcb != Fcb) || !Fcb->FcbNonpaged || !Fcb->FileInfo || Fcb->FileInfo->Dloc != Dloc ||
+            Fcb->Header.PagingIoResource != &Fcb->FcbNonpaged->FcbPagingIoResource ||
+            !ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource) ||
+            ExIsResourceAcquiredSharedLite(&Fcb->FcbNonpaged->FcbPagingIoResource))
+            return STATUS_INVALID_DEVICE_STATE;
+    } else if (FileInfo->Fcb || !ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource)) {
+        return STATUS_INVALID_DEVICE_STATE;
     }
-    FileInfo->Dloc->FileEntryLen = NewLength;
-    FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
-    if (Vcb->minUDFReadRev < 0x0200)
-        Vcb->minUDFReadRev = 0x0200;
-    return STATUS_SUCCESS;
+    _SEH2_TRY {
+    _SEH2_TRY {
+        Status = UDFDrainNewFileData(IrpContext, Vcb, FileInfo);
+        if (!NT_SUCCESS(Status)) goto conversion_exit;
+        if (Fcb) {
+            UDFAcquirePagingIoExclusive(IrpContext, Fcb);
+            PagingAcquired = TRUE;
+        }
+        Status = UDFFlushDirectoryAppend(IrpContext, Vcb, FileInfo);
+        if (!NT_SUCCESS(Status)) goto conversion_exit;
+        Status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+        if (!NT_SUCCESS(Status)) goto conversion_exit;
+        if (Dloc->FileEntry->tagIdent == TID_EXTENDED_FILE_ENTRY)
+            goto conversion_exit;
+        if (Vcb->Vat || Vcb->CDR_Mode || (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY)) {
+            Status = STATUS_MEDIA_WRITE_PROTECTED;
+            goto conversion_exit;
+        }
+        if (!NT_SUCCESS(Dloc->ZeroDataError)) {
+            Status = Dloc->ZeroDataError;
+            goto conversion_exit;
+        }
+        FileEntry = (PFILE_ENTRY)Dloc->FileEntry;
+        Mode = FileEntry->icbTag.flags & ICB_FLAG_ALLOC_MASK;
+        if (!Dloc->FELoc.Mapping || Dloc->FELoc.Offset ||
+            Dloc->FELoc.Mapping[0].extLength != Vcb->SectorSize ||
+            Dloc->FELoc.Mapping[1].extLength || !Dloc->DataLoc.Mapping ||
+            Dloc->DataLoc.Mapping == Dloc->FELoc.Mapping ||
+            Dloc->DataLoc.Length < 0 ||
+            FileEntry->informationLength != (uint64)Dloc->DataLoc.Length ||
+            FileEntry->lengthAllocDescs > Vcb->SectorSize - Header) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto conversion_exit;
+        }
+        NewHeaderBytes = (uint64)Header - sizeof(FILE_ENTRY) + sizeof(EXTENDED_FILE_ENTRY);
+        if (NewHeaderBytes > Vcb->SectorSize) {
+            Status = STATUS_NOT_SUPPORTED; /* one-sector FE/EFE profile */
+            goto conversion_exit;
+        }
+        NewHeader = (uint32)NewHeaderBytes;
+        if (!Vcb->Partitions || !Vcb->PartitionMaps) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto conversion_exit;
+        }
+        PartNum = UDFGetRefPartNumByPhysLba(Vcb, Dloc->FELoc.Mapping[0].extLocation);
+        if (PartNum >= Vcb->PartitionMaps) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto conversion_exit;
+        }
+        DataPartNum = PartNum;
+        if (Vcb->MetadataFileInfo && PartNum == Vcb->MetadataRef && !UDFIsADirectory(FileInfo))
+            DataPartNum = Vcb->MetadataPhysRef;
+        if (DataPartNum >= Vcb->PartitionMaps) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto conversion_exit;
+        }
+        if (Mode == ICB_FLAG_AD_IN_ICB) {
+            if (Dloc->DataLoc.Offset != Header ||
+                (uint64)Dloc->DataLoc.Length > Vcb->SectorSize - Header ||
+                Dloc->DataLoc.Mapping[0].extLocation != Dloc->FELoc.Mapping[0].extLocation ||
+                Dloc->DataLoc.Mapping[0].extLength != Vcb->SectorSize ||
+                Dloc->DataLoc.Mapping[1].extLength || Dloc->AllocLoc.Mapping ||
+                Dloc->AllocLoc.Length || Dloc->AllocLoc.Offset) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto conversion_exit;
+            }
+            Promote = (uint64)Dloc->DataLoc.Length > Vcb->SectorSize - NewHeader;
+        } else if (Mode == ICB_FLAG_AD_SHORT || Mode == ICB_FLAG_AD_LONG) {
+            if (Dloc->DataLoc.Offset || !Dloc->AllocLoc.Mapping ||
+                Dloc->AllocLoc.Mapping == Dloc->DataLoc.Mapping ||
+                Dloc->AllocLoc.Mapping == Dloc->FELoc.Mapping ||
+                Dloc->AllocLoc.Offset != Header || Dloc->AllocLoc.Length < 0 ||
+                Dloc->AllocLoc.Mapping[0].extLocation != Dloc->FELoc.Mapping[0].extLocation ||
+                (Dloc->AllocLoc.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) < Vcb->SectorSize ||
+                (Dloc->AllocLoc.Mapping[0].extLength >> 30) > EXTENT_NOT_RECORDED_ALLOCATED) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto conversion_exit;
+            }
+        } else {
+            Status = STATUS_NOT_SUPPORTED;
+            goto conversion_exit;
+        }
+        ExFileEntry = (PEXTENDED_FILE_ENTRY)MyAllocatePoolTag__(NonPagedPool,
+                                                           Vcb->SectorSize, MEM_XFE_TAG);
+        if (!ExFileEntry) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            goto conversion_exit;
+        }
+        RtlZeroMemory(ExFileEntry, Vcb->SectorSize);
+        ExFileEntry->descTag = FileEntry->descTag;
+        ExFileEntry->descTag.tagIdent = TID_EXTENDED_FILE_ENTRY;
+        ExFileEntry->descTag.descCRC = ExFileEntry->descTag.descCRCLength = 0;
+        ExFileEntry->descTag.tagChecksum = 0; /* regenerated at FE serialization */
+        ExFileEntry->icbTag = FileEntry->icbTag;
+        ExFileEntry->uid = FileEntry->uid;
+        ExFileEntry->gid = FileEntry->gid;
+        ExFileEntry->permissions = FileEntry->permissions;
+        ExFileEntry->fileLinkCount = FileEntry->fileLinkCount;
+        ExFileEntry->recordFormat = FileEntry->recordFormat;
+        ExFileEntry->recordDisplayAttr = FileEntry->recordDisplayAttr;
+        ExFileEntry->recordLength = FileEntry->recordLength;
+        ExFileEntry->informationLength = FileEntry->informationLength;
+        /* A plain FE cannot already own a stream directory. Preserve the
+         * existing FE creation-time fallback (its modification time). */
+        ExFileEntry->objectSize = FileEntry->informationLength;
+        ExFileEntry->logicalBlocksRecorded = FileEntry->logicalBlocksRecorded;
+        ExFileEntry->accessTime = FileEntry->accessTime;
+        ExFileEntry->modificationTime = FileEntry->modificationTime;
+        ExFileEntry->createTime = FileEntry->modificationTime;
+        ExFileEntry->attrTime = FileEntry->attrTime;
+        ExFileEntry->checkpoint = FileEntry->checkpoint;
+        ExFileEntry->extendedAttrICB = FileEntry->extendedAttrICB;
+        ExFileEntry->impIdent = FileEntry->impIdent;
+        ExFileEntry->uniqueID = FileEntry->uniqueID;
+        ExFileEntry->lengthExtendedAttr = FileEntry->lengthExtendedAttr;
+        RtlCopyMemory(ExFileEntry + 1, FileEntry + 1, FileEntry->lengthExtendedAttr);
+        if (Mode == ICB_FLAG_AD_IN_ICB && !Promote) {
+            ExFileEntry->lengthAllocDescs = (uint32)Dloc->DataLoc.Length;
+            RtlCopyMemory((int8*)ExFileEntry + NewHeader,
+                          (int8*)FileEntry + Header, (SIZE_T)Dloc->DataLoc.Length);
+        } else if (Promote) {
+            /* The lease owns an immutable borrowed map. Copy it before
+             * WriteExtent can replace the recorded/unrecorded work map. */
+            Cover = ((uint64)Dloc->DataLoc.Length + Vcb->SectorSize - 1) &
+                    ~((uint64)Vcb->SectorSize - 1);
+            Status = UDFAllocExtentLease(IrpContext, Vcb, DataPartNum, (int64)Cover,
+                UDFPartStart(Vcb, DataPartNum), UDFPartEnd(Vcb, DataPartNum),
+                &Borrowed, EXTENT_FLAG_ALLOC_STD, &Lease);
+            if (!NT_SUCCESS(Status)) goto conversion_exit;
+            if (!Lease || !Borrowed.Mapping ||
+                (uint64)UDFGetExtentLength(Borrowed.Mapping) != Cover) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto conversion_exit;
+            }
+            Status = UDFGetMappingByteCount(Borrowed.Mapping, &Bytes);
+            if (!NT_SUCCESS(Status)) goto conversion_exit;
+            DataPlan.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, Bytes, MEM_EXTMAP_TAG);
+            AllocPlan.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                                                          2 * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+            if (!DataPlan.Mapping || !AllocPlan.Mapping) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                goto conversion_exit;
+            }
+            RtlCopyMemory(DataPlan.Mapping, Borrowed.Mapping, Bytes);
+            DataPlan.Length = Dloc->DataLoc.Length;
+            DataPlan.Modified = TRUE;
+            RtlZeroMemory(AllocPlan.Mapping, 2 * sizeof(EXTENT_MAP));
+            AllocPlan.Mapping[0] = Dloc->FELoc.Mapping[0];
+            AllocPlan.Offset = NewHeader;
+            AllocPlan.Modified = TRUE;
+            Status = UDFWriteExtent(IrpContext, Vcb, &DataPlan, 0,
+                (SIZE_T)Dloc->DataLoc.Length, FALSE, (int8*)FileEntry + Header, &Written);
+            if (NT_SUCCESS(Status) && Written != (SIZE_T)Dloc->DataLoc.Length)
+                Status = STATUS_IO_DEVICE_ERROR;
+            if (!NT_SUCCESS(Status)) goto conversion_exit;
+            ExFileEntry->icbTag.flags &= ~ICB_FLAG_ALLOC_MASK;
+            ExFileEntry->icbTag.flags |= (PartNum == DataPartNum) ? ICB_FLAG_AD_SHORT : ICB_FLAG_AD_LONG;
+            Status = UDFPublishAllocationLease(Vcb, Lease);
+            if (!NT_SUCCESS(Status)) goto conversion_exit;
+        }
+        /* No fallible byte/map preparation remains. Keep the sector buffer
+         * address stable; raw FE readers under the writer domain cannot be
+         * left pointing at freed storage. No old physical block is released. */
+        LiveChanged = TRUE;
+        Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+        if (Promote) {
+            OldDataMap = Dloc->DataLoc.Mapping;
+            Dloc->DataLoc = DataPlan;
+            DataPlan.Mapping = NULL;
+            Dloc->AllocLoc = AllocPlan;
+            AllocPlan.Mapping = NULL;
+        } else if (Mode == ICB_FLAG_AD_IN_ICB) {
+            Dloc->DataLoc.Offset = NewHeader;
+            Dloc->DataLoc.Modified = TRUE;
+        } else {
+            /* Keep every existing AED owner. The counted builder rebuilds
+             * the shorter FE prefix and resizes/retires its old chain later. */
+            Dloc->AllocLoc.Offset = NewHeader;
+            Dloc->AllocLoc.Modified = TRUE;
+            Dloc->DataLoc.Modified = TRUE;
+        }
+        RtlCopyMemory(Dloc->FileEntry, ExFileEntry, Vcb->SectorSize);
+        Dloc->FileEntryLen = NewHeader;
+        Dloc->FELoc.Length = NewHeader;
+        Dloc->FELoc.Modified = TRUE;
+        if (Fcb) {
+            if (Dloc->DataLoc.Offset)
+                Fcb->FcbState |= UDF_FCB_EMBEDDED_DATA;
+            else
+                Fcb->FcbState &= ~UDF_FCB_EMBEDDED_DATA;
+        }
+        if (Vcb->minUDFReadRev < 0x0200) Vcb->minUDFReadRev = 0x0200;
+        Installed = TRUE;
+conversion_exit:
+        NOTHING;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) Status = STATUS_FILE_CORRUPT_ERROR;
+        if (Lease) {
+            if (Installed && !_SEH2_AbnormalTermination())
+                LeaseStatus = UDFCommitAllocationLease(Vcb, &Lease);
+            else
+                LeaseStatus = UDFAbortAllocationLease(Vcb, &Lease, Status);
+            if (NT_SUCCESS(Status) && !NT_SUCCESS(LeaseStatus)) Status = LeaseStatus;
+            if (Lease) {
+                Lease->Uncertain = TRUE;
+                UDFAbortAllocationLease(Vcb, &Lease, Status);
+            }
+        }
+        if (OldDataMap) MyFreePool__(OldDataMap);
+        if (DataPlan.Mapping) MyFreePool__(DataPlan.Mapping);
+        if (AllocPlan.Mapping) MyFreePool__(AllocPlan.Mapping);
+        if (ExFileEntry) MyFreePool__(ExFileEntry);
+        if (LiveChanged && !NT_SUCCESS(Status)) {
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, Status);
+        }
+        if (PagingAcquired) UDFReleasePagingIo(IrpContext, Fcb);
+    } _SEH2_END;
+    return Status;
 } // end UDFConvertFEToExtended()
 
 /*

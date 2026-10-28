@@ -137,6 +137,11 @@ UDFTeardownStructures(
     _Out_ PBOOLEAN RemovedStartingFcb
     );
 
+_Requires_lock_held_(_Global_critical_region_)
+NTSTATUS UDFTeardownStructuresEx(PIRP_CONTEXT IrpContext, PFCB StartingFcb,
+    BOOLEAN Recursive, BOOLEAN WalkParents, PBOOLEAN RemovedStartingFcb);
+VOID UDFScheduleFcbTeardownRetry(PIRP_CONTEXT IrpContext, PFCB Fcb);
+
 NTSTATUS
 UDFPurgeVolume (
     _In_ PIRP_CONTEXT IrpContext,
@@ -358,6 +363,7 @@ extern NTSTATUS UDFGetNetworkInformation(
 
 extern NTSTATUS UDFGetStandardInformation(
     IN PFCB                        Fcb,
+    IN PCCB                        Ccb,
     IN PFILE_STANDARD_INFORMATION  PtrBuffer,
  IN OUT PLONG                      PtrReturnedLength);
 
@@ -382,6 +388,7 @@ extern NTSTATUS UDFGetFullNameInformation(
 
 extern NTSTATUS UDFGetAltNameInformation(
     IN PFCB                        Fcb,
+    IN PCCB                        Ccb,
     IN PFILE_NAME_INFORMATION      PtrBuffer,
  IN OUT PLONG                      PtrReturnedLength);
 
@@ -406,11 +413,10 @@ extern NTSTATUS UDFSetBasicInformation(
     IN PFILE_BASIC_INFORMATION     PtrBuffer);
 
 NTSTATUS
-UDFMarkStreamsForDeletion(
+UDFPreflightStreamDirectoryDelete(
     IN PIRP_CONTEXT IrpContext,
-    IN PVCB           Vcb,
-    IN PFCB           Fcb,
-    IN BOOLEAN        ForDel
+    IN PVCB Vcb,
+    IN PUDF_FILE_INFO SDirInfo
     );
 
 NTSTATUS
@@ -422,6 +428,8 @@ UDFSetDispositionInfo(
     IN PFILE_DISPOSITION_INFORMATION Buffer
     );
 
+/* Internal size setters: caller owns VCB shared/exclusive and Main exclusive.
+ * No inherited PagingIoResource or shared-Main upgrade is accepted. */
 NTSTATUS
 UDFSetAllocationInfo(
     IN PFCB Fcb,
@@ -585,7 +593,7 @@ UDFRecoverDirtyVolumeBeforeLoad(
     IN PVCB Vcb
     );
 
-VOID
+NTSTATUS
 UDFCloseResidual(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb
@@ -752,6 +760,24 @@ UDFDeleteCcb(
     PCCB Ccb
     );
 
+BOOLEAN UDFIsLinkDeletePending(PFCB Fcb, PUDF_FILE_INFO FileInfo);
+NTSTATUS UDFReserveDeleteOnClose(PIRP_CONTEXT IrpContext, PCCB Ccb,
+                                 PUDF_FILE_INFO FileInfo, BOOLEAN VcbLocked);
+NTSTATUS UDFDiscardDeleteOnClose(PIRP_CONTEXT IrpContext, PCCB Ccb,
+                                 BOOLEAN VcbLocked);
+NTSTATUS UDFActivateDeleteOnClose(PIRP_CONTEXT IrpContext, PCCB Ccb);
+NTSTATUS UDFQueueLinkDelete(PIRP_CONTEXT IrpContext, PFCB Fcb,
+                            PUDF_FILE_INFO FileInfo, PLCB Lcb);
+NTSTATUS UDFCancelLinkDelete(PIRP_CONTEXT IrpContext, PFCB Fcb,
+                             PUDF_FILE_INFO FileInfo);
+NTSTATUS UDFProcessPendingDeletes(PIRP_CONTEXT IrpContext, PFCB Fcb,
+                                 BOOLEAN ExplicitRetry);
+VOID UDFNoteCommittedUnlink(PVCB Vcb, PFCB Fcb, PUDF_FILE_INFO FileInfo);
+NTSTATUS UDFRetryVolumeDeletes(PIRP_CONTEXT IrpContext, PVCB Vcb);
+NTSTATUS UDFRetryVolumeCreateAborts(PIRP_CONTEXT IrpContext, PVCB Vcb);
+NTSTATUS UDFRetryVolumeCreateRollbacks(PIRP_CONTEXT IrpContext, PVCB Vcb);
+
+
 // Bitmap cache stream
 NTSTATUS
 UDFCreateBitmapStream(
@@ -761,10 +787,19 @@ UDFCreateBitmapStream(
     IN ULONG BitmapLength
     );
 
-VOID
+NTSTATUS
 UDFDeleteBitmapStream(
-    IN PVCB Vcb
+    IN PIRP_CONTEXT IrpContext,
+    IN PVCB Vcb,
+    IN BOOLEAN AbortUnpublished
     );
+
+NTSTATUS UDFBeginBitmapFlush(PVCB Vcb);
+
+NTSTATUS
+UDFBitmapStreamIo(PIRP_CONTEXT IrpContext, PVCB Vcb, BOOLEAN Write,
+                  LONGLONG Offset, ULONG Length, PVOID Buffer,
+                  PULONG Transferred);
 
 // Per-page bitmap cache access (alloc.cpp)
 VOID
@@ -802,6 +837,7 @@ UDFInsertPrefix(
     IN PIRP_CONTEXT IrpContext,
     IN PFCB ParentFcb,
     IN PFCB ChildFcb,
+    IN PUDF_FILE_INFO LinkFileInfo,
     IN PUNICODE_STRING FileName OPTIONAL,
     IN PUNICODE_STRING CaseFileName OPTIONAL,
     IN PUNICODE_STRING ShortName OPTIONAL,
@@ -837,15 +873,17 @@ UDFFindPrefix(
     IN PFCB ChildFcb
     );
 
-PLCB
+NTSTATUS
 UDFAcquirePrefix(
     IN PIRP_CONTEXT IrpContext,
     IN PFCB ParentFcb,
     IN PFCB ChildFcb,
+    IN PUDF_FILE_INFO LinkFileInfo,
     IN PUNICODE_STRING FileName OPTIONAL,
     IN PUNICODE_STRING CaseFileName OPTIONAL,
     IN PUNICODE_STRING ShortName OPTIONAL,
-    IN ULONGLONG InitialOffset
+    IN ULONGLONG InitialOffset,
+    OUT PLCB* Result
     );
 
 VOID
@@ -858,8 +896,7 @@ NTSTATUS
 UDFBuildFullPathFromLcb(
     IN PIRP_CONTEXT IrpContext,
     IN PLCB Lcb,
-    OUT PUNICODE_STRING FullPath,
-    IN BOOLEAN CachePath
+    OUT PUNICODE_STRING FullPath
     );
 
 BOOLEAN
@@ -870,11 +907,26 @@ UDFReleasePrefixImmediate(
     );
 
 NTSTATUS
-UDFRenameMovePrefix(
+UDFPreparePrefixRename(
     IN PIRP_CONTEXT IrpContext,
     IN PLCB Lcb,
     IN PUNICODE_STRING NewName,
-    IN PFCB NewParentFcb OPTIONAL
+    IN PUDF_FILE_INFO NewParentFileInfo,
+    OUT PUDF_PREFIX_RENAME_PLAN Plan
+    );
+
+NTSTATUS
+UDFApplyPrefixRename(
+    IN PIRP_CONTEXT IrpContext,
+    IN OUT PUDF_PREFIX_RENAME_PLAN Plan,
+    IN BOOLEAN FlushParent
+    );
+
+NTSTATUS
+UDFDiscardPrefixRename(
+    IN PIRP_CONTEXT IrpContext,
+    IN OUT PUDF_PREFIX_RENAME_PLAN Plan,
+    IN BOOLEAN FlushParent
     );
 
 PLCB
@@ -908,7 +960,7 @@ UDFDeleteFcb(
     _In_ PFCB Fcb
     );
 
-VOID
+NTSTATUS
 UDFInsertFcbIntoTable(
     _In_ PIRP_CONTEXT IrpContext,
     _In_ PFCB Fcb
@@ -972,6 +1024,9 @@ extern ULONG UDFGetRegParameter(
     IN PVCB Vcb,
     IN PCWSTR Name,
     IN ULONG DefValue );
+
+/* Global/VCB lifetime held; closes final posting only if no worker remains. */
+BOOLEAN UDFTryStopFspPosting(IN PVCB Vcb);
 
 VOID
 UDFDeleteVCB(
@@ -1110,11 +1165,13 @@ UDFVerifyVcb(
     IN PVCB Vcb
     );
 
+/* SUCCESS for a usable FCB; failure raises with an IRP context and is
+   returned without raising for NULL-context fast metadata queries. */
 NTSTATUS
 UDFVerifyFcbOperation(
     IN PIRP_CONTEXT IrpContext OPTIONAL,
     IN PFCB Fcb,
-    IN PCCB Ccb
+    IN PCCB Ccb OPTIONAL
     );
 
 NTSTATUS
@@ -1229,14 +1286,28 @@ extern VOID UDFClrModified(
       UDFPurgeCacheEx_(Fcb, Offset, Length, CanWait, Vcb, FileObject)
 //#endif //ALLOW_SPARSE
 
-BOOLEAN
-UDFZeroData (
-    IN PVCB Vcb,
+/* Zero a range beyond VDL without truncating its 64-bit byte coordinates.
+ * DirectDisk avoids Cache Manager recursion for an actual mapped-page write. */
+NTSTATUS
+UDFZeroData(
+    IN PIRP_CONTEXT IrpContext,
+    IN PFCB Fcb,
     IN PFILE_OBJECT FileObject,
-    IN ULONG StartingZero,
-    IN ULONG ByteCount,
-    IN BOOLEAN CanWait
+    IN LONGLONG StartingZero,
+    IN LONGLONG ByteCount,
+    IN BOOLEAN CanWait,
+    IN BOOLEAN DirectDisk
     );
+
+PIRP_CONTEXT UDFCurrentIrpContextForLowerError(VOID);
+VOID UDFRecordLowerIoError(PIRP_CONTEXT IrpContext, NTSTATUS Status);
+BOOLEAN UDFIsZeroDataRetry(PUDF_DATALOC_INFO Dloc);
+/* Main exclusive; initialize invalid tail before a writable user section. */
+NTSTATUS UDFInitializeWritableSection(PFILE_OBJECT FileObject, PFCB Fcb);
+VOID UDFRetainCacheSizeError(PIRP_CONTEXT IrpContext, PFCB Fcb,
+    PFILE_OBJECT FileObject, NTSTATUS Status);
+NTSTATUS UDFRetryZeroData(PIRP_CONTEXT IrpContext, PFCB Fcb);
+NTSTATUS UDFRetryVolumeZeroData(PIRP_CONTEXT IrpContext, PVCB Vcb);
 
 NTSTATUS
 UDFToggleMediaEjectDisable (
@@ -1300,23 +1371,27 @@ UDFMarkDevForVerifyIfVcbMounted(
 
 #define UDFRealDevNeedsVerify( DO)    BooleanFlagOn( (DO)->Flags, DO_VERIFY_VOLUME)
 
-#define UDFLockVcb(IC,V)                                                                \
-    ASSERT(KeAreApcsDisabled());                                                        \
-    ExAcquireFastMutexUnsafe( &(V)->VcbMutex );                                         \
-    (V)->VcbLockThread = PsGetCurrentThread()
+#define UDFLockVcb(IC,V) do {                       \
+    ASSERT(KeAreApcsDisabled());                     \
+    ExAcquireFastMutexUnsafe(&(V)->VcbMutex);        \
+    (V)->VcbLockThread = PsGetCurrentThread();        \
+} while (0)
 
-#define UDFUnlockVcb(IC,V)                                                              \
-    (V)->VcbLockThread = NULL;                                                          \
-    ExReleaseFastMutexUnsafe( &(V)->VcbMutex )
+#define UDFUnlockVcb(IC,V) do {                     \
+    (V)->VcbLockThread = NULL;                       \
+    ExReleaseFastMutexUnsafe(&(V)->VcbMutex);        \
+} while (0)
 
-#define UDFLockFcbTable(IC,V)                                                           \
-    ASSERT(KeAreApcsDisabled());                                                        \
-    ExAcquireFastMutexUnsafe( &(V)->FcbTableMutex );                                    \
-    (V)->FcbTableLockThread = PsGetCurrentThread()
+#define UDFLockFcbTable(IC,V) do {                  \
+    ASSERT(KeAreApcsDisabled());                     \
+    ExAcquireFastMutexUnsafe(&(V)->FcbTableMutex);   \
+    (V)->FcbTableLockThread = PsGetCurrentThread();   \
+} while (0)
 
-#define UDFUnlockFcbTable(IC,V)                                                         \
-    (V)->FcbTableLockThread = NULL;                                                     \
-    ExReleaseFastMutexUnsafe( &(V)->FcbTableMutex )
+#define UDFUnlockFcbTable(IC,V) do {                \
+    (V)->FcbTableLockThread = NULL;                  \
+    ExReleaseFastMutexUnsafe(&(V)->FcbTableMutex);   \
+} while (0)
 
 #define UDFLockFcb(IC,F) {                                                              \
     PVOID _CurrentThread = PsGetCurrentThread();                                        \

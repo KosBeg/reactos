@@ -253,6 +253,80 @@ typedef struct _UDF_DELETE_PREFREE {
     UDF_DELETE_PREFREE_RANGE Ranges[1];
 } UDF_DELETE_PREFREE, *PUDF_DELETE_PREFREE;
 
+/* In-memory request phases, not an on-media recovery journal. */
+typedef enum _UDF_NAMESPACE_PHASE {
+    UdfNamespaceNone = 0,
+    UdfNamespaceReserved,
+    UdfNamespaceTargetRetained,
+    UdfNamespaceTargetDetached,
+    UdfNamespaceTargetTombstoneCommitted,
+    UdfNamespaceSourcePreparing,
+    UdfNamespaceDestinationSubmitted,
+    UdfNamespaceDestinationCommitted,
+    UdfNamespaceSourceTombstoneSubmitted,
+    UdfNamespaceIdentityMoved,
+    UdfNamespaceCommitted,
+    UdfNamespaceAbortCommitted
+} UDF_NAMESPACE_PHASE;
+
+/* Target retirement is distinct from source namespace publication. Ready
+ * retries only the non-I/O reference release; Failed never replays a drain. */
+typedef enum _UDF_NAMESPACE_TARGET_STATE {
+    UdfNamespaceTargetNone = 0,
+    UdfNamespaceTargetHeld,
+    UdfNamespaceTargetDraining,
+    UdfNamespaceTargetReleasing,
+    UdfNamespaceTargetReady,
+    UdfNamespaceTargetFailed
+} UDF_NAMESPACE_TARGET_STATE;
+
+/* Exact old ranges removed from a RAM mapping, still owned until the
+ * replacement FE passes a device barrier. The immutable map survives partial
+ * release; an uncertain bitmap mutation is never retried as a fresh free. */
+typedef struct _UDF_EXTENT_RETIREMENT {
+    struct _UDF_EXTENT_RETIREMENT* Next;
+    ULONG PartRef;
+    ULONG PartitionRoot;
+    ULONG PartitionLength;
+    ULONG Count;
+    ULONG Capacity;
+    ULONG Completed;
+    NTSTATUS Error;
+    BOOLEAN Metadata;
+    BOOLEAN Uncertain;
+    EXTENT_MAP Ranges[1];
+} UDF_EXTENT_RETIREMENT, *PUDF_EXTENT_RETIREMENT;
+
+/* A failed cache-size notification must never be repaired by zeroing an
+ * already accepted payload. Unknown partial cache copies cannot be replayed
+ * after the originating request/buffer is gone. */
+typedef enum _UDF_DATA_REPAIR_KIND {
+    UdfDataRepairZeroRange = 0,
+    UdfDataRepairCacheSizes,
+    UdfDataRepairNoReplay
+} UDF_DATA_REPAIR_KIND;
+
+/* Exact ownership of an in-progress stream-directory creation. The base
+ * owns one extra FI hold; Child is either a still-owned constructor output
+ * or the successful child open. It is transferred only after both FE barriers.
+ * A failed/uncertain generation remains reachable through both Dlocs. */
+typedef enum _UDF_STREAM_CREATE_PHASE {
+    UdfStreamCreateReserved = 0,
+    UdfStreamCreateConstructed,
+    UdfStreamCreateChildOpen,
+    UdfStreamCreateChildDurable,
+    UdfStreamCreateBasePrepared,
+    UdfStreamCreateCommitted
+} UDF_STREAM_CREATE_PHASE;
+
+typedef struct _UDF_STREAM_CREATE_CONTEXT {
+    struct _UDF_FILE_INFO* BaseFile;
+    struct _UDF_FILE_INFO* Child;
+    PETHREAD Thread;
+    NTSTATUS FirstError;
+    UDF_STREAM_CREATE_PHASE Phase;
+} UDF_STREAM_CREATE_CONTEXT, *PUDF_STREAM_CREATE_CONTEXT;
+
 typedef struct _UDF_DATALOC_INFO {
 
 /**
@@ -291,6 +365,7 @@ typedef struct _UDF_DATALOC_INFO {
 */
     tag*        FileEntry;             // file entry data
     uint32      FileEntryLen;
+    uint32      FileEntryCapacity;    // requested owned buffer bytes, not descriptor body length
 /**
     Set of flags. This is intended for internal use.
     Valid flags:
@@ -312,6 +387,45 @@ typedef struct _UDF_DATALOC_INFO {
     released untill this field reaches zero.
 */
     uint32      LinkRefCount;
+    /* Nonblocking lifetime claim, serialized by VCB.DlocResource2. New
+     * lookups/references cannot enter while the claimed FI is released. */
+    PVOID       CleanupOwner;
+    BOOLEAN AllocationReleaseActive;
+    LONG AllocationReleaseError; /* retained first error; never replay a partial free */
+    PUDF_EXTENT_RETIREMENT RetiredExtents;
+    /* Failed data/cache admission is not repaired by an unrelated successful
+     * flush. DataRepairKind selects zeroing, size-only or no automatic replay. */
+    LONG ZeroDataError;               // first failure, retained until committed repair
+    LONG CacheSizeError;              // cache sizes may differ; data I/O awaits explicit repair
+    LONG ZeroDataLastError;           // first failure in the latest explicit attempt
+    LONG ZeroDataLowerError;          // actual lower failure; forbids status-only retry
+    uint32 ZeroDataAttempts;
+    UDF_DATA_REPAIR_KIND DataRepairKind;
+    BOOLEAN ZeroDataCanRetry;
+    int64 ZeroDataStart;
+    int64 ZeroDataEnd;
+    /* Exact temporary FE retained until namespace publication is verified.
+     * An uncertain write quarantines this generation, never its allocation. */
+    struct _UDF_FILE_INFO* NamespaceScratch;
+    struct _UDF_FILE_INFO* NamespaceFileInfo;
+    struct _UDF_FILE_INFO* NamespaceTarget; /* exact replaced FI/open hold */
+    UDF_NAMESPACE_TARGET_STATE NamespaceTargetState;
+    NTSTATUS NamespaceTargetError; /* first retirement error, not a new open */
+    UDF_NAMESPACE_PHASE NamespacePhase;
+    BOOLEAN DeleteCommitted; /* final FID/parent ICB removal passed a lower barrier */
+    struct _UDF_DATALOC_INFO* NamespaceScratchOwner;
+    // Exact temporary open owned by synchronous stream deletion/preflight.
+    // The slot remains populated if checked reference consumption fails.
+    struct _UDF_FILE_INFO* StreamDeleteOwner;
+    // Parent operation gates new by-ID/named references to this generation.
+    struct _UDF_DATALOC_INFO* StreamDeleteContextOwner;
+    PUDF_STREAM_CREATE_CONTEXT StreamCreate;
+    /* One real ordinary FI reference owned by a failed fresh CREATE.
+     * Kept even across an uncertain namespace/release phase. */
+    struct _UDF_FILE_INFO* CreateRollbackOwner;
+    /* A private CREATE constructor owns its parent until publication or
+     * quarantine. It is not an ordinary successful-open FI reference. */
+    struct _UDF_FILE_INFO* CreateConstructionOwner;
 /**
     Points to the list of files referenced  by  the  given  file.
     This field is used for directories only. Otherwise its  value
@@ -417,6 +531,36 @@ typedef struct _UDF_FILE_INFO {
     this counter reachs zero.
 */
     uint32       RefCount;             // number of references
+    /* Existing failed-CREATE tokens, not newly acquired references. A
+     * refused checked decrement remains owned here, never replayed as close. */
+    uint32       RetainedOpenReferences;
+    NTSTATUS     RetainedOpenError;
+    /* Dloc->CreateRollbackOwner owns this exact hold, not a borrowed CCB token. */
+    LIST_ENTRY   CreateRollbackLinks;
+    ULONG        CreateRollbackPhase; /* 0 none, 1 ready, 2 unlink, 3 committed,
+                                       * 4 release, 5 uncertain, 6 flushing */
+    BOOLEAN      CreateRollbackCounted;
+    BOOLEAN      CreateRollbackTouched;
+    NTSTATUS     CreateFailureStatus;
+    NTSTATUS     CreateRollbackFirstError;
+    NTSTATUS     CreateRollbackLastError;
+    struct _UDF_FILE_INFO* CreateConstructionParent;
+    NTSTATUS     CreateConstructionError;
+    BOOLEAN      CreateConstructionCounted;
+    BOOLEAN      CreateConstructionOpenOwned;
+    /* UDFStoreDloc acquires one exact FI reference before exposing the
+     * shared Dloc. Successful open transfers it; failed-open cleanup
+     * consumes it once without flushing a half-built FI. */
+    BOOLEAN      Constructing;
+    BOOLEAN      DlocInitOwner;
+    BOOLEAN      ConstructionFailed;
+    BOOLEAN      ConstructionReferenceOwned;
+    BOOLEAN      CleanupPending;       // retained in the Dloc ring for flush/retry
+    BOOLEAN      InternalOpenReleased; // mount-owned open reference consumed once
+    BOOLEAN      TemporaryRetired;     // private rename FE; namespace owner transferred
+    BOOLEAN      NamespaceStaged;      // reserved deleted FID, not a live namespace link
+    BOOLEAN      LinkDeleteCommitted;  // this exact parent/index tombstone passed barrier
+    struct _UDF_FILE_INFO* ConstructionParent; // exact parent component of that hold
 /**
     Counter of open operations performed  for  subsequent  files.
     Each routine opening the  file  increments  this  counter  in
@@ -424,7 +568,7 @@ typedef struct _UDF_FILE_INFO {
     decrements. The FileInfo structure can't be  released  untill
     this counter reachs zero.
 */
-    uint32       OpenCount;            // number of opened files in Dir
+    uint32       OpenCount;            // references held by children of this exact FI
     struct _UDF_FILE_INFO* NextLinkedFile; //
     struct _UDF_FILE_INFO* PrevLinkedFile; //
 

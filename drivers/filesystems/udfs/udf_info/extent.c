@@ -16,6 +16,7 @@
 */
 
 #include "udf.h"
+#include <udf_descriptor.h>
 
 #define         UDF_BUG_CHECK_ID                UDF_FILE_UDF_INFO_EXTENT
 
@@ -35,44 +36,66 @@ UDFExtentOffsetToLba(
     OUT uint32* Index
     )
 {
-    uint32 j=0, l, d, BSh = Vcb->SectorShift;
-    uint32 Offs;
-    uint32 i=0, BOffset; // block nums
+    uint32 j = 0, Length, Type, LastType = EXTENT_NOT_RECORDED_NOT_ALLOCATED;
+    uint64 Remaining, Physical;
 
-    BOffset = (uint32)(Offset >> BSh);
-    // scan extent table for suitable range (frag)
-    ExtPrint(("ExtLen %x\n", Extent->extLength));
-    while(i+(d = (l = (Extent->extLength & UDF_EXTENT_LENGTH_MASK)) >> BSh) <= BOffset) {
+    if (SectorOffset) *SectorOffset = 0;
+    if (AvailLength) *AvailLength = 0;
+    if (Flags) *Flags = EXTENT_NOT_RECORDED_NOT_ALLOCATED;
+    if (Index) *Index = MAXULONG;
+    if (!Vcb || !Extent || Offset < 0 || Vcb->SectorShift >= 32 ||
+        !Vcb->SectorSize || Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift))
+        return LBA_OUT_OF_EXTENT;
 
-        if (!l) {
-            if (Index) (*Index) = j-1;
-            if (Flags) {
-                Extent--;
-                (*Flags) = (Extent->extLength >> 30);
+    /* The mapping is an owned, terminated internal array. File offsets are
+     * byte counts, not 32-bit block numbers or the low word of Offset. */
+    Remaining = (uint64)Offset;
+    for (;;) {
+        Length = Extent->extLength & UDF_EXTENT_LENGTH_MASK;
+        if (!Length) {
+            /* Resize uses the last valid index/type when growing beyond EOF.
+             * An empty map has no predecessor, including a freed-FE marker
+             * whose length is zero but whose old type bits remain set. */
+            if (j) {
+                if (Index) *Index = j - 1;
+                if (Flags) *Flags = LastType;
             }
             return LBA_OUT_OF_EXTENT;
         }
-        if (!d)
-            break;
-        i += d; //frag offset
-        j++; // frag index
+        Type = Extent->extLength >> 30;
+        if (Type > EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+            return LBA_OUT_OF_EXTENT;
+        if (Type != EXTENT_NOT_RECORDED_NOT_ALLOCATED &&
+            (uint64)Extent->extLocation +
+                (((uint64)Length + Vcb->SectorSize - 1) >> Vcb->SectorShift) > LBA_OUT_OF_EXTENT)
+            return LBA_OUT_OF_EXTENT;
+        if (Remaining < Length) {
+            Physical = (uint64)Extent->extLocation + (Remaining >> Vcb->SectorShift);
+            if (Type != EXTENT_NOT_RECORDED_NOT_ALLOCATED && Physical >= LBA_OUT_OF_EXTENT)
+                return LBA_OUT_OF_EXTENT;
+            if (SectorOffset) *SectorOffset = (uint32)Remaining & (Vcb->SectorSize - 1);
+            if (AvailLength) *AvailLength = Length - (uint32)Remaining;
+            if (Flags) *Flags = Type;
+            if (Index) *Index = j;
+            /* A hole has no physical sector, regardless of its file offset. */
+            return Type == EXTENT_NOT_RECORDED_NOT_ALLOCATED ? 0 : (uint32)Physical;
+        }
+        if (Length & (Vcb->SectorSize - 1)) {
+            /* A short final run has an EOF too. It cannot be followed by
+             * another run with a fractional logical sector boundary. */
+            if (!(Extent[1].extLength & UDF_EXTENT_LENGTH_MASK)) {
+                if (Index) *Index = j;
+                if (Flags) *Flags = Type;
+            }
+            return LBA_OUT_OF_EXTENT;
+        }
+        if (j == MAXULONG - 1)
+            return LBA_OUT_OF_EXTENT;
+        Remaining -= Length;
+        LastType = Type;
+        j++;
         Extent++;
     }
-    BOffset -= i;
-    Offs = (*((uint32*)&Offset)) - (i << BSh); // offset in frag
-
-    if (SectorOffset)
-        (*SectorOffset) = Offs & (Vcb->SectorSize-1);// offset in 1st Lba
-    if (AvailLength)
-        (*AvailLength) = l - Offs;// bytes to EO frag
-    if (Flags)
-        (*Flags) = (Extent->extLength >> 30);
-    if (Index)
-        (*Index) = j;
-
-    ASSERT(((Extent->extLength >> 30) == EXTENT_NOT_RECORDED_NOT_ALLOCATED) || Extent->extLocation);
-
-    return Extent->extLocation + BOffset;// 1st Lba
 } // end UDFExtentOffsetToLba()
 
 uint32
@@ -84,29 +107,7 @@ UDFNextExtentToLba(
     OUT uint32* Index
     )
 {
-//    uint32 Lba;
-
-    uint32 l;
-//    uint32 d;
-
-    // scan extent table for suitable range (frag)
-//    d = (l = (Extent->extLength & UDF_EXTENT_LENGTH_MASK));
-    l = (Extent->extLength & UDF_EXTENT_LENGTH_MASK);
-
-    if (!l) {
-        (*Index) = -1;
-        Extent--;
-        (*Flags) = (Extent->extLength >> 30);
-        return LBA_OUT_OF_EXTENT;
-    }
-
-    (*Index) = 0;
-    (*AvailLength) = l;// bytes to EO frag
-    (*Flags) = (Extent->extLength >> 30);
-
-    ASSERT(((*Flags) == EXTENT_NOT_RECORDED_NOT_ALLOCATED) || Extent->extLocation);
-
-    return Extent->extLocation;// 1st Lba
+    return UDFExtentOffsetToLba(Vcb, Extent, 0, NULL, AvailLength, Flags, Index);
 } // end UDFNextExtentToLba()
 
 /*
@@ -119,15 +120,21 @@ UDFLocateLbaInExtent(
     IN lba_t lba
     )
 {
-    uint32 l, BSh = Vcb->SectorShift;
-    uint32 i=0;
+    uint32 Length, i = 0;
+    uint64 Blocks;
 
-    while((l = ((Extent->extLength & UDF_EXTENT_LENGTH_MASK) >> BSh))) {
-
-        if (Extent->extLocation   >= lba &&
-           Extent->extLocation+l <  lba) {
+    if (!Vcb || !Extent || Vcb->SectorShift >= 32 || !Vcb->SectorSize ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift))
+        return LBA_OUT_OF_EXTENT;
+    while ((Length = Extent->extLength & UDF_EXTENT_LENGTH_MASK) != 0) {
+        Blocks = ((uint64)Length + Vcb->SectorSize - 1) >> Vcb->SectorShift;
+        if ((Extent->extLength >> 30) < EXTENT_NOT_RECORDED_NOT_ALLOCATED &&
+            lba >= Extent->extLocation &&
+            (uint64)lba - Extent->extLocation < Blocks) {
             return i;
         }
+        if (i == MAXULONG - 1)
+            return LBA_OUT_OF_EXTENT;
         i++; //frag offset
         Extent++;
     }
@@ -143,15 +150,20 @@ UDFGetExtentLength(
     IN PEXTENT_MAP Extent   // Extent array
     )
 {
-    if (!Extent) return 0;
-    int64 i=0;
-
-    while(Extent->extLength) {
-        i += (Extent->extLength & UDF_EXTENT_LENGTH_MASK);
+    int64 Total = 0;
+    uint32 Count = 0, Length;
+    const uint32 MaxCount = (MAXULONG - MY_HEAP_ALIGN) / sizeof(EXTENT_MAP);
+    if (!Extent)
+        return 0;
+    while ((Length = Extent->extLength & UDF_EXTENT_LENGTH_MASK) != 0) {
+        if ((Extent->extLength >> 30) > EXTENT_NOT_RECORDED_NOT_ALLOCATED ||
+            Count >= MaxCount - 1 || (uint64)Total + Length > MAXLONGLONG)
+            ExRaiseStatus(STATUS_FILE_CORRUPT_ERROR);
+        Total += Length;
+        Count++;
         Extent++;
     }
-
-    return i;
+    return Total;
 } // UDFGetExtentLength()
 
 /*
@@ -198,1129 +210,931 @@ UDFGetMappingLength(
     IN PEXTENT_MAP Extent
     )
 {
-    if (!Extent) return 0;
-    uint32 i=0;
-
-    while(Extent->extLength) {
-        i++;
-        Extent++;
-    }
-    i++;
-    i*=sizeof(EXTENT_MAP);
-
-    return i; //  i*sizeof(EXTENT_MAP)
+    uint32 Bytes;
+    NTSTATUS Status;
+    if (!Extent)
+        return 0;
+    Status = UDFGetMappingByteCount(Extent, &Bytes);
+    if (!NT_SUCCESS(Status))
+        ExRaiseStatus(Status);
+    return Bytes;
 } // end UDFGetMappingLength()
 
-/*
-    This routine merges 2 sequencial file mappings
- */
-PEXTENT_MAP
+/* Internal maps are owned and terminated; count bytes before allocation
+ * arithmetic, including the allocator's alignment headroom. */
+NTSTATUS
+UDFGetMappingByteCount(PEXTENT_MAP Mapping, uint32* Bytes)
+{
+    uint32 Count = 0;
+    const uint32 MaxCount = (MAXULONG - MY_HEAP_ALIGN) / sizeof(EXTENT_MAP);
+    if (!Mapping || !Bytes)
+        return STATUS_INVALID_PARAMETER;
+    *Bytes = 0;
+    while (Mapping[Count].extLength & UDF_EXTENT_LENGTH_MASK) {
+        if ((Mapping[Count].extLength >> 30) > EXTENT_NOT_RECORDED_NOT_ALLOCATED ||
+            Count >= MaxCount - 1)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Count++;
+    }
+    *Bytes = (Count + 1) * sizeof(EXTENT_MAP);
+    return STATUS_SUCCESS;
+}
+
+/* Append is a private copy/commit operation. In particular, allocation
+ * failure must not masquerade as a successful unchanged mapping. Neither
+ * the destination nor the tail is consumed on failure; the caller still
+ * owns the tail's physical allocation and must retain or roll it back. */
+NTSTATUS
 __fastcall
-UDFMergeMappings(
-    IN PEXTENT_MAP Extent,
-    IN PEXTENT_MAP Extent2
-    )
+UDFAppendMapping(PEXTENT_MAP* Mapping, PEXTENT_MAP Tail)
 {
-    PEXTENT_MAP NewExt;
-    uint32 len, len2;
+    PEXTENT_MAP NewMap;
+    uint32 OldBytes, TailBytes, NewBytes;
+    uint64 Total;
+    NTSTATUS Status;
 
-    len = UDFGetMappingLength(Extent);
-    len2 = UDFGetMappingLength(Extent2);
-    ASSERT(len2 && len);
-    if (!len2) {
-        return Extent;
-    }
-    if (MyReallocPool__((int8*)Extent, len, (int8**)(&NewExt), len+len2-sizeof(EXTENT_MAP))) {
-        RtlCopyMemory(((int8*)NewExt)+len-sizeof(EXTENT_MAP), (int8*)Extent2, len2);
-    } else {
-        ExtPrint(("UDFMergeMappings failed\n"));
-        BrutePoint();
-    }
-    return NewExt;
-} // end UDFMergeMappings()
-
-PSHORT_AD
-GetNextAllocDesc(
-    IN PSHORT_AD AllocDesc,
-    IN uint32 AllocDescsCount,
-    IN uint32 ExtentIndex
-    )
-{
-    if (ExtentIndex < AllocDescsCount) {
-        return &AllocDesc[ExtentIndex];
-    }
-
-    return NULL;
+    if (!Mapping || !*Mapping || !Tail || *Mapping == Tail)
+        return STATUS_INVALID_PARAMETER;
+    Status = UDFGetMappingByteCount(*Mapping, &OldBytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = UDFGetMappingByteCount(Tail, &TailBytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (TailBytes == sizeof(EXTENT_MAP))
+        return STATUS_SUCCESS;
+    Total = (uint64)OldBytes + TailBytes - sizeof(EXTENT_MAP);
+    if (Total > MAXULONG - MY_HEAP_ALIGN)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    NewBytes = (uint32)Total;
+    NewMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, NewBytes, MEM_EXTMAP_TAG);
+    if (!NewMap)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlCopyMemory(NewMap, *Mapping, OldBytes - sizeof(EXTENT_MAP));
+    RtlCopyMemory((PCHAR)NewMap + OldBytes - sizeof(EXTENT_MAP), Tail, TailBytes);
+    MyFreePool__(*Mapping);
+    *Mapping = NewMap;
+    return STATUS_SUCCESS;
 }
 
-/*
-    This routine builds file mapping according to ShortAllocDesc (SHORT_AD)
-    array
- */
-PEXTENT_MAP
-UDFShortAllocDescToMapping(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 PartNum,
-    IN PSHORT_AD AllocDescs,
-    IN uint32 AllocDescsLength,
-    IN uint32 SubCallCount,
-    OUT PEXTENT_INFO AllocLoc
-    )
+/* Release only the private list wrappers after every underlying receipt is
+ * committed to a live map or aborted/retained by the VCB lease inventory. */
+NTSTATUS
+UDFCompletePrivateExtent(PVCB Vcb, PUDF_PRIVATE_ALLOCATION* Claims,
+                         BOOLEAN Transferred, NTSTATUS FirstError)
 {
-    PEXTENT_MAP AllocMap;
-    EXTENT_AD AllocExt;
-    PALLOC_EXT_DESC NextAllocDesc = NULL;
-    lb_addr locAddr;
-    EXTENT_INFO NextAllocLoc;
-    BOOLEAN w2k_compat = FALSE;
-
-    ExtPrint(("UDFShortAllocDescToMapping: len=%x\n", AllocDescsLength));
-
-    if (SubCallCount > ALLOC_DESC_MAX_RECURSE) return NULL;
-
-    locAddr.partitionReferenceNum = (uint16)PartNum;
-
-    NextAllocLoc.Offset = 0;
-
-    uint32 AllocDescsCount = AllocDescsLength / sizeof(SHORT_AD);
-    uint32 AllocDescsIndex = 0;
-    PSHORT_AD AllocDesc = NULL;
-    uint32 ExtentLength = (AllocDescsCount + 1) * sizeof(SHORT_AD);
-
-    PEXTENT_MAP Extent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, ExtentLength, MEM_EXTMAP_TAG);
-    if (!Extent) {
-        return NULL;
-    }
-
-    // set terminator
-    Extent[AllocDescsLength/sizeof(SHORT_AD)].extLength = 0;
-    Extent[AllocDescsLength/sizeof(SHORT_AD)].extLocation = 0;
-
-    PEXTENT_MAP ExtentNext = Extent;
-
-    while ((AllocDesc = GetNextAllocDesc(AllocDescs, AllocDescsCount, AllocDescsIndex))) {
-
-        uint32 type = AllocDesc->extLength >> 30;
-        uint32 len  = AllocDesc->extLength & UDF_EXTENT_LENGTH_MASK;
-        ExtPrint(("ShExt: type %x, loc %x, len %x\n", type, AllocDesc->extPosition, len));
-
-        if (type == EXTENT_NEXT_EXTENT_ALLOCDESC) {
-
-            // record information about this frag
-            locAddr.logicalBlockNum = AllocDesc->extPosition;
-            AllocExt.extLength = ALIGN_UP_BY(len, Vcb->SectorSize);
-            AllocExt.extLocation = UDFPartLbaToPhys(Vcb, &locAddr);
-            ExtentNext[AllocDescsIndex].extLength = 0;
-            ExtentNext[AllocDescsIndex].extLocation = 0;
-
-            if (ExtentNext && ExtentNext != Extent) {
-                UDFCheckSpaceAllocation(Vcb, 0, ExtentNext, AS_USED); // check if used
-                // and merge this 2 mappings into 1
-                Extent = UDFMergeMappings(Extent, ExtentNext);
-
-                MyFreePool__(ExtentNext);
-                ExtentNext = NULL;
-                MyFreePool__(NextAllocDesc);
-                NextAllocDesc = NULL;
-            }
-
-            // read next frag of allocation descriptors if encountered
-            if (len < sizeof(ALLOC_EXT_DESC)) {
-                ASSERT(ExtentNext == Extent || ExtentNext == NULL);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-
-            NextAllocDesc = (PALLOC_EXT_DESC)MyAllocatePoolTag__(NonPagedPool, len, MEM_ALLOCDESC_TAG);
-            if (!NextAllocDesc) {
-                ASSERT(ExtentNext == Extent || ExtentNext == NULL);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-
-            if (AllocExt.extLocation == LBA_OUT_OF_EXTENT) {
-                UDFPrint(("bad address\n"));
-                MyFreePool__(NextAllocDesc);
-                ASSERT(ExtentNext == Extent || ExtentNext == NULL);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            NextAllocLoc.Mapping =
-            AllocMap = UDFExtentToMapping(&AllocExt);
-            NextAllocLoc.Length = len;
-            if (!AllocMap) {
-                MyFreePool__(NextAllocDesc);
-                ASSERT(ExtentNext == Extent || ExtentNext == NULL);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            AllocLoc->Mapping = UDFMergeMappings(AllocLoc->Mapping, AllocMap);
-            if (!AllocLoc->Mapping ||
-            // read this frag
-               !NT_SUCCESS(UDFReadExtent(IrpContext, Vcb, &NextAllocLoc,
-                                0, len, FALSE, (int8*)NextAllocDesc)))
-            {
-                MyFreePool__(AllocMap);
-                MyFreePool__(NextAllocDesc);
-                ASSERT(ExtentNext == Extent || ExtentNext == NULL);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            MyFreePool__(AllocMap);
-            // check integrity
-            if ((NextAllocDesc->descTag.tagIdent != TID_ALLOC_EXTENT_DESC) ||
-               (NextAllocDesc->lengthAllocDescs > (len - sizeof(ALLOC_EXT_DESC))) ) {
-                UDFPrint(("Integrity check failed\n"));
-                UDFPrint(("NextAllocDesc->descTag.tagIdent = %x\n", NextAllocDesc->descTag.tagIdent));
-                UDFPrint(("NextAllocDesc->lengthAllocDescs = %x\n", NextAllocDesc->lengthAllocDescs));
-                UDFPrint(("len = %x\n", len));
-                MyFreePool__(NextAllocDesc);
-                ASSERT(ExtentNext == Extent || ExtentNext == NULL);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-
-            // Setting pointers to the beginning of the next descriptor
-            AllocDescs = (PSHORT_AD)(NextAllocDesc+1);
-            AllocDescsCount = NextAllocDesc->lengthAllocDescs / sizeof(SHORT_AD);
-            AllocDescsIndex = 0;
-
-            uint32 ExtentNextLength = (AllocDescsCount + 1) * sizeof(EXTENT_AD);
-            ExtentNext = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, ExtentNextLength, MEM_EXTMAP_TAG);
-            if(!ExtentNext)
-            {
-                UDFPrint(("Memory alloc failed: `ExtentNext`\n"));
-                MyFreePool__(NextAllocDesc);
-                ASSERT(ExtentNext == Extent || ExtentNext == NULL);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-
-            // set terminator
-            ExtentNext[AllocDescsCount].extLength = 0;
-            ExtentNext[AllocDescsCount].extLocation = 0;
-        }
-        else {
-#ifdef UDF_CHECK_EXTENT_SIZE_ALIGNMENT
-            ASSERT(!(len & (Vcb->LBlockSize-1) ));
-#endif //UDF_CHECK_EXTENT_SIZE_ALIGNMENT
-            if (len & (Vcb->SectorSize-1)) {
-                w2k_compat = TRUE;
-            }
-            ExtentNext[AllocDescsIndex].extLength = (len+Vcb->SectorSize-1) & ~(Vcb->SectorSize-1);
-            locAddr.logicalBlockNum = AllocDesc->extPosition;
-            // Note: for compatibility Adaptec DirectCD we check 'len' here
-            //       That strange implementation records bogus extLocation in terminal entries
-            if (type != EXTENT_NOT_RECORDED_NOT_ALLOCATED && len) {
-                ExtentNext[AllocDescsIndex].extLocation = UDFPartLbaToPhys(Vcb, &locAddr);
-                if (ExtentNext[AllocDescsIndex].extLocation == LBA_OUT_OF_EXTENT) {
-                    UDFPrint(("bad address (2)\n"));
-                    if(ExtentNext != Extent) {
-                        MyFreePool__(ExtentNext);
-                        MyFreePool__(NextAllocDesc);
-                    }
-                    MyFreePool__(Extent);
-                    return NULL;
+    PUDF_PRIVATE_ALLOCATION Claim, Next;
+    NTSTATUS Status = FirstError, ReleaseStatus;
+    if (!Claims) return STATUS_INVALID_PARAMETER;
+    for (Claim = *Claims; Claim; Claim = Next) {
+        Next = Claim->Next;
+        if (Claim->Lease) {
+            ReleaseStatus = Transferred ? UDFCommitAllocationLease(Vcb, &Claim->Lease) :
+                UDFAbortAllocationLease(Vcb, &Claim->Lease, FirstError);
+            if (NT_SUCCESS(Status) && !NT_SUCCESS(ReleaseStatus)) Status = ReleaseStatus;
+            if (Claim->Lease) {
+                /* The allocator's active/failed VCB inventory owns the
+                 * receipt independently of this caller-private wrapper. */
+                Claim->Lease->Uncertain = TRUE;
+                ReleaseStatus = UDFAbortAllocationLease(Vcb, &Claim->Lease, Status);
+                if (NT_SUCCESS(Status) && !NT_SUCCESS(ReleaseStatus)) Status = ReleaseStatus;
+                if (Claim->Lease) {
+                    Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                    InterlockedCompareExchange(&Vcb->FailedAllocationError,
+                                                STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
                 }
-            } else {
-                ExtentNext[AllocDescsIndex].extLocation = 0;
             }
-            if (!len) {
-                // some UDF implementations set strange AllocDesc sequence length,
-                // but terminates it with zeros in proper place, so handle
-                // this case
-                ASSERT(AllocDescsIndex>=(AllocDescsCount-1));
-                ASSERT(!ExtentNext[AllocDescsIndex].extLength);
-                break;
-            }
-            ExtentNext[AllocDescsIndex].extLength |= (type << 30);
-            ++AllocDescsIndex;
         }
+        MyFreePool__(Claim);
     }
-
-    if (ExtentNext && ExtentNext != Extent) {
-        UDFCheckSpaceAllocation(Vcb, 0, ExtentNext, AS_USED); // check if used
-        // and merge this 2 mappings into 1
-        Extent = UDFMergeMappings(Extent, ExtentNext);
-
-        MyFreePool__(ExtentNext);
-        MyFreePool__(NextAllocDesc);
-    }
-
-    if (/*!SubCallCount &&*/ w2k_compat) {
-        ExtPrint(("w2k-compat\n"));
-    }
-
-    return Extent;
-} // end UDFShortAllocDescToMapping()
-
-PEXTENT_MAP
-UDFSplitMetadataMapping(
-    IN PVCB Vcb,
-    IN PEXTENT_MAP Extent
-)
-{
-    SIZE_T avail;
-    BOOLEAN Split = FALSE;
-    PEXTENT_MAP NewExtent, Src, Dst;
-    uint32 n = 0, type, len, lbn, piece, BSh = Vcb->SectorShift;
-
-    for (Src = Extent; Src->extLength; Src++) {
-
-        type = Src->extLength >> 30;
-        
-        len = Src->extLength & UDF_EXTENT_LENGTH_MASK;
-        n++;
-        
-        if (type == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
-            continue;
-        }
-        
-        lbn = UDFPhysLbaToMetadata(Vcb, Src->extLocation);
-        
-        if (lbn == LBA_OUT_OF_EXTENT) {
-            continue;
-        }
-        
-        while (
-            (UDFMetadataLbaToPhys(Vcb, lbn, &avail) != LBA_OUT_OF_EXTENT) &&
-            (avail < len)
-        ) {
-            Split = TRUE;
-            n++;
-            len -= (uint32)avail;
-            lbn += (uint32)(avail >> BSh);
-        }
-    }
-
-    if (!Split) {
-        return Extent;
-    }
-
-    NewExtent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, (n+1)*sizeof(EXTENT_AD), MEM_EXTMAP_TAG);
-    
-    if (!NewExtent) {
-        MyFreePool__(Extent);
-        return NULL;
-    }
-
-    Dst = NewExtent;
-
-    for (Src = Extent; Src->extLength; Src++) {
-        type = Src->extLength >> 30;
-
-        len = Src->extLength & UDF_EXTENT_LENGTH_MASK;
-        lbn = (type == EXTENT_NOT_RECORDED_NOT_ALLOCATED) ? LBA_OUT_OF_EXTENT :
-                  UDFPhysLbaToMetadata(Vcb, Src->extLocation);
-        
-        if (lbn == LBA_OUT_OF_EXTENT) {
-            *Dst = *Src;
-            Dst++;
-            continue;
-        }
-
-        while (len) {
-            Dst->extLocation = UDFMetadataLbaToPhys(Vcb, lbn, &avail);
-
-            if (Dst->extLocation == LBA_OUT_OF_EXTENT) {
-                UDFPrint(("UDFSplitMetadataMapping: Metadata File doesn't have the lbn %x\n", lbn));
-                MyFreePool__(NewExtent);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-
-            piece = (avail < len) ? (uint32)avail : len;
-            Dst->extLength = piece | (type << 30);
-            Dst++;
-
-            len -= piece;
-            lbn += piece >> BSh;
-        }
-    }
-
-    Dst->extLength = 0;
-    Dst->extLocation = 0;
-    MyFreePool__(Extent);
-
-    return NewExtent;
+    *Claims = NULL;
+    return Status;
 }
 
-/*
-    This routine builds file mapping according to LongAllocDesc (LONG_AD)
-    array
- */
-PEXTENT_MAP
-UDFLongAllocDescToMapping(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PLONG_AD AllocDesc,
-    IN uint32 AllocDescLength,
-    IN uint32 SubCallCount,
-    OUT PEXTENT_INFO AllocLoc // .Mapping must be initialized (non-Zero)
-    )
+NTSTATUS
+UDFPublishPrivateExtent(PVCB Vcb, PUDF_PRIVATE_ALLOCATION Claims)
 {
-    uint32 i, lim, l, len, type, Depth = SubCallCount;
-    uint32 ResultBytes, ExtentBytes;
-    PEXTENT_MAP Extent = NULL, Result = NULL, Combined, AllocMap, Seen;
-    EXTENT_AD AllocExt;
-    PALLOC_EXT_DESC CurrentAllocDesc = NULL, NextAllocDesc = NULL;
-    EXTENT_INFO NextAllocLoc;
-    BOOLEAN ContinueChain;
-
-    /* AED chains may be much longer than a kernel stack permits recursion. */
-    for (;;) {
-        if (Depth > ALLOC_DESC_MAX_RECURSE)
-            goto fail;
-
-        ExtPrint(("UDFLongAllocDescToMapping: len=%x, depth=%x\n",
-                  AllocDescLength, Depth));
-        lim = AllocDescLength / sizeof(LONG_AD);
-        if (lim >= (0xffffffffU / sizeof(EXTENT_AD)))
-            goto fail;
-        l = (lim + 1) * sizeof(EXTENT_AD);
-        Extent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, l, MEM_EXTMAP_TAG);
-        if (!Extent)
-            goto fail;
-
-        ContinueChain = FALSE;
-        NextAllocDesc = NULL;
-        NextAllocLoc.Offset = 0;
-
-        for (i = 0; i < lim; i++) {
-            type = AllocDesc[i].extLength >> 30;
-            len = AllocDesc[i].extLength & UDF_EXTENT_LENGTH_MASK;
-            ExtPrint(("LnExt: type %x, loc %x (%x:%x), len %x\n",
-                      type, UDFPartLbaToPhys(Vcb, &(AllocDesc[i].extLocation)),
-                      AllocDesc[i].extLocation.partitionReferenceNum,
-                      AllocDesc[i].extLocation.logicalBlockNum, len));
-
-            if (type == EXTENT_NEXT_EXTENT_ALLOCDESC) {
-                if (len < sizeof(ALLOC_EXT_DESC))
-                    goto fail;
-
-                AllocExt.extLength = ALIGN_UP_BY(len, Vcb->SectorSize);
-                AllocExt.extLocation = UDFPartLbaToPhys(Vcb, &(AllocDesc[i].extLocation));
-                if (AllocExt.extLocation == LBA_OUT_OF_EXTENT) {
-                    UDFPrint(("bad address\n"));
-                    goto fail;
-                }
-
-                /* A repeated AED sector is a cycle, not another valid fragment. */
-                for (Seen = AllocLoc->Mapping; Seen && Seen->extLength; Seen++) {
-                    if (Seen->extLocation == AllocExt.extLocation) {
-                        UDFPrint(("cyclic allocation descriptor chain\n"));
-                        goto fail;
-                    }
-                }
-
-                NextAllocDesc = (PALLOC_EXT_DESC)MyAllocatePoolTag__(
-                    NonPagedPool, len, MEM_ALLOCDESC_TAG);
-                if (!NextAllocDesc)
-                    goto fail;
-
-                NextAllocLoc.Mapping = AllocMap = UDFExtentToMapping(&AllocExt);
-                NextAllocLoc.Length = len;
-                if (!AllocMap)
-                    goto fail;
-                AllocLoc->Mapping = UDFMergeMappings(AllocLoc->Mapping, AllocMap);
-                if (!AllocLoc->Mapping ||
-                    !NT_SUCCESS(UDFReadExtent(IrpContext, Vcb, &NextAllocLoc,
-                                             0, len, FALSE, (int8*)NextAllocDesc))) {
-                    MyFreePool__(AllocMap);
-                    goto fail;
-                }
-                MyFreePool__(AllocMap);
-
-                if (NextAllocDesc->descTag.tagIdent != TID_ALLOC_EXTENT_DESC ||
-                    NextAllocDesc->lengthAllocDescs > len - sizeof(ALLOC_EXT_DESC)) {
-                    UDFPrint(("Invalid allocation extent descriptor\n"));
-                    goto fail;
-                }
-                ContinueChain = TRUE;
-                break;
-            }
-
-#ifdef UDF_CHECK_EXTENT_SIZE_ALIGNMENT
-            ASSERT(!(len & (Vcb->SectorSize - 1)));
-#endif
-            Extent[i].extLength = (len + Vcb->SectorSize - 1) & ~(Vcb->SectorSize - 1);
-            /* A terminal zero-length entry may have a bogus location. */
-            if (type != EXTENT_NOT_RECORDED_NOT_ALLOCATED && len) {
-                Extent[i].extLocation = UDFPartLbaToPhys(Vcb, &(AllocDesc[i].extLocation));
-                if (Extent[i].extLocation == LBA_OUT_OF_EXTENT) {
-                    UDFPrint(("bad address (2)\n"));
-                    goto fail;
-                }
-            } else {
-                Extent[i].extLocation = 0;
-            }
-            if (!len)
-                break;
-            Extent[i].extLength |= type << 30;
-        }
-        Extent[i].extLength = 0;
-        Extent[i].extLocation = 0;
-
-        if (!Result) {
-            Result = Extent;
-            Extent = NULL;
-        } else {
-            /* Concatenate complete fragments without retaining stack frames. */
-            ResultBytes = UDFGetMappingLength(Result);
-            ExtentBytes = UDFGetMappingLength(Extent);
-            if (ExtentBytes > 0xffffffffU - ResultBytes + sizeof(EXTENT_AD))
-                goto fail;
-            Combined = (PEXTENT_MAP)MyAllocatePoolTag__(
-                NonPagedPool, ResultBytes + ExtentBytes - sizeof(EXTENT_AD),
-                MEM_EXTMAP_TAG);
-            if (!Combined)
-                goto fail;
-            RtlCopyMemory(Combined, Result, ResultBytes - sizeof(EXTENT_AD));
-            RtlCopyMemory((int8*)Combined + ResultBytes - sizeof(EXTENT_AD),
-                          Extent, ExtentBytes);
-            MyFreePool__(Result);
-            MyFreePool__(Extent);
-            Result = Combined;
-            Extent = NULL;
-        }
-
-        if (!ContinueChain) {
-            if (CurrentAllocDesc)
-                MyFreePool__(CurrentAllocDesc);
-            return Result;
-        }
-
-        if (CurrentAllocDesc)
-            MyFreePool__(CurrentAllocDesc);
-        CurrentAllocDesc = NextAllocDesc;
-        NextAllocDesc = NULL;
-        AllocDesc = (PLONG_AD)(CurrentAllocDesc + 1);
-        AllocDescLength = CurrentAllocDesc->lengthAllocDescs;
-        Depth++;
+    PUDF_PRIVATE_ALLOCATION Claim;
+    NTSTATUS Status;
+    for (Claim = Claims; Claim; Claim = Claim->Next) {
+        Status = UDFPublishAllocationLease(Vcb, Claim->Lease);
+        if (!NT_SUCCESS(Status)) return Status;
     }
+    return STATUS_SUCCESS;
+}
 
-fail:
-    if (NextAllocDesc)
-        MyFreePool__(NextAllocDesc);
-    if (CurrentAllocDesc)
-        MyFreePool__(CurrentAllocDesc);
-    if (Extent)
-        MyFreePool__(Extent);
-    if (Result)
-        MyFreePool__(Result);
-    return NULL;
-} // end UDFLongAllocDescToMapping()
-
-/*
-    This routine builds file mapping according to ExtendedAllocDesc (EXT_AD)
-    array
- */
-PEXTENT_MAP
-UDFExtAllocDescToMapping(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN PEXT_AD AllocDesc,
-    IN uint32 AllocDescLength,
-    IN uint32 SubCallCount,
-    OUT PEXTENT_INFO AllocLoc // .Mapping must be intialized (non-Zero)
-    )
+/* Respect the allocator's per-attempt extent-length limit without imposing
+ * that limit on an entire file/AED work allocation. No borrowed lease map is
+ * ever passed to a function which can resize/record/free a work map. */
+NTSTATUS
+UDFPreparePrivateExtent(PIRP_CONTEXT IrpContext, PVCB Vcb, uint32 PartRef,
+    int64 Length, uint8 Flags, PEXTENT_INFO Extent, PUDF_PRIVATE_ALLOCATION* Claims)
 {
-    uint32 i, lim, l, len, type;
-//    uint32 BSh;
-    PEXTENT_MAP Extent, Extent2, AllocMap;
-    EXTENT_AD AllocExt;
-    PALLOC_EXT_DESC NextAllocDesc;
-    EXTENT_INFO NextAllocLoc;
+    EXTENT_INFO Candidate, Borrowed;
+    PUDF_PRIVATE_ALLOCATION Pending = NULL, Claim;
+    uint64 Cover, Done = 0;
+    uint32 Need, Maximum;
+    NTSTATUS Status = STATUS_SUCCESS;
 
-    ExtPrint(("UDFExtAllocDescToMapping: len=%x\n", AllocDescLength));
-
-    if (SubCallCount > ALLOC_DESC_MAX_RECURSE) return NULL;
-
-//    BSh = Vcb->BlockSizeBits;
-    l = ((lim = (AllocDescLength/sizeof(EXT_AD))) + 1 ) * sizeof(EXTENT_AD);
-    Extent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, l, MEM_EXTMAP_TAG);
-    if (!Extent) return NULL;
-
-    NextAllocLoc.Offset = 0;
-
-    for(i=0;i<lim;i++) {
-        type = AllocDesc[i].extLength >> 30;
-        len  = AllocDesc[i].extLength & UDF_EXTENT_LENGTH_MASK;
-        ExtPrint(("ExExt: type %x, loc %x, len %x\n", type, UDFPartLbaToPhys(Vcb,&(AllocDesc[i].extLocation)), len));
-        if (type == EXTENT_NEXT_EXTENT_ALLOCDESC) {
-            // read next frag of allocation descriptors if encountered
-            if (len < sizeof(ALLOC_EXT_DESC)) {
-                MyFreePool__(Extent);
-                return NULL;
+    if (!Extent || !Claims) return STATUS_INVALID_PARAMETER;
+    RtlZeroMemory(Extent, sizeof(*Extent));
+    *Claims = NULL;
+    RtlZeroMemory(&Candidate, sizeof(Candidate));
+    if (!IrpContext || !Vcb || !Vcb->Partitions || PartRef >= Vcb->PartitionMaps ||
+        Length <= 0 || !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) ||
+        (uint64)Length > (uint64)MAXLONGLONG - (Vcb->SectorSize - 1))
+        return STATUS_INVALID_PARAMETER;
+    Maximum = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, Vcb->SectorSize);
+    Cover = ((uint64)Length + Vcb->SectorSize - 1) & ~((uint64)Vcb->SectorSize - 1);
+    _SEH2_TRY {
+    _SEH2_TRY {
+        Candidate.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                                                         sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+        if (!Candidate.Mapping) { Status = STATUS_INSUFFICIENT_RESOURCES; goto private_exit; }
+        RtlZeroMemory(Candidate.Mapping, sizeof(EXTENT_MAP));
+        while (Done < Cover) {
+            Claim = (PUDF_PRIVATE_ALLOCATION)MyAllocatePool__(NonPagedPool, sizeof(*Claim));
+            if (!Claim) { Status = STATUS_INSUFFICIENT_RESOURCES; goto private_exit; }
+            RtlZeroMemory(Claim, sizeof(*Claim));
+            Claim->Next = Pending;
+            Pending = Claim;
+            Need = (uint32)min(Cover - Done, (uint64)Maximum);
+            RtlZeroMemory(&Borrowed, sizeof(Borrowed));
+            Status = UDFAllocExtentLease(IrpContext, Vcb, PartRef, Need,
+                UDFPartStart(Vcb, PartRef), UDFPartEnd(Vcb, PartRef), &Borrowed, Flags, &Claim->Lease);
+            if (!NT_SUCCESS(Status)) goto private_exit;
+            if (!Claim->Lease || !Borrowed.Mapping ||
+                (uint64)UDFGetExtentLength(Borrowed.Mapping) != Need) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto private_exit;
             }
-            NextAllocDesc = (PALLOC_EXT_DESC)MyAllocatePoolTag__(NonPagedPool, len, MEM_ALLOCDESC_TAG);
-            if (!NextAllocDesc) {
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            // record information about this frag
-            AllocExt.extLength = ALIGN_UP_BY(len, Vcb->SectorSize);
-            AllocExt.extLocation = UDFPartLbaToPhys(Vcb,&(AllocDesc[i].extLocation));
-            if (AllocExt.extLocation == LBA_OUT_OF_EXTENT) {
-                UDFPrint(("bad address\n"));
-                MyFreePool__(NextAllocDesc);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            NextAllocLoc.Mapping =
-            AllocMap = UDFExtentToMapping(&AllocExt);
-            NextAllocLoc.Length = len;
-            if (!AllocMap) {
-                MyFreePool__(NextAllocDesc);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            AllocLoc->Mapping = UDFMergeMappings(AllocLoc->Mapping, AllocMap);
-            if (!AllocLoc->Mapping ||
-            // read this frag
-               !NT_SUCCESS(UDFReadExtent(IrpContext, Vcb, &NextAllocLoc,
-                                0, len, FALSE, (int8*)NextAllocDesc)))
-            {
-                MyFreePool__(AllocMap);
-                MyFreePool__(NextAllocDesc);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            MyFreePool__(AllocMap);
-            // check integrity
-            if ((NextAllocDesc->descTag.tagIdent != TID_ALLOC_EXTENT_DESC) ||
-               (NextAllocDesc->lengthAllocDescs > (len - sizeof(ALLOC_EXT_DESC))) ) {
-                UDFPrint(("Integrity check failed\n"));
-                MyFreePool__(NextAllocDesc);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            // perform recursive call to obtain mapping
-            Extent2 = UDFExtAllocDescToMapping(IrpContext, Vcb, (PEXT_AD)(NextAllocDesc+1),
-                                      NextAllocDesc->lengthAllocDescs, SubCallCount+1, AllocLoc);
-            if (!Extent2) {
-                MyFreePool__(NextAllocDesc);
-                MyFreePool__(Extent);
-                return NULL;
-            }
-            // and merge this 2 mappings into 1
-            Extent[i].extLength = 0;
-            Extent[i].extLocation = 0;
-            Extent = UDFMergeMappings(Extent, Extent2);
-            MyFreePool__(Extent2);
-            return Extent;
+            Status = UDFAppendMapping(&Candidate.Mapping, Borrowed.Mapping);
+            if (!NT_SUCCESS(Status)) goto private_exit;
+            Done += Need;
         }
-/*        if ((AllocDesc[i].extLength & UDF_EXTENT_LENGTH_MASK) > // Uncomment!!!
-           (AllocDesc[i].recordedLength & UDF_EXTENT_LENGTH_MASK)) {
-            Extent[i].extLength = AllocDesc[i].recordedLength;
-            Extent[i].extLocation = UDFPartLbaToPhys(Vcb,&(AllocDesc[i].extLocation));
-        }*/
-        Extent[i].extLength = len;
-#ifdef UDF_CHECK_EXTENT_SIZE_ALIGNMENT
-        ASSERT(!(len & (Vcb->LBlockSize-1) ));
-#endif //UDF_CHECK_EXTENT_SIZE_ALIGNMENT
-        // Note: for compatibility Adaptec DirectCD we check 'len' here
-        //       That strange implementation records bogus extLocation in terminal entries
-        if (type != EXTENT_NOT_RECORDED_NOT_ALLOCATED && len) {
-            Extent[i].extLocation = UDFPartLbaToPhys(Vcb,&(AllocDesc[i].extLocation));
-            if (Extent[i].extLocation == LBA_OUT_OF_EXTENT) {
-                UDFPrint(("bad address (2)\n"));
-                MyFreePool__(Extent);
-                return NULL;
-            }
-        } else {
-            Extent[i].extLocation = 0;
-        }
-        if (!len) {
-            // some UDF implementations set strange AllocDesc sequence length,
-            // but terminates it with zeros in proper place, so handle
-            // this case
-            Extent[i].extLocation = 0;
-            return Extent;
-        }
-        Extent[i].extLength |= (type << 30);
+        Candidate.Length = Length;
+        Candidate.Modified = TRUE;
+        Candidate.Flags = Flags;
+        *Extent = Candidate;
+        Candidate.Mapping = NULL;
+        *Claims = Pending;
+        Pending = NULL;
+private_exit:
+        NOTHING;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) Status = STATUS_FILE_CORRUPT_ERROR;
+        Status = UDFCompletePrivateExtent(Vcb, &Pending, FALSE, Status);
+        if (Candidate.Mapping) MyFreePool__(Candidate.Mapping);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Counted private maps are published only after the entire AD chain is valid.
+ * Growth never consumes the old allocation on failure. There is no recursive
+ * AED call and no merge into the caller's live AllocLoc during parsing. */
+typedef struct _UDF_AD_BUILD {
+    PEXTENT_MAP Map;
+    uint32 Count, Capacity;
+} UDF_AD_BUILD;
+
+typedef struct _UDF_AED_KEY {
+    uint32 Lbn;
+    uint16 Partition;
+} UDF_AED_KEY;
+
+static NTSTATUS
+UDFAppendParsedAd(UDF_AD_BUILD* Build, uint32 Location, uint32 Length)
+{
+    if (Build->Count == Build->Capacity) {
+        uint32 Limit = MAXULONG / sizeof(EXTENT_MAP) - 1;
+        uint32 Capacity;
+        PEXTENT_MAP Map;
+        if (Build->Count >= Limit)
+            return STATUS_NOT_SUPPORTED;
+        Capacity = Build->Capacity ?
+            (Build->Capacity > Limit / 2 ? Limit : Build->Capacity * 2) : 8;
+        Map = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                                  (Capacity + 1) * sizeof(*Map), MEM_EXTMAP_TAG);
+        if (!Map)
+            return STATUS_INSUFFICIENT_RESOURCES;
+        if (Build->Count)
+            RtlCopyMemory(Map, Build->Map, Build->Count * sizeof(*Map));
+        if (Build->Map) MyFreePool__(Build->Map);
+        Build->Map = Map;
+        Build->Capacity = Capacity;
     }
-    // set terminator
-    Extent[i].extLength = 0;
-    Extent[i].extLocation = 0;
+    Build->Map[Build->Count].extLocation = Location;
+    Build->Map[Build->Count++].extLength = Length;
+    Build->Map[Build->Count].extLocation = 0;
+    Build->Map[Build->Count].extLength = 0;
+    return STATUS_SUCCESS;
+}
 
-    return Extent;
-} // end UDFExtAllocDescToMapping()
+/* Keep the descriptor's partition identity until its range has been checked.
+ * Metadata extents are split by that identity, never guessed by searching for
+ * a coincident numeric physical address after flattening mixed long_ads.
+ * Virtual descriptor slots resolve once in UDFPartLbaToPhys; the resulting
+ * flat map is physical and lower I/O never reapplies VAT by numeric range. */
+static NTSTATUS
+UDFAppendAdRange(PVCB Vcb, UDF_AD_BUILD* Build, lb_addr Address,
+                  uint32 Length, uint32 Type, BOOLEAN Descriptor)
+{
+    uint64 Rounded = ((uint64)Length + Vcb->SectorSize - 1) &
+                     ~((uint64)Vcb->SectorSize - 1);
+    uint32 Remaining, Part = Address.partitionReferenceNum;
+    uint32 MaxRun = UDF_EXTENT_LENGTH_MASK & ~(Vcb->SectorSize - 1);
+    NTSTATUS Status;
+    BOOLEAN Virtual;
+    if (!Rounded || Rounded > MAXULONG || !MaxRun)
+        return STATUS_FILE_CORRUPT_ERROR;
+    /* A final max-length AD can round to 1 GiB, which needs two internal
+     * runs; do not turn its length bit into an allocation-type flag. */
+    if (Type == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
+        Remaining = (uint32)Rounded;
+        while (Remaining) {
+            uint32 Piece = min(Remaining, MaxRun);
+            Status = UDFAppendParsedAd(Build, 0, Piece | (Type << 30));
+            if (!NT_SUCCESS(Status)) return Status;
+            Remaining -= Piece;
+        }
+        return STATUS_SUCCESS;
+    }
+    if (!Vcb->Partitions || Part >= Vcb->PartitionMaps)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Virtual = Vcb->Partitions[Part].PartitionType == UDF_VIRTUAL_MAP15 ||
+              Vcb->Partitions[Part].PartitionType == UDF_VIRTUAL_MAP20;
+    /* UDF virtual extents identify descriptors, not file/directory data.
+     * Virtual size is the VAT count, not the physical partition length. */
+    if (Virtual) {
+        if (!Descriptor || Rounded > Vcb->SectorSize)
+            return STATUS_FILE_CORRUPT_ERROR;
+    } else if (Address.logicalBlockNum >= Vcb->Partitions[Part].PartitionLen ||
+        (Rounded >> Vcb->SectorShift) > Vcb->Partitions[Part].PartitionLen - Address.logicalBlockNum) {
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+    Remaining = (uint32)Rounded;
+    while (Remaining) {
+        uint32 Location, Piece = min(Remaining, MaxRun);
+        if (Vcb->MetadataFileInfo && Part == Vcb->MetadataRef) {
+            SIZE_T Available = 0;
+            Location = UDFMetadataLbaToPhys(Vcb, Address.logicalBlockNum, &Available);
+            if (!Available || (Available & (Vcb->SectorSize - 1)))
+                return STATUS_FILE_CORRUPT_ERROR;
+            Piece = (uint32)min((uint64)Piece, (uint64)Available);
+        } else {
+            if (!Virtual && (uint64)Vcb->Partitions[Part].PartitionRoot + Address.logicalBlockNum >=
+                LBA_OUT_OF_EXTENT)
+                return STATUS_NOT_SUPPORTED;
+            Location = UDFPartLbaToPhys(Vcb, &Address);
+        }
+        if (Location == LBA_OUT_OF_EXTENT || Location > Vcb->SessionEndLba ||
+            (Piece >> Vcb->SectorShift) > (uint64)Vcb->SessionEndLba - Location + 1)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Status = UDFAppendParsedAd(Build, Location, Piece | (Type << 30));
+        if (!NT_SUCCESS(Status))
+            return Status;
+        Remaining -= Piece;
+        if (Remaining)
+            Address.logicalBlockNum += Piece >> Vcb->SectorShift;
+    }
+    return STATUS_SUCCESS;
+}
 
-
-/*
-    This routine builds FileMapping according to given FileEntry
-    Return:    pointer to EXTENT_MAP array
-            or offset inside FileEntry (negative)
-               when ICB_FLAG_AD_IN_ICB encountered
-            of NULL if an error occured
- */
-PEXTENT_MAP
+/* FE/EFE buffers are one logical block in this caller profile. No I/O, caller
+ * mapping publication or descriptor-sized allocation precedes these bounds.
+ * A legal AED fits one logical block (UDF 2.01/2.50 section 2.3.11). */
+NTSTATUS
 UDFReadMappingFromXEntry(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN uint32 PartNum,
-    IN tag* XEntry,
-    IN OUT uint32* Offset,
-    OUT PEXTENT_INFO AllocLoc // .Mapping must be intialized (non-Zero)
+    IN const LONG_AD* FileIcb,
+    IN const tag* XEntry,
+    IN OUT PEXTENT_INFO DataInfo,
+    IN OUT PEXTENT_INFO AllocLoc
     )
 {
-    PEXTENT_AD Extent;
-    uint16 AllocMode;
-    int8* AllocDescs;
-    uint32 len;
-//    EntityID* eID;  // for compatibility with Adaptec DirectCD
-
-    Extent = NULL;
-    (*Offset) = 0;
-
-
+    UDF_AD_BUILD Data = {0}, Alloc = {0};
+    UDF_AED_KEY* Seen = NULL;
+    PUCHAR Sector = NULL;
+    const uint8* Descs;
+    uint32 Offset, Length, InitialLength, Mode, Part, Width, Depth = 0;
+    uint64 Information, LogicalBytes = 0;
+    NTSTATUS Status = STATUS_FILE_CORRUPT_ERROR;
+    BOOLEAN Embedded;
+    if (!FileIcb || !XEntry || !DataInfo || !AllocLoc || DataInfo == AllocLoc ||
+        DataInfo->Mapping || !Vcb->Partitions ||
+        FileIcb->extLocation.partitionReferenceNum >= Vcb->PartitionMaps)
+        return STATUS_INVALID_PARAMETER;
+    if (Vcb->SectorSize < 512 || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift) ||
+        Vcb->SectorSize > 0x10000)
+        return STATUS_NOT_SUPPORTED;
     if (XEntry->tagIdent == TID_FILE_ENTRY) {
-//        UDFPrint(("Standard FileEntry\n"));
-        PFILE_ENTRY FileEntry = (PFILE_ENTRY)XEntry;
-        ExtPrint(("Standard FileEntry\n"));
-
-        AllocDescs = (int8*)(((int8*)(FileEntry+1))+(FileEntry->lengthExtendedAttr));
-        len = FileEntry->lengthAllocDescs;
-        AllocLoc->Offset = sizeof(FILE_ENTRY) + FileEntry->lengthExtendedAttr;
-//        eID = &(FileEntry->impIdent);
-
-        AllocMode = FileEntry->icbTag.flags & ICB_FLAG_ALLOC_MASK;
-
+        const FILE_ENTRY* Entry = (const FILE_ENTRY*)XEntry;
+        if (Vcb->SectorSize < sizeof(*Entry) ||
+            Entry->lengthExtendedAttr > Vcb->SectorSize - sizeof(*Entry))
+            return STATUS_FILE_CORRUPT_ERROR;
+        Offset = sizeof(*Entry) + Entry->lengthExtendedAttr;
+        Length = Entry->lengthAllocDescs;
+        Information = Entry->informationLength;
+        Mode = Entry->icbTag.flags & ICB_FLAG_ALLOC_MASK;
     } else if (XEntry->tagIdent == TID_EXTENDED_FILE_ENTRY) {
-//        UDFPrint(("Extended FileEntry\n"));
-        ExtPrint(("Extended FileEntry\n"));
-        PEXTENDED_FILE_ENTRY ExFileEntry = (PEXTENDED_FILE_ENTRY)XEntry;
-
-        AllocDescs = (((int8*)(ExFileEntry+1))+(ExFileEntry->lengthExtendedAttr));
-        len = ExFileEntry->lengthAllocDescs;
-        AllocLoc->Offset = sizeof(EXTENDED_FILE_ENTRY) + ExFileEntry->lengthExtendedAttr;
-//        eID = &(FileEntry->impIdent);
-
-        AllocMode = ExFileEntry->icbTag.flags & ICB_FLAG_ALLOC_MASK;
-
+        const EXTENDED_FILE_ENTRY* Entry = (const EXTENDED_FILE_ENTRY*)XEntry;
+        if (Vcb->SectorSize < sizeof(*Entry) ||
+            Entry->lengthExtendedAttr > Vcb->SectorSize - sizeof(*Entry))
+            return STATUS_FILE_CORRUPT_ERROR;
+        Offset = sizeof(*Entry) + Entry->lengthExtendedAttr;
+        Length = Entry->lengthAllocDescs;
+        Information = Entry->informationLength;
+        Mode = Entry->icbTag.flags & ICB_FLAG_ALLOC_MASK;
     } else {
-        return NULL;
+        return STATUS_FILE_CORRUPT_ERROR;
     }
-
-    AllocLoc->Length=len;
-
-    switch (AllocMode) {
-    case ICB_FLAG_AD_SHORT: {
-        Extent = UDFShortAllocDescToMapping(IrpContext, Vcb, PartNum, (PSHORT_AD)AllocDescs, len, 0, AllocLoc);
-        break;
-    }
-    case ICB_FLAG_AD_LONG: {
-        Extent = UDFLongAllocDescToMapping(IrpContext, Vcb, (PLONG_AD)AllocDescs, len, 0, AllocLoc);
-        break;
-    }
-    case ICB_FLAG_AD_EXTENDED: {
-        Extent = UDFExtAllocDescToMapping(IrpContext, Vcb, (PEXT_AD)AllocDescs, len, 0, AllocLoc);
-        break;
-    }
-    default : {  // case ICB_FLAG_AD_IN_ICB
-        Extent = NULL;
-        *Offset = (uintptr_t)AllocDescs - (uintptr_t)XEntry;
-        AllocLoc->Offset=0;
-        AllocLoc->Length=0;
+    if (Length > Vcb->SectorSize - Offset || (Information >> 63))
+        return STATUS_FILE_CORRUPT_ERROR;
+    Embedded = Mode == ICB_FLAG_AD_IN_ICB;
+    if (!Embedded && Mode != ICB_FLAG_AD_SHORT && Mode != ICB_FLAG_AD_LONG)
+        return STATUS_NOT_SUPPORTED; /* no fallthrough treating unknown mode as embedded */
+    if (Embedded && Information > Length)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Part = FileIcb->extLocation.partitionReferenceNum;
+    Width = Mode == ICB_FLAG_AD_SHORT ? sizeof(SHORT_AD) : sizeof(LONG_AD);
+    InitialLength = Length;
+    Descs = (const uint8*)XEntry + Offset;
+    _SEH2_TRY {
+        Status = UDFAppendAdRange(Vcb, Embedded ? &Data : &Alloc,
+                         FileIcb->extLocation, Vcb->SectorSize, EXTENT_RECORDED_ALLOCATED, TRUE);
+        if (!NT_SUCCESS(Status))
+            _SEH2_LEAVE;
+        if (!Embedded) {
+            BOOLEAN More;
+            do {
+                uint32 i, Count;
+                More = FALSE;
+                if (Length % Width) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    _SEH2_LEAVE;
+                }
+                Count = Length / Width;
+                for (i = 0; i < Count; i++) {
+                    lb_addr Address;
+                    uint32 ExtLength = UdfDescriptorRead32(Descs + i * Width);
+                    uint32 Type = ExtLength >> 30;
+                    uint32 Bytes = ExtLength & UDF_EXTENT_LENGTH_MASK;
+                    if (Mode == ICB_FLAG_AD_SHORT) {
+                        Address.partitionReferenceNum = (uint16)Part;
+                        Address.logicalBlockNum = UdfDescriptorRead32(Descs + i * Width + 4);
+                    } else {
+                        Address.logicalBlockNum = UdfDescriptorRead32(Descs + i * Width + 4);
+                        Address.partitionReferenceNum = (uint16)UdfDescriptorRead16(Descs + i * Width + 8);
+                    }
+                    if (!Bytes) {
+                        if (Type) {
+                            Status = STATUS_FILE_CORRUPT_ERROR;
+                            _SEH2_LEAVE;
+                        }
+                        break; /* legacy zero terminator: its location is not dereferenced */
+                    }
+                    if (Type == EXTENT_NEXT_EXTENT_ALLOCDESC) {
+                        uint32 j, Location;
+                        uint16 Ident;
+                        PALLOC_EXT_DESC Next;
+                        if (i + 1 != Count || Bytes < sizeof(ALLOC_EXT_DESC) ||
+                            Bytes > Vcb->SectorSize || Address.partitionReferenceNum >= Vcb->PartitionMaps ||
+                            ((Vcb->Partitions[Address.partitionReferenceNum].PartitionType != UDF_VIRTUAL_MAP15 &&
+                              Vcb->Partitions[Address.partitionReferenceNum].PartitionType != UDF_VIRTUAL_MAP20) &&
+                             Address.logicalBlockNum >= Vcb->Partitions[Address.partitionReferenceNum].PartitionLen)) {
+                            Status = STATUS_FILE_CORRUPT_ERROR;
+                            _SEH2_LEAVE;
+                        }
+                        if (Depth >= ALLOC_DESC_MAX_RECURSE) {
+                            Status = STATUS_NOT_SUPPORTED;
+                            _SEH2_LEAVE;
+                        }
+                        if (!Seen) {
+                            Seen = (UDF_AED_KEY*)MyAllocatePoolTag__(NonPagedPool,
+                                      ALLOC_DESC_MAX_RECURSE * sizeof(*Seen), MEM_ALLOCDESC_TAG);
+                            Sector = (PUCHAR)MyAllocatePoolTag__(NonPagedPool,
+                                                        Vcb->SectorSize, MEM_ALLOCDESC_TAG);
+                            if (!Seen || !Sector) {
+                                Status = STATUS_INSUFFICIENT_RESOURCES;
+                                _SEH2_LEAVE;
+                            }
+                        }
+                        for (j = 0; j < Depth; j++) {
+                            if (Seen[j].Partition == Address.partitionReferenceNum &&
+                                Seen[j].Lbn == Address.logicalBlockNum) {
+                                Status = STATUS_FILE_CORRUPT_ERROR;
+                                _SEH2_LEAVE;
+                            }
+                        }
+                        Seen[Depth].Partition = Address.partitionReferenceNum;
+                        Seen[Depth++].Lbn = Address.logicalBlockNum;
+                        if ((Vcb->Partitions[Address.partitionReferenceNum].PartitionType == UDF_TYPE1_MAP15 ||
+                             Vcb->Partitions[Address.partitionReferenceNum].PartitionType == UDF_SPARABLE_MAP15) &&
+                            (uint64)Vcb->Partitions[Address.partitionReferenceNum].PartitionRoot +
+                                Address.logicalBlockNum >= LBA_OUT_OF_EXTENT) {
+                            Status = STATUS_NOT_SUPPORTED;
+                            _SEH2_LEAVE;
+                        }
+                        Location = UDFPartLbaToPhys(Vcb, &Address);
+                        Status = UDFReadTagged(IrpContext, Vcb, (int8*)Sector,
+                                                Location, Address.logicalBlockNum, &Ident);
+                        if (Status != STATUS_SUCCESS) {
+                            if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+                            _SEH2_LEAVE;
+                        }
+                        Next = (PALLOC_EXT_DESC)Sector;
+                        if (Ident != TID_ALLOC_EXTENT_DESC ||
+                            Next->lengthAllocDescs > Bytes - sizeof(*Next) ||
+                            Next->lengthAllocDescs % Width) {
+                            Status = STATUS_FILE_CORRUPT_ERROR;
+                            _SEH2_LEAVE;
+                        }
+                        /* UDFReadTagged authenticates full returned bytes/tag/CRC,
+                         * including the allowed header-only AED CRC dialect. */
+                        Status = UDFAppendAdRange(Vcb, &Alloc, Address,
+                                                 Vcb->SectorSize, EXTENT_RECORDED_ALLOCATED, TRUE);
+                        if (!NT_SUCCESS(Status))
+                            _SEH2_LEAVE;
+                        Descs = (const uint8*)(Next + 1);
+                        Length = Next->lengthAllocDescs;
+                        More = TRUE;
+                        break;
+                    }
+                    /* Short/long AD information is its declared byte length,
+                     * not sector padding. After the file body only aligned,
+                     * allocated/unrecorded file-tail extents are permitted. */
+                    if ((LogicalBytes >= Information &&
+                         (Type != EXTENT_NOT_RECORDED_ALLOCATED || (Bytes & (Vcb->SectorSize - 1)))) ||
+                        (LogicalBytes < Information && Information - LogicalBytes > Bytes &&
+                         (Bytes & (Vcb->SectorSize - 1)))) {
+                        Status = STATUS_FILE_CORRUPT_ERROR;
+                        _SEH2_LEAVE;
+                    }
+                    Status = UDFAppendAdRange(Vcb, &Data, Address, Bytes, Type, FALSE);
+                    if (!NT_SUCCESS(Status))
+                        _SEH2_LEAVE;
+                    LogicalBytes += Bytes;
+                }
+            } while (More);
+            if (Information > LogicalBytes) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            if (!Data.Map) {
+                Data.Map = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                                                   sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+                if (!Data.Map) {
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                    _SEH2_LEAVE;
+                }
+                RtlZeroMemory(Data.Map, sizeof(EXTENT_MAP));
+            }
+        }
+        /* Only this final section transfers ownership. A read/CRC/cycle/OOM
+         * refusal above leaves the caller's old mapping and offsets intact. */
         if (AllocLoc->Mapping) MyFreePool__(AllocLoc->Mapping);
-        AllocLoc->Mapping=NULL;
-        break;
-    }
-    }
+        AllocLoc->Mapping = Alloc.Map;
+        Alloc.Map = NULL;
+        AllocLoc->Offset = Embedded ? 0 : Offset;
+        AllocLoc->Length = Embedded ? 0 : InitialLength;
+        DataInfo->Mapping = Data.Map;
+        Data.Map = NULL;
+        DataInfo->Offset = Embedded ? Offset : 0;
+        DataInfo->Length = (int64)Information;
+        DataInfo->Modified = FALSE;
+        Status = STATUS_SUCCESS;
+    } _SEH2_FINALLY {
+        if (Data.Map) MyFreePool__(Data.Map);
+        if (Alloc.Map) MyFreePool__(Alloc.Map);
+        if (Sector) MyFreePool__(Sector);
+        if (Seen) MyFreePool__(Seen);
+    } _SEH2_END;
+    return Status;
+} // end UDFReadMappingFromXEntry()
 
-    if (Extent && Vcb->MetadataFileInfo)
-        Extent = UDFSplitMetadataMapping(Vcb, Extent);
-
-    ExtPrint(("UDFReadMappingFromXEntry: mode %x, loc %x, len %x\n", AllocMode,
-        AllocLoc->Mapping ? AllocLoc->Mapping[0].extLocation : -1, len));
-
-    UDFCheckSpaceAllocation(Vcb, 0, Extent, AS_USED); // check if used
-
-    return Extent;
-}// end UDFReadMappingFromXEntry()
-
-/*
-    This routine builds data for AllocDesc sequence for specified
-    extent
- */
-NTSTATUS
-UDFBuildShortAllocDescs(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 PartNum,
-    OUT int8** Buff,  // data for AllocLoc
-    IN uint32 InitSz,
- IN OUT PUDF_FILE_INFO FileInfo
-    )
-{
-    uint32 i, j;
-    uint32 len=0;
-    PEXTENT_MAP Extent = FileInfo->Dloc->DataLoc.Mapping;
-    PEXTENT_INFO AllocExtent = &(FileInfo->Dloc->AllocLoc);
-    PSHORT_AD Alloc;
-    uint32 NewLen;
-    NTSTATUS status;
-    uint32 ph_len=0; // in general, this should be uint64,
-                     // but we need its lower part only
-#ifdef UDF_ALLOW_FRAG_AD
-    uint32 ts, ac, len2;
-    uint32 LBS = Vcb->SectorSize;
-    uint32 LBSh = Vcb->SectorShift;
-    uint32 TagLen = 0;
-    tag* Tag = NULL;
-    PSHORT_AD saved_Alloc;
-    uint32 TagLoc;
-    uint32 BufOffs;
-    uint32 ExtOffs;
-    uint32 saved_NewLen;
-#endif //UDF_ALLOW_FRAG_AD
-
-    ValidateFileInfo(FileInfo);
-    ExtPrint(("UDFBuildShortAllocDescs: FE %x\n", FileInfo->Dloc->FELoc.Mapping[0].extLocation));
-    // calculate length
-    for(len=0; (i=(Extent[len].extLength & UDF_EXTENT_LENGTH_MASK)); len++, ph_len+=i) {
-        ExtPrint(("bShExt: type %x, loc %x, len %x\n",
-            Extent[len].extLength >> 30, Extent[len].extLocation, Extent[len].extLength & UDF_EXTENT_LENGTH_MASK));
-    }
-    Alloc = (PSHORT_AD)MyAllocatePoolTag__(NonPagedPool, (len+1)*sizeof(SHORT_AD), MEM_SHAD_TAG);
-    if (!Alloc) {
-        BrutePoint();
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    // fill contiguous AllocDesc buffer (decribing UserData)
-    for(i=0;i<len;i++) {
-        Alloc[i].extLength = Extent[i].extLength;
-        Alloc[i].extPosition = UDFPhysLbaToPart(Vcb, PartNum, Extent[i].extLocation);
-    }
-    if (i) {
-        Alloc[i-1].extLength -= (ph_len - (ULONG)(FileInfo->Dloc->DataLoc.Length)) &
-                                (Vcb->SectorSize-1);
-        ExtPrint(("bShExt: cut tail -> %x\n",
-            Alloc[i-1].extLength & UDF_EXTENT_LENGTH_MASK));
-    }
-    Alloc[i].extLength =
-    Alloc[i].extPosition = 0;
-    j = len*sizeof(SHORT_AD); // required space
-    len = (InitSz & ~(sizeof(SHORT_AD)-1)); // space available in 1st block
-
-    // Ok. Let's init AllocLoc
-    if (!(FileInfo->Dloc->AllocLoc.Mapping)) {
-        FileInfo->Dloc->AllocLoc.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, 2 * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
-        if (!(FileInfo->Dloc->AllocLoc.Mapping)) {
-            BrutePoint();
-            MyFreePool__(Alloc);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        // allocation descriptors are located in the same sector as FileEntry
-        // (at least their 1st part), just after it
-        FileInfo->Dloc->AllocLoc.Mapping[0] = FileInfo->Dloc->FELoc.Mapping[0];
-        FileInfo->Dloc->AllocLoc.Offset = FileInfo->Dloc->FileEntryLen;
-        FileInfo->Dloc->AllocLoc.Length = 0;
-        // set terminator
-        FileInfo->Dloc->AllocLoc.Mapping[1].extLength =
-        FileInfo->Dloc->AllocLoc.Mapping[1].extLocation = 0;
-    }
-
-    if (j <= len) {
-        // we needn't allocating additional blocks to store AllocDescs
-        AdPrint(("in-ICB AllocDescs, j=%x\n",j));
-        RtlCopyMemory(*Buff, (int8*)Alloc, j);
-        NewLen = j;
-        MyFreePool__(Alloc);
-    } else {
-#ifndef UDF_ALLOW_FRAG_AD
-        AdPrint(("  DISK_FULL\n"));
-        return STATUS_DISK_FULL;
-#else //UDF_ALLOW_FRAG_AD
-        AdPrint(("multi-block AllocDescs, j=%x\n",j));
-        BufOffs = 0;
-        TagLoc = 0;
-        // calculate the space available for SHORT_ADs in each block
-        ac = (LBS - (sizeof(ALLOC_EXT_DESC) + sizeof(SHORT_AD))) & ~(sizeof(SHORT_AD)-1);
-        len2 = len;
-        // tail size
-        ts = InitSz - len2;
-        len -= sizeof(SHORT_AD);
-        // calculate actual AllocSequence length (in bytes)
-        NewLen = ( ((j - len + ac - 1) / ac) << LBSh) + InitSz + sizeof(SHORT_AD);
-        MyFreePool__(*Buff);
-        (*Buff) = (int8*)MyAllocatePoolTag__(NonPagedPool, NewLen, MEM_SHAD_TAG);
-        if (!(*Buff)) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            UDFPrint(("UDFResizeExtent() failed (%x)\n",status));
-            BrutePoint();
-            goto sh_alloc_err;
-        }
-        if (UDFGetExtentLength(AllocExtent->Mapping) < NewLen) {
-            status = UDFResizeExtent(IrpContext, Vcb, PartNum, NewLen, TRUE, AllocExtent);
-            if (!NT_SUCCESS(status)) {
-                UDFPrint(("UDFResizeExtent(2) failed (%x)\n",status));
-                BrutePoint();
-sh_alloc_err:
-                MyFreePool__(Alloc);
-                return status;
-            }
-        }
-        ExtOffs = AllocExtent->Offset;
-        RtlZeroMemory(*Buff, NewLen);
-        saved_NewLen = NewLen;
-        NewLen = 0; // recorded length
-        saved_Alloc = Alloc;
-        // fill buffer sector by sector (adding links at the end of each one)
-        while(TRUE) {
-
-            // j - remained AllocDescs length (in bytes)
-            // len - bytes available for AllocDescs in current block
-            // ac - bytes available for AllocDescs in each block
-
-            // leave space for terminator or pointer to next part of sequence
-            if (j == len2) {
-                // if we have only 1 SHORT_AD that we can fit in last sector
-                // we shall do it instead of recording link & allocating new block
-                len = len2;
-            }
-            ASSERT(saved_NewLen >= (BufOffs + len));
-            RtlCopyMemory( (*Buff)+BufOffs, (int8*)Alloc, len);
-            Alloc = (PSHORT_AD)((int8*)Alloc + len);
-            j -= len;
-            BufOffs += len;
-            if (j) {
-                len = ac;
-                if (j <= (len + sizeof(SHORT_AD)))
-                    len = j - sizeof(SHORT_AD);
-                len2 = len + sizeof(SHORT_AD);
-                ((PSHORT_AD)((*Buff)+BufOffs))->extLength = LBS |
-                    (((uint32)EXTENT_NEXT_EXTENT_ALLOCDESC) << 30) ;
-                ((PSHORT_AD)((*Buff)+BufOffs))->extPosition =
-                    UDFPhysLbaToPart(
-                        Vcb,
-                        PartNum,
-                        UDFExtentOffsetToLba(
-                            Vcb, AllocExtent->Mapping,
-                            ExtOffs+BufOffs+sizeof(SHORT_AD)+ts,
-                            NULL, NULL, NULL, NULL
-                        ) 
-                    );
-            }
-            if (Tag) {
-                // Set up Tag for AllocDesc
-                Tag->tagIdent = TID_ALLOC_EXTENT_DESC;
-                UDFSetUpTag(Vcb, Tag, (uint16)TagLen, TagLoc, 0);
-            }
-            if (!j) {
-                // terminate loop
-                NewLen = BufOffs;
-                break;
-            }
-            TagLoc = ((PSHORT_AD)((*Buff)+BufOffs))->extPosition;
-            // reflect additional (link) block & LBlock tail (if any)
-            BufOffs += ts+sizeof(SHORT_AD);
-            // init AllocDesc
-            ( (PALLOC_EXT_DESC) ((*Buff)+BufOffs))->lengthAllocDescs = len2;
-            ( (PALLOC_EXT_DESC) ((*Buff)+BufOffs))->previousAllocExtLocation = 0;
-            Tag = (tag*)((*Buff)+BufOffs);
-            TagLen = sizeof(ALLOC_EXT_DESC) + ((Vcb->UdfRevision >= 0x0201) ? len2 : 0);;
-            ts = LBS-len2-sizeof(ALLOC_EXT_DESC);
-            BufOffs += sizeof(ALLOC_EXT_DESC);
-        }
-        MyFreePool__(saved_Alloc);
-#endif //UDF_ALLOW_FRAG_AD
-    }
-    status = UDFResizeExtent(IrpContext, Vcb, PartNum, NewLen, TRUE, AllocExtent);
-    return status;
-} // end UDFBuildShortAllocDescs()
 
 /*
     This routine builds data for AllocDesc sequence for specified
     extent
  */
-NTSTATUS
-UDFBuildLongAllocDescs(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 PartNum,
-    OUT int8** Buff,  // data for AllocLoc
-    IN uint32 InitSz,
- IN OUT PUDF_FILE_INFO FileInfo
-    )
+/* Encode a data run or chain link while its address domain is explicit.
+ * Sparse positions are zero, never a translation of placeholder PSN zero. */
+static NTSTATUS
+UDFStoreAllocationDescriptor(PVCB Vcb, uint32 PartNum, BOOLEAN LongAds,
+                              uint32 Length, uint32 Location, int8* Destination)
 {
-    uint32 i, j;
-    uint32 len=0;
-    PEXTENT_MAP Extent = FileInfo->Dloc->DataLoc.Mapping;
-    PEXTENT_INFO AllocExtent = &(FileInfo->Dloc->AllocLoc);
-    PLONG_AD Alloc;
-    uint32 NewLen;
-    NTSTATUS status;
-    uint32 ph_len=0; // in general, this should be uint64,
-                     // but we need its lower part only
-#ifdef UDF_ALLOW_FRAG_AD
-    uint32 ac, len2, ts;
-    uint32 TagLoc;
-    uint32 LBS = Vcb->SectorSize;
-    uint32 LBSh = Vcb->SectorShift;
-    uint32 BufOffs;
-    uint32 ExtOffs = AllocExtent->Offset;
-    PLONG_AD saved_Alloc;
-    uint32 TagLen = 0;
-    tag* Tag = NULL;
-#endif //UDF_ALLOW_FRAG_AD
-
-    ValidateFileInfo(FileInfo);
-    ExtPrint(("UDFBuildLongAllocDescs: FE %x\n", FileInfo->Dloc->FELoc.Mapping[0].extLocation));
-    // calculate length
-    //for(len=0; i=(Extent[len].extLength & UDF_EXTENT_LENGTH_MASK); len++, ph_len+=i);
-    for(len=0; (i=(Extent[len].extLength & UDF_EXTENT_LENGTH_MASK)); len++, ph_len+=i) {
-        ExtPrint(("bLnExt: type %x, loc %x, len %x\n",
-            Extent[len].extLength >> 30, Extent[len].extLocation, Extent[len].extLength & UDF_EXTENT_LENGTH_MASK));
+    uint32 Type = Length >> 30, Bytes = Length & UDF_EXTENT_LENGTH_MASK;
+    uint32 Reference = PartNum, Lbn = 0;
+    uint64 Blocks, End;
+    if (!Bytes || PartNum >= Vcb->PartitionMaps || PartNum > MAXUSHORT)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Type != EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
+        Blocks = ((uint64)Bytes + Vcb->SectorSize - 1) >> Vcb->SectorShift;
+        End = (uint64)Location + Blocks;
+        if (!Blocks || End > LBA_OUT_OF_EXTENT)
+            return STATUS_FILE_CORRUPT_ERROR;
+        if (LongAds && Type != EXTENT_NEXT_EXTENT_ALLOCDESC)
+            Reference = UDFGetRefPartNumByPhysLba(Vcb, Location);
+        if (Reference >= Vcb->PartitionMaps || Reference > MAXUSHORT)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Lbn = UDFPhysLbaToPart(Vcb, Reference, Location);
+        if (Lbn == LBA_OUT_OF_EXTENT ||
+            (uint64)Lbn + Blocks > Vcb->Partitions[Reference].PartitionLen ||
+            UDFPhysLbaToPart(Vcb, Reference, (uint32)(End - 1)) != (uint64)Lbn + Blocks - 1)
+            return STATUS_FILE_CORRUPT_ERROR;
     }
-    Alloc = (PLONG_AD)MyAllocatePoolTag__(NonPagedPool, (len+1)*sizeof(LONG_AD), MEM_LNGAD_TAG);
-    if (!Alloc) return STATUS_INSUFFICIENT_RESOURCES;
-    // fill contiguous AllocDesc buffer (decribing UserData)
-    for(i=0;i<len;i++) {
-        uint32 DataPartNum = PartNum;
-        if (Vcb->MetadataFileInfo && Extent[i].extLocation) {
-            DataPartNum = UDFGetRefPartNumByPhysLba(Vcb, Extent[i].extLocation);
-            if (DataPartNum == LBA_OUT_OF_EXTENT) {
-                MyFreePool__(Alloc);
-                return STATUS_FILE_CORRUPT_ERROR;
-            }
-        }
-        Alloc[i].extLength = Extent[i].extLength;
-        Alloc[i].extLocation.logicalBlockNum = Extent[i].extLocation ?
-            UDFPhysLbaToPart(Vcb, DataPartNum, Extent[i].extLocation) : 0;
-        Alloc[i].extLocation.partitionReferenceNum = (uint16)DataPartNum;
-        RtlZeroMemory(&(Alloc[i].impUse), sizeof(Alloc[i].impUse));
-    }
-    if (i) {
-        Alloc[i-1].extLength -= (ph_len - (ULONG)(FileInfo->Dloc->DataLoc.Length)) &
-                                (Vcb->SectorSize-1);
-        ExtPrint(("bLnExt: cut tail -> %x\n",
-            Alloc[i-1].extLength & UDF_EXTENT_LENGTH_MASK));
-    }
-    RtlZeroMemory(&(Alloc[i]), sizeof(LONG_AD));
-    j = len*sizeof(LONG_AD); // required space
-    len = (InitSz & ~(sizeof(LONG_AD)-1)); // space available in 1st block
-
-    // Ok. Let's init AllocLoc
-    if (!(FileInfo->Dloc->AllocLoc.Mapping)) {
-        FileInfo->Dloc->AllocLoc.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, 2 * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
-        if (!(FileInfo->Dloc->AllocLoc.Mapping)) {
-            MyFreePool__(Alloc);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        // allocation descriptors are located in the same sector as FileEntry
-        // (at least their 1st part), just after it
-        FileInfo->Dloc->AllocLoc.Mapping[0] = FileInfo->Dloc->FELoc.Mapping[0];
-        FileInfo->Dloc->AllocLoc.Offset = FileInfo->Dloc->FileEntryLen;
-        FileInfo->Dloc->AllocLoc.Length = 0;
-        // set terminator
-        FileInfo->Dloc->AllocLoc.Mapping[1].extLength =
-        FileInfo->Dloc->AllocLoc.Mapping[1].extLocation = 0;
-    }
-
-    if (j <= len) {
-        // we needn't allocating additional blocks to store AllocDescs
-        RtlCopyMemory(*Buff, (int8*)Alloc, j);
-        NewLen = j;
-        MyFreePool__(Alloc);
+    if (LongAds) {
+        PLONG_AD Ad = (PLONG_AD)Destination;
+        RtlZeroMemory(Ad, sizeof(*Ad));
+        Ad->extLength = Length;
+        Ad->extLocation.logicalBlockNum = Lbn;
+        Ad->extLocation.partitionReferenceNum = (uint16)Reference;
     } else {
-#ifndef UDF_ALLOW_FRAG_AD
-        AdPrint(("  DISK_FULL\n"));
-        return STATUS_DISK_FULL;
-#else //UDF_ALLOW_FRAG_AD
-        BufOffs = 0;
-        TagLoc = 0;
-        // calculate the space available for LONG_ADs in each block
-        ac = (LBS - (sizeof(ALLOC_EXT_DESC) + sizeof(LONG_AD))) & ~(sizeof(LONG_AD)-1);
-        len2 = len;
-        // tail size
-        ts = InitSz - len2;
-        len -= sizeof(LONG_AD);
-        // calculate actual AllocSequence length (in LBlocks)
-        NewLen = ( ((j - len + ac - 1) / ac) << LBSh) + InitSz + sizeof(LONG_AD);
-        MyFreePool__(*Buff);
-        (*Buff) = (int8*)MyAllocatePoolTag__(NonPagedPool, NewLen, MEM_LNGAD_TAG);
-        if (!(*Buff)) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            goto lad_alloc_err;
-        }
-        if (UDFGetExtentLength(AllocExtent->Mapping) < NewLen) {
-            status = UDFResizeExtent(IrpContext, Vcb, PartNum, NewLen, TRUE, AllocExtent);
-            if (!NT_SUCCESS(status)) {
-lad_alloc_err:
-                MyFreePool__(Alloc);
-                return status;
-            }
-        }
-        ExtOffs = AllocExtent->Offset;
-        RtlZeroMemory(*Buff, NewLen);
-        NewLen = 0; // recorded length
-        saved_Alloc = Alloc;
-        len2 = len+sizeof(LONG_AD);
-        // fill buffer sector by sector (adding links at the end of each one)
-        while(TRUE) {
-
-            // j - remained AllocDescs length (in bytes)
-            // len - bytes available for in AllocDescs each block
-
-            // leave space for terminator or pointer to next part of sequence
-            if (j == len2) {
-                // if we have only 1 LONG_AD that we can fit in last sector
-                // we shall do it instead of recording link & allocating new block
-                len = len2;
-            }
-            RtlCopyMemory( (*Buff)+BufOffs, (int8*)Alloc, len);
-            Alloc = (PLONG_AD)((int8*)Alloc + len);
-            j -= len;
-            BufOffs += len;
-            if (j) {
-                len = ac;
-                if (j <= (len + sizeof(LONG_AD)))
-                    len = j - sizeof(LONG_AD);
-                len2 = len+sizeof(LONG_AD);
-                ((PLONG_AD)((*Buff)+BufOffs))->extLength = LBS |
-                    (((uint32)EXTENT_NEXT_EXTENT_ALLOCDESC) << 30) ;
-                ((PLONG_AD)((*Buff)+BufOffs))->extLocation.logicalBlockNum =
-                    UDFPhysLbaToPart(
-                        Vcb,
-                        PartNum,
-                        UDFExtentOffsetToLba(
-                            Vcb, AllocExtent->Mapping,
-                            ExtOffs+BufOffs+sizeof(LONG_AD)+ts,
-                            NULL, NULL, NULL, NULL
-                        ) 
-                );
-                ((PLONG_AD)((*Buff)+BufOffs))->extLocation.partitionReferenceNum = (uint16)PartNum;
-            }
-            if (Tag) {
-                // Set up Tag for AllocDesc
-                Tag->tagIdent = TID_ALLOC_EXTENT_DESC;
-                UDFSetUpTag(Vcb, Tag, (uint16)TagLen, TagLoc, 0);
-            }
-            if (!j) {
-                // terminate loop
-                NewLen = BufOffs;
-                break;
-            }
-            TagLoc = ((PLONG_AD)((*Buff)+BufOffs))->extLocation.logicalBlockNum;
-            // reflect additional (link) block & LBlock tail (if any)
-            BufOffs += ts+sizeof(LONG_AD);
-            // init AllocDesc
-            ( (PALLOC_EXT_DESC) ((*Buff)+BufOffs))->lengthAllocDescs = len2;
-            ( (PALLOC_EXT_DESC) ((*Buff)+BufOffs))->previousAllocExtLocation = 0;
-            Tag = (tag*)((*Buff)+BufOffs);
-            TagLen = sizeof(ALLOC_EXT_DESC) + ((Vcb->UdfRevision >= 0x0201) ? len2 : 0);
-            ts = LBS-len2-sizeof(ALLOC_EXT_DESC);
-            BufOffs += sizeof(ALLOC_EXT_DESC);
-        }
-        MyFreePool__(saved_Alloc);
-#endif //UDF_ALLOW_FRAG_AD
+        PSHORT_AD Ad = (PSHORT_AD)Destination;
+        Ad->extLength = Length;
+        Ad->extPosition = Lbn;
     }
-    status = UDFResizeExtent(IrpContext, Vcb, PartNum, NewLen, TRUE, AllocExtent);
-    return status;
-} // end UDFBuildLongAllocDescs()
+    return STATUS_SUCCESS;
+}
+
+/* One counted layout for short and long ADs. All sizes are planned wide
+ * before narrowing; every emitted block has a proved buffer window. */
+static BOOLEAN
+UDFRetirementOverlapsMap(PVCB Vcb, PEXTENT_MAP Map, uint32 Lba, uint32 Blocks);
+
+/* Ordinary lookup/IO shares the canonical Main domain; a new cold parser
+ * owns UNDER_INIT until the complete FE/AED mapping exists. Metadata growth
+ * has no ordinary FCB, but its reserved FIs are owned by BitMapResource1. */
+static BOOLEAN
+UDFAllocationDescriptorWriterHeld(PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    PFCB Fcb = Dloc->CommonFcb;
+    if (Fcb) {
+        /* Paging reads also hold Main shared, but need not take VCB. A
+         * volume-exclusive caller still needs the canonical Main writer. */
+        return Fcb->FcbNonpaged && Fcb->FileInfo && Fcb->FileInfo->Dloc == Dloc &&
+            ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource);
+    }
+    if (FileInfo->Fcb) return FALSE;
+    if (ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource)) return TRUE;
+    if (FileInfo->Constructing && FileInfo->DlocInitOwner &&
+        (Dloc->FE_Flags & UDF_FE_FLAG_UNDER_INIT)) return TRUE;
+    return !Fcb && (FileInfo == Vcb->MetadataFileInfo ||
+                   FileInfo == Vcb->MetadataMirrorFileInfo || FileInfo == Vcb->MetadataBitmapFileInfo) &&
+        ExIsResourceAcquiredExclusiveLite(&Vcb->BitMapResource1);
+}
+
+static NTSTATUS
+UDFBuildAllocationDescriptorSequence(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    uint32 PartNum, BOOLEAN LongAds, uint32 InitSz, PUDF_FILE_INFO FileInfo,
+    int8** Buffer, uint32* Capacity)
+{
+    PUDF_DATALOC_INFO Dloc;
+    PEXTENT_MAP Mapping, PreviousMap = NULL;
+    PEXTENT_INFO Alloc;
+    EXTENT_INFO Candidate, OldPrefix, Tail;
+    PUDF_EXTENT_RETIREMENT Retired = NULL, Prior;
+    PUDF_PRIVATE_ALLOCATION Claims = NULL, Claim;
+    int8* Flat = NULL;
+    int8* Encoded = NULL;
+    uint32 MapBytes, Count, Entries = 0, i, LastRelevant = MAXULONG;
+    uint32 Width = LongAds ? sizeof(LONG_AD) : sizeof(SHORT_AD);
+    uint32 FirstSlots, AedSlots, Remaining, Take, Source = 0, Slots, Payload, Offset;
+    uint32 RawLength, Type, EncodedLength, LinkLba, SectorOffset, LinkLocation;
+    uint32 CandidateBytes, Blocks, j;
+    LONG Pending;
+    uint64 Total = 0, Position = 0, FlatBytes, EncodedBytes;
+    uint64 Information, NextOffset, Cover, TailBytes;
+    SIZE_T Available;
+    BOOLEAN First = TRUE, More, Installed = FALSE;
+    PALLOC_EXT_DESC Aed;
+    NTSTATUS Status, ReleaseStatus;
+
+    if (!Buffer || !Capacity) return STATUS_INVALID_PARAMETER;
+    *Buffer = NULL;
+    *Capacity = 0;
+    RtlZeroMemory(&Candidate, sizeof(Candidate));
+    RtlZeroMemory(&OldPrefix, sizeof(OldPrefix));
+    RtlZeroMemory(&Tail, sizeof(Tail));
+    if (!Vcb || !FileInfo || !(Dloc = FileInfo->Dloc) || !Dloc->FileEntry ||
+        Dloc->FileEntryCapacity < Vcb->SectorSize || !Dloc->FELoc.Mapping ||
+        !Dloc->DataLoc.Mapping || !Vcb->Partitions || PartNum >= Vcb->PartitionMaps ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) || Vcb->SectorSize > MAXUSHORT ||
+        Dloc->FileEntryLen > Vcb->SectorSize || InitSz != Vcb->SectorSize - Dloc->FileEntryLen ||
+        Dloc->DataLoc.Offset || Dloc->DataLoc.Length < 0 ||
+        Vcb->SectorSize < sizeof(ALLOC_EXT_DESC) + 2 * Width)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Vcb->Vat || Vcb->CDR_Mode || (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    Status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &RawLength);
+    if (!NT_SUCCESS(Status)) return Status;
+    if (!UDFAllocationDescriptorWriterHeld(Vcb, FileInfo))
+        return STATUS_INVALID_DEVICE_STATE;
+    Mapping = Dloc->DataLoc.Mapping;
+    Alloc = &Dloc->AllocLoc;
+    if (Dloc->FELoc.Offset ||
+        (Dloc->FELoc.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) != Vcb->SectorSize ||
+        (Dloc->FELoc.Mapping[0].extLength >> 30) > EXTENT_NOT_RECORDED_ALLOCATED ||
+        Dloc->FELoc.Mapping[1].extLength)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Information = (uint64)Dloc->DataLoc.Length;
+    Status = UDFGetMappingByteCount(Mapping, &MapBytes);
+    if (!NT_SUCCESS(Status)) return Status;
+    Count = MapBytes / sizeof(EXTENT_MAP) - 1;
+    for (i = 0; i < Count; i++) {
+        RawLength = Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK;
+        Type = Mapping[i].extLength >> 30;
+        if (Total < Information || Type != EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+            LastRelevant = i;
+        if (Total >= Information && Type != EXTENT_NOT_RECORDED_NOT_ALLOCATED &&
+            (Type != EXTENT_NOT_RECORDED_ALLOCATED || (RawLength & (Vcb->SectorSize - 1))))
+            return STATUS_NOT_SUPPORTED;
+        if (Total < Information && Information - Total > RawLength &&
+            (RawLength & (Vcb->SectorSize - 1)))
+            return STATUS_FILE_CORRUPT_ERROR;
+        Total += RawLength;
+        if (Total > MAXLONGLONG) return STATUS_FILE_CORRUPT_ERROR;
+    }
+    if (Information > Total) return STATUS_FILE_CORRUPT_ERROR;
+    FlatBytes = max((uint64)1, (uint64)Count * Width);
+    if (FlatBytes > MAXULONG - MY_HEAP_ALIGN) return STATUS_INSUFFICIENT_RESOURCES;
+    _SEH2_TRY {
+    _SEH2_TRY {
+        Flat = (int8*)MyAllocatePoolTag__(NonPagedPool, FlatBytes, MEM_SHAD_TAG);
+        if (!Flat) { Status = STATUS_INSUFFICIENT_RESOURCES; goto sequence_exit; }
+        for (i = 0; i < Count; i++) {
+            RawLength = Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK;
+            Type = Mapping[i].extLength >> 30;
+            if (Position >= Information && Type == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
+                Position += RawLength; /* unused holes own no physical allocation */
+                continue;
+            }
+            EncodedLength = RawLength;
+            if (i == LastRelevant && Position < Information && Information - Position <= RawLength)
+                EncodedLength -= (uint32)((Position + RawLength - Information) & (Vcb->SectorSize - 1));
+            if (!EncodedLength) { Status = STATUS_FILE_CORRUPT_ERROR; goto sequence_exit; }
+            Status = UDFStoreAllocationDescriptor(Vcb, PartNum, LongAds,
+                EncodedLength | (Type << 30), Mapping[i].extLocation, Flat + (SIZE_T)Entries * Width);
+            if (!NT_SUCCESS(Status)) goto sequence_exit;
+            Entries++;
+            Position += RawLength;
+        }
+        FirstSlots = InitSz / Width;
+        AedSlots = (Vcb->SectorSize - sizeof(ALLOC_EXT_DESC)) / Width;
+        if (Entries <= FirstSlots) {
+            EncodedBytes = (uint64)Entries * Width;
+        } else {
+#ifndef UDF_ALLOW_FRAG_AD
+            Status = STATUS_NOT_SUPPORTED;
+            goto sequence_exit;
+#else
+            uint64 AedBlocks = 1, LastEntries;
+            if (!FirstSlots || AedSlots < 2) { Status = STATUS_NOT_SUPPORTED; goto sequence_exit; }
+            Remaining = Entries - (FirstSlots - 1);
+            if (Remaining > AedSlots)
+                AedBlocks += ((uint64)Remaining - AedSlots + AedSlots - 2) / (AedSlots - 1);
+            if (AedBlocks > ALLOC_DESC_MAX_RECURSE) {
+                Status = STATUS_NOT_SUPPORTED; /* same chain-depth profile as the reader */
+                goto sequence_exit;
+            }
+            LastEntries = Remaining - (AedBlocks - 1) * (AedSlots - 1);
+            EncodedBytes = (uint64)InitSz + (AedBlocks - 1) * Vcb->SectorSize +
+                           sizeof(ALLOC_EXT_DESC) + LastEntries * Width;
+#endif
+        }
+        if (EncodedBytes > MAXULONG - MY_HEAP_ALIGN ||
+            EncodedBytes > (uint64)MAXLONGLONG - Dloc->FileEntryLen) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            goto sequence_exit;
+        }
+        Encoded = (int8*)MyAllocatePoolTag__(NonPagedPool, max((uint64)1, EncodedBytes), MEM_SHAD_TAG);
+        if (!Encoded) { Status = STATUS_INSUFFICIENT_RESOURCES; goto sequence_exit; }
+        RtlZeroMemory(Encoded, max((uint64)1, EncodedBytes));
+        /* Never resize/reuse an AED still reachable from the old FE.
+         * Plan the old exact tail retirement without freeing it, and build
+         * an independent replacement chain rooted at the same FE sector. */
+        if (Alloc->Mapping) {
+            if (Alloc->Mapping == Dloc->DataLoc.Mapping || Alloc->Mapping == Dloc->FELoc.Mapping ||
+                Alloc->Offset != Dloc->FileEntryLen ||
+                Alloc->Mapping[0].extLocation != Dloc->FELoc.Mapping[0].extLocation ||
+                (Alloc->Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) < Vcb->SectorSize ||
+                (Alloc->Mapping[0].extLength >> 30) > EXTENT_NOT_RECORDED_ALLOCATED) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto sequence_exit;
+            }
+            Status = UDFPrepareExtentShrink(Vcb, PartNum, 0, TRUE,
+                                              Alloc, &OldPrefix, &Retired);
+            if (!NT_SUCCESS(Status)) goto sequence_exit;
+        } else if (Alloc->Offset || Alloc->Length) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto sequence_exit;
+        }
+        Candidate.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                                                          2 * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+        if (!Candidate.Mapping) { Status = STATUS_INSUFFICIENT_RESOURCES; goto sequence_exit; }
+        RtlZeroMemory(Candidate.Mapping, 2 * sizeof(EXTENT_MAP));
+        Candidate.Mapping[0] = Dloc->FELoc.Mapping[0];
+        Candidate.Offset = Dloc->FileEntryLen;
+        Candidate.Length = (int64)EncodedBytes;
+        Candidate.Modified = TRUE;
+        TailBytes = (((uint64)Candidate.Offset + EncodedBytes + Vcb->SectorSize - 1) &
+                      ~((uint64)Vcb->SectorSize - 1)) - Vcb->SectorSize;
+        if (TailBytes) {
+            Status = UDFPreparePrivateExtent(IrpContext, Vcb, PartNum, (int64)TailBytes,
+                                              EXTENT_FLAG_ALLOC_STD, &Tail, &Claims);
+            if (!NT_SUCCESS(Status)) goto sequence_exit;
+            Status = UDFAppendMapping(&Candidate.Mapping, Tail.Mapping);
+            if (!NT_SUCCESS(Status)) goto sequence_exit;
+        }
+        Remaining = Entries;
+        Slots = FirstSlots;
+        Offset = 0;
+        while (TRUE) {
+            More = Remaining > Slots;
+            Take = More ? Slots - 1 : Remaining;
+            Payload = (Take + (More ? 1 : 0)) * Width;
+            Cover = (uint64)Offset + (First ? 0 : sizeof(ALLOC_EXT_DESC)) + Payload;
+            if (Cover > EncodedBytes) { Status = STATUS_FILE_CORRUPT_ERROR; goto sequence_exit; }
+            if (!First) {
+                Aed = (PALLOC_EXT_DESC)(Encoded + Offset);
+                Aed->descTag.tagIdent = TID_ALLOC_EXTENT_DESC;
+                Aed->previousAllocExtLocation = 0;
+                Aed->lengthAllocDescs = Payload;
+                Offset += sizeof(ALLOC_EXT_DESC);
+            } else {
+                Aed = NULL;
+            }
+            if (Take) RtlCopyMemory(Encoded + Offset, Flat + (SIZE_T)Source * Width, (SIZE_T)Take * Width);
+            Source += Take;
+            Remaining -= Take;
+            Offset += Take * Width;
+            if (More) {
+                NextOffset = ((uint64)Dloc->FileEntryLen + Offset + Width + Vcb->SectorSize - 1) &
+                             ~((uint64)Vcb->SectorSize - 1);
+                if (NextOffset < Dloc->FileEntryLen || NextOffset - Dloc->FileEntryLen >= EncodedBytes) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    goto sequence_exit;
+                }
+                LinkLba = UDFExtentOffsetToLba(Vcb, Candidate.Mapping, (int64)NextOffset,
+                                               &SectorOffset, &Available, &Type, NULL);
+                if (LinkLba == LBA_OUT_OF_EXTENT || SectorOffset || Available < Vcb->SectorSize ||
+                    Type > EXTENT_NOT_RECORDED_ALLOCATED) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    goto sequence_exit;
+                }
+                Status = UDFStoreAllocationDescriptor(Vcb, PartNum, LongAds,
+                    Vcb->SectorSize | ((uint32)EXTENT_NEXT_EXTENT_ALLOCDESC << 30), LinkLba, Encoded + Offset);
+                if (!NT_SUCCESS(Status)) goto sequence_exit;
+            }
+            if (Aed) {
+                LinkLba = UDFExtentOffsetToLba(Vcb, Candidate.Mapping,
+                    (int64)((uint64)Dloc->FileEntryLen + (uint64)((int8*)Aed - Encoded)),
+                    &SectorOffset, &Available, &Type, NULL);
+                if (LinkLba == LBA_OUT_OF_EXTENT || SectorOffset || Available < Vcb->SectorSize ||
+                    Type > EXTENT_NOT_RECORDED_ALLOCATED) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    goto sequence_exit;
+                }
+                LinkLocation = UDFPhysLbaToPart(Vcb, PartNum, LinkLba);
+                if (LinkLocation == LBA_OUT_OF_EXTENT) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    goto sequence_exit;
+                }
+                UDFSetUpTag(Vcb, &Aed->descTag,
+                    (uint16)(sizeof(ALLOC_EXT_DESC) + (Vcb->UdfRevision >= 0x0201 ? Payload : 0)),
+                    LinkLocation, 0);
+            }
+            if (!More) break;
+            Offset = (uint32)(NextOffset - Dloc->FileEntryLen);
+            Slots = AedSlots;
+            First = FALSE;
+        }
+        if (Source != Entries || Offset != EncodedBytes) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto sequence_exit;
+        }
+        /* The writer domain excludes old in-memory map readers; a new
+         * cold parser must first own UNDER_INIT and cannot race this Dloc.
+         * Check the allocator's offered tail against all still-live owners
+         * before submitting any AED bytes. A conflicting bitmap claim is
+         * uncertain, not a private free that may release someone else's data. */
+        Status = UDFGetMappingByteCount(Candidate.Mapping, &CandidateBytes);
+        if (!NT_SUCCESS(Status)) goto sequence_exit;
+        UDFAcquireResourceExclusive(&Vcb->BitMapResource1, TRUE);
+        _SEH2_TRY {
+            if (Vcb->PendingExtentRetirements < 0 ||
+                (Retired && Vcb->PendingExtentRetirements == MAXLONG)) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                _SEH2_LEAVE;
+            }
+            for (i = 1; i + 1 < CandidateBytes / sizeof(EXTENT_MAP); i++) {
+                uint32 Lba = Candidate.Mapping[i].extLocation;
+                uint64 End;
+                Blocks = (Candidate.Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK) >> Vcb->SectorShift;
+                End = (uint64)Lba + Blocks;
+                if (!Blocks || End > LBA_OUT_OF_EXTENT ||
+                    UDFRetirementOverlapsMap(Vcb, Dloc->DataLoc.Mapping, Lba, Blocks) ||
+                    UDFRetirementOverlapsMap(Vcb, Dloc->AllocLoc.Mapping, Lba, Blocks) ||
+                    UDFRetirementOverlapsMap(Vcb, Dloc->FELoc.Mapping, Lba, Blocks)) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    break;
+                }
+                Pending = Vcb->PendingExtentRetirements;
+                for (Prior = Dloc->RetiredExtents; Prior; Prior = Prior->Next) {
+                    if (Pending-- <= 0 || Prior->Count > Prior->Capacity ||
+                        Prior->Completed > Prior->Count) {
+                        Status = STATUS_FILE_CORRUPT_ERROR;
+                        break;
+                    }
+                    for (j = Prior->Completed; j < Prior->Count; j++) {
+                        uint64 OldEnd = (uint64)Prior->Ranges[j].extLocation +
+                            ((Prior->Ranges[j].extLength & UDF_EXTENT_LENGTH_MASK) >> Vcb->SectorShift);
+                        if ((uint64)Lba < OldEnd && (uint64)Prior->Ranges[j].extLocation < End) {
+                            Status = STATUS_FILE_CORRUPT_ERROR;
+                            break;
+                        }
+                    }
+                    if (!NT_SUCCESS(Status)) break;
+                }
+                if (!NT_SUCCESS(Status)) break;
+            }
+            if (!NT_SUCCESS(Status)) {
+                for (Claim = Claims; Claim; Claim = Claim->Next)
+                    if (Claim->Lease) Claim->Lease->Uncertain = TRUE;
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                _SEH2_LEAVE;
+            }
+            Status = UDFPublishPrivateExtent(Vcb, Claims);
+            if (!NT_SUCCESS(Status)) _SEH2_LEAVE;
+            if (Retired) {
+                Retired->Next = Dloc->RetiredExtents;
+                Dloc->RetiredExtents = Retired;
+                Retired = NULL;
+                InterlockedIncrement(&Vcb->PendingExtentRetirements);
+            }
+            PreviousMap = Alloc->Mapping;
+            *Alloc = Candidate;
+            Candidate.Mapping = NULL;
+            Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+            Installed = TRUE;
+        } _SEH2_FINALLY {
+            UDFReleaseResource(&Vcb->BitMapResource1);
+        } _SEH2_END;
+        if (!NT_SUCCESS(Status)) goto sequence_exit;
+        *Buffer = Encoded;
+        Encoded = NULL;
+        *Capacity = (uint32)max((uint64)1, EncodedBytes);
+        Status = STATUS_SUCCESS;
+sequence_exit:
+        NOTHING;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) Status = STATUS_FILE_CORRUPT_ERROR;
+        ReleaseStatus = UDFCompletePrivateExtent(Vcb, &Claims,
+            Installed && !_SEH2_AbnormalTermination(), Status);
+        if (NT_SUCCESS(Status) && !NT_SUCCESS(ReleaseStatus)) Status = ReleaseStatus;
+        if (Flat) MyFreePool__(Flat);
+        if (Encoded) MyFreePool__(Encoded);
+        if (Candidate.Mapping) MyFreePool__(Candidate.Mapping);
+        if (OldPrefix.Mapping) MyFreePool__(OldPrefix.Mapping);
+        if (Tail.Mapping) MyFreePool__(Tail.Mapping);
+        if (Retired) MyFreePool__(Retired);
+        if (PreviousMap) MyFreePool__(PreviousMap);
+        if (Installed && !NT_SUCCESS(Status)) {
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            UDFRememberMetadataWritebackError(IrpContext, Vcb, FileInfo, Status);
+        }
+    } _SEH2_END;
+    return Status;
+}
+
+NTSTATUS
+UDFBuildShortAllocDescs(PIRP_CONTEXT IrpContext, PVCB Vcb, uint32 PartNum,
+    int8** Buffer, uint32 InitSz, PUDF_FILE_INFO FileInfo, uint32* Capacity)
+{
+    return UDFBuildAllocationDescriptorSequence(IrpContext, Vcb, PartNum,
+                                                  FALSE, InitSz, FileInfo, Buffer, Capacity);
+}
+
+NTSTATUS
+UDFBuildLongAllocDescs(PIRP_CONTEXT IrpContext, PVCB Vcb, uint32 PartNum,
+    int8** Buffer, uint32 InitSz, PUDF_FILE_INFO FileInfo, uint32* Capacity)
+{
+    return UDFBuildAllocationDescriptorSequence(IrpContext, Vcb, PartNum,
+                                                  TRUE, InitSz, FileInfo, Buffer, Capacity);
+} // end counted short/long AD builders
 
 /*
     This routine builds data for AllocDesc sequence for specified
@@ -1467,205 +1281,64 @@ UDFBuildExtAllocDescs(
 } // end UDFBuildExtAllocDescs()*/
 
 
-NTSTATUS
-UDFInitAllocationCache(
-    IN PVCB Vcb,
-    IN uint32 AllocClass,
-   OUT PUDF_ALLOCATION_CACHE_ITEM* _AllocCache,
-   OUT uint32* _lim,
-    IN BOOLEAN Init
-    )
-{
-    PUDF_ALLOCATION_CACHE_ITEM AllocCache;
-    PUDF_ALLOCATION_CACHE_ITEM* pAllocCache;
-    uint32 i, lim;
-    uint32* plim;
-
-    switch(AllocClass) {
-    case UDF_PREALLOC_CLASS_DIR:
-        UDFPrint(("AllocationCache DIR:\n"));
-        pAllocCache = &(Vcb->PreallocCache);
-        plim = &(Vcb->PreallocCacheMaxSize);
-        lim = 32;
-        break;
-    default:
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (!(*plim)) {
-        if (!Init) {
-            return STATUS_UNSUCCESSFUL;
-        }
-        (*pAllocCache) = AllocCache =
-                  (PUDF_ALLOCATION_CACHE_ITEM)
-                  MyAllocatePoolTag__(NonPagedPool , sizeof(UDF_ALLOCATION_CACHE_ITEM)*lim,
-                                      MEM_ALLOC_CACHE_TAG);
-        if (!AllocCache) {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        RtlZeroMemory(AllocCache, sizeof(UDF_ALLOCATION_CACHE_ITEM)*lim);
-        for(i=0; i<lim; i++) {
-            AllocCache[i].ParentLocation = LBA_NOT_ALLOCATED;
-        }
-        (*plim) = lim;
-    } else {
-        lim = (*plim);
-        AllocCache = (*pAllocCache);
-    }
-    (*_lim) = lim;
-    (*_AllocCache) = AllocCache;
-
-    return STATUS_SUCCESS;
-} // end UDFInitAllocationCache()
-
-NTSTATUS
-UDFGetCachedAllocation(
-    IN PVCB Vcb,
-    IN uint32 ParentLocation,
-   OUT PEXTENT_INFO Ext,
-   OUT uint32* Items, // optional
-    IN uint32 AllocClass
-    )
-{
-    PUDF_ALLOCATION_CACHE_ITEM AllocCache;
-    uint32 i, lim;
-    NTSTATUS status;
-
-    UDFAcquireResourceExclusive(&(Vcb->PreallocResource),TRUE);
-
-    status = UDFInitAllocationCache(Vcb, AllocClass, &AllocCache, &lim, FALSE);
-    if (!NT_SUCCESS(status)) {
-        UDFReleaseResource(&(Vcb->PreallocResource));
-        return status;
-    }
-    UDFPrint(("Get AllocationCache for %x lim %x\n", ParentLocation, lim));
-
-    for(i=0; i<lim; i++) {
-        if (AllocCache[i].ParentLocation == ParentLocation) {
-            (*Ext) = AllocCache[i].Ext;
-            AdPrint(("    map %x (%x)\n", Ext->Mapping, i));
-            if (Items) {
-                (*Items) = AllocCache[i].Items;
-            }
-            RtlZeroMemory(&(AllocCache[i]), sizeof(AllocCache[i]));
-            AllocCache[i].ParentLocation = LBA_NOT_ALLOCATED;
-            UDFReleaseResource(&(Vcb->PreallocResource));
-            return STATUS_SUCCESS;
-        }
-    }
-    AdPrint(("    no map\n"));
-    UDFReleaseResource(&(Vcb->PreallocResource));
-    return STATUS_UNSUCCESSFUL;
-} // end UDFGetCachedAllocation()
-
-NTSTATUS
-UDFStoreCachedAllocation(
-    IN PVCB Vcb,
-    IN uint32 ParentLocation,
-    IN PEXTENT_INFO Ext,
-    IN uint32 Items,
-    IN uint32 AllocClass
-    )
-{
-    PUDF_ALLOCATION_CACHE_ITEM AllocCache;
-    uint32 i, lim;
-    NTSTATUS status;
-
-    UDFAcquireResourceExclusive(&(Vcb->PreallocResource),TRUE);
-
-    status = UDFInitAllocationCache(Vcb, AllocClass, &AllocCache, &lim, TRUE);
-    if (!NT_SUCCESS(status)) {
-        UDFReleaseResource(&(Vcb->PreallocResource));
-        return status;
-    }
-    UDFPrint(("Store AllocationCache for %x, map %x\n", ParentLocation, Ext->Mapping));
-
-    for(i=0; i<lim; i++) {
-        if (AllocCache[i].ParentLocation == LBA_NOT_ALLOCATED) {
-            AdPrint(("    stored in %x\n", i));
-            AllocCache[i].Ext = (*Ext);
-            AllocCache[i].Items = Items;
-            AllocCache[i].ParentLocation = ParentLocation;
-            UDFReleaseResource(&(Vcb->PreallocResource));
-            return STATUS_SUCCESS;
-        }
-    }
-    //
-    AdPrint(("    drop map %x (%x)\n", AllocCache[lim-1].Ext.Mapping, lim-1));
-    UDFMarkSpaceAsXXX(Vcb, 0, AllocCache[lim-1].Ext.Mapping, AS_DISCARDED);
-    RtlMoveMemory(&(AllocCache[1]), &(AllocCache[0]), sizeof(UDF_ALLOCATION_CACHE_ITEM)*(lim-1));
-    AllocCache[0].Ext = (*Ext);
-    AllocCache[0].Items = Items;
-    AllocCache[0].ParentLocation = ParentLocation;
-    AdPrint(("    stored in 0\n"));
-    UDFReleaseResource(&(Vcb->PreallocResource));
-    return STATUS_SUCCESS;
-} // end UDFStoreCachedAllocation()
-
+/* Private extent growth/shrink owns typed allocator leases and exact old
+ * generation retirements. The former ParentLocation-only cache has no
+ * producer/consumer in this source: retaining its get/store/append API would
+ * allow untyped or still-live ranges to become reusable. Keep checkpoint's
+ * empty-cache contract, but never guess the domain/owner of a stray entry. */
 NTSTATUS
 UDFFlushAllCachedAllocations(
     IN PVCB Vcb,
     IN uint32 AllocClass
     )
 {
-    PUDF_ALLOCATION_CACHE_ITEM AllocCache;
-    uint32 i, lim;
-    NTSTATUS status;
-
-    UDFPrint(("Flush AllocationCache\n"));
+    NTSTATUS Status = STATUS_SUCCESS;
+    BOOLEAN CacheLocked = FALSE;
     if (AllocClass != UDF_PREALLOC_CLASS_DIR)
         return STATUS_INVALID_PARAMETER;
-    UDFAcquireResourceExclusive(&(Vcb->PreallocResource),TRUE);
-
-    /* There is nothing to release when no directory allocation cache was
-     * created.  UDFInitAllocationCache deliberately reports a miss for
-     * lookup callers, but a second volume flush must remain idempotent. */
-    if (!Vcb->PreallocCacheMaxSize && !Vcb->PreallocCache) {
-        UDFReleaseResource(&(Vcb->PreallocResource));
-        return STATUS_SUCCESS;
-    }
-    if (!Vcb->PreallocCache) {
-        UDFReleaseResource(&(Vcb->PreallocResource));
-        return STATUS_FILE_CORRUPT_ERROR;
-    }
-
-    status = UDFInitAllocationCache(Vcb, AllocClass, &AllocCache, &lim, FALSE);
-    if (!NT_SUCCESS(status)) {
-        UDFReleaseResource(&(Vcb->PreallocResource));
-        return status;
-    }
-
-    for(i=0; i<lim; i++) {
-        if (AllocCache[i].ParentLocation != LBA_NOT_ALLOCATED) {
-            UDFMarkSpaceAsXXX(Vcb, 0, AllocCache[i].Ext.Mapping, AS_DISCARDED);
+    UDFAcquireResourceExclusive(&Vcb->BitMapResource1, TRUE);
+    _SEH2_TRY {
+        UDFAcquireResourceExclusive(&Vcb->PreallocResource, TRUE);
+        CacheLocked = TRUE;
+        if (Vcb->PreallocCache || Vcb->PreallocCacheMaxSize) {
+            /* Preserve the inventory. No current source path creates it,
+             * and its obsolete coordinates prove no bitmap ownership. */
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                        Status, STATUS_SUCCESS);
         }
-    }
-    MyFreePool__(AllocCache);
-    Vcb->PreallocCache = NULL;
-    Vcb->PreallocCacheMaxSize = 0;
-    UDFReleaseResource(&(Vcb->PreallocResource));
-    //
-    return STATUS_SUCCESS;
+    } _SEH2_FINALLY {
+        if (CacheLocked) UDFReleaseResource(&Vcb->PreallocResource);
+        UDFReleaseResource(&Vcb->BitMapResource1);
+    } _SEH2_END;
+    return Status;
 } // end UDFFlushAllCachedAllocations()
 
 /*
     This routine allocates space for FE of the file being created.
     Allocates a single block from the partition bitmap.
  */
-NTSTATUS
-UDFAllocateFESpace(
+static NTSTATUS
+UDFAllocateFESpaceInternal(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
     IN PUDF_FILE_INFO DirInfo,
     IN uint32 PartNum,
     IN PEXTENT_INFO FEExtInfo,
-    IN uint32 Len
+    IN uint32 Len,
+    OUT PUDF_ALLOCATION_FAILURE* Lease OPTIONAL
     )
 {
     uint32 start, end, length, preferred;
     NTSTATUS status;
     UNREFERENCED_PARAMETER(DirInfo);
 
-    if (Vcb->MetadataFileInfo && PartNum == Vcb->MetadataRef)
+    if (Lease) *Lease = NULL;
+    if (!Vcb || !Vcb->Partitions || PartNum >= Vcb->PartitionMaps ||
+        !FEExtInfo || !Len || !Vcb->SectorSize)
+        return STATUS_INVALID_PARAMETER;
+    if (Vcb->MetadataFileInfo && PartNum == Vcb->MetadataRef && !Lease)
         return UDFAllocMetadataExtent(IrpContext, Vcb, Len, FEExtInfo);
 
     start = UDFPartStart(Vcb, PartNum);
@@ -1682,14 +1355,40 @@ UDFAllocateFESpace(
         end > start && length >= 16384 && Vcb->FSBM_BitCount >= length &&
         Vcb->FeSectorHint != MAXULONG) {
         preferred = end - length / 4;
-        status = UDFAllocFreeExtent(IrpContext, Vcb, Len, preferred, end,
-                                    FEExtInfo, EXTENT_FLAG_VERIFY | EXTENT_FLAG_FE_LOCALITY);
+        status = Lease ?
+            UDFAllocExtentLease(IrpContext, Vcb, PartNum, Len, preferred, end,
+                FEExtInfo, EXTENT_FLAG_VERIFY | EXTENT_FLAG_FE_LOCALITY, Lease) :
+            UDFAllocFreeExtent(IrpContext, Vcb, PartNum, Len, preferred, end,
+                FEExtInfo, EXTENT_FLAG_VERIFY | EXTENT_FLAG_FE_LOCALITY);
         if (status != STATUS_DISK_FULL)
             return status;
     }
-    return UDFAllocFreeExtent(IrpContext, Vcb, Len, start, end,
-                               FEExtInfo, EXTENT_FLAG_VERIFY);
-} // end UDFAllocateFESpace()
+    return Lease ?
+        UDFAllocExtentLease(IrpContext, Vcb, PartNum, Len, start, end,
+                            FEExtInfo, EXTENT_FLAG_VERIFY, Lease) :
+        UDFAllocFreeExtent(IrpContext, Vcb, PartNum, Len, start, end,
+                            FEExtInfo, EXTENT_FLAG_VERIFY);
+}
+
+NTSTATUS
+UDFAllocateFESpace(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO DirInfo,
+                   uint32 PartNum, PEXTENT_INFO FEExtInfo, uint32 Len)
+{
+    return UDFAllocateFESpaceInternal(IrpContext, Vcb, DirInfo, PartNum,
+                                     FEExtInfo, Len, NULL);
+}
+
+/* The returned map is borrowed from the VCB lease. A constructor must
+ * publish an independent work map before committing these bitmap claims. */
+NTSTATUS
+UDFAllocateFESpaceLease(PIRP_CONTEXT IrpContext, PVCB Vcb,
+    PUDF_FILE_INFO DirInfo, uint32 PartNum, PEXTENT_INFO FEExtInfo,
+    uint32 Len, PUDF_ALLOCATION_FAILURE* Lease)
+{
+    if (!Lease) return STATUS_INVALID_PARAMETER;
+    return UDFAllocateFESpaceInternal(IrpContext, Vcb, DirInfo, PartNum,
+                                     FEExtInfo, Len, Lease);
+}
 
 /*
     This routine frees space allocated for FE.
@@ -1719,126 +1418,67 @@ UDFMarkAllocatedAsRecorded(
     IN PEXTENT_INFO ExtInfo   // Extent array
     )
 {
-    uint32 i, len, lba, sLen;
-    PEXTENT_MAP Extent = ExtInfo->Mapping;   // Extent array
-    PEXTENT_MAP NewExtent;
-    uint32 BS = Vcb->SectorSize;
-    uint32 LBS = Vcb->SectorSize;
-    uint32 BSh = Vcb->SectorShift;
-    uint32 MaxExtentLength = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, LBS);
-    BOOLEAN TryPack = TRUE;
-#ifdef UDF_DBG
-    int64 check_size;
-#endif //UDF_DBG
-    // I don't know what else comment can be added here.
-    // Just belive that it works
-    lba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, (Offset & ~((int64)LBS-1)), NULL, NULL, NULL, &i);
-    if (i == (ULONG)-1) return STATUS_INVALID_PARAMETER;
-#ifdef UDF_DBG
-    check_size = UDFGetExtentLength(ExtInfo->Mapping);
-    ASSERT(!(check_size & (LBS-1)));
-#endif //UDF_DBG
-    AdPrint(("Alloc->Rec  ExtInfo %x, Extent %x\n", ExtInfo, Extent));
-    if ((Extent[i].extLength >> 30) == EXTENT_RECORDED_ALLOCATED) return STATUS_SUCCESS;
-    if ((Extent[i].extLength >> 30) == EXTENT_NOT_RECORDED_NOT_ALLOCATED) return STATUS_INVALID_PARAMETER;
-    ASSERT((((uint32)Offset) & (LBS-1)) + Length <= (Extent[i].extLength & UDF_EXTENT_LENGTH_MASK));
-    sLen = (( (((uint32)Offset) & (LBS-1)) + Length+LBS-1) & ~(LBS-1)) >> BSh;
-    if ((Extent[i].extLocation == lba) && (((Extent[i].extLength & UDF_EXTENT_LENGTH_MASK ) >> BSh) == sLen)) {
-        // xxxxxx ->  RRRRRR
-        Extent[i].extLength &= UDF_EXTENT_LENGTH_MASK;
-//      Extent[i].extLength |= (EXTENT_RECORDED_ALLOCATED << 30); // = 0;
+    uint32 Index, Lba, Type, OldBytes, Prefix, Suffix, Rounded, j;
+    SIZE_T Available;
+    uint64 Cover, AllocationBytes;
+    PEXTENT_MAP OldMap, NewMap;
+    NTSTATUS Status;
+
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || Offset < 0 || !Vcb->SectorSize)
+        return STATUS_INVALID_PARAMETER;
+    if (!Length)
+        return STATUS_SUCCESS;
+    OldMap = ExtInfo->Mapping;
+    Lba = UDFExtentOffsetToLba(Vcb, OldMap,
+        Offset & ~((int64)Vcb->SectorSize - 1), NULL, &Available, &Type, &Index);
+    Cover = ((uint64)Offset & (Vcb->SectorSize - 1)) + Length;
+    Cover = (Cover + Vcb->SectorSize - 1) & ~((uint64)Vcb->SectorSize - 1);
+    if (Lba == LBA_OUT_OF_EXTENT || Index == MAXULONG || !Cover || Cover > Available)
+        return STATUS_INVALID_PARAMETER;
+    if (Type == EXTENT_RECORDED_ALLOCATED)
+        return STATUS_SUCCESS;
+    if (Type != EXTENT_NOT_RECORDED_ALLOCATED)
+        return STATUS_INVALID_PARAMETER;
+    if (Vcb->Vat || Vcb->CDR_Mode || (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    Rounded = (uint32)Cover;
+    Prefix = (Lba - OldMap[Index].extLocation) << Vcb->SectorShift;
+    Suffix = (OldMap[Index].extLength & UDF_EXTENT_LENGTH_MASK) - Prefix - Rounded;
+    if (!Prefix && !Suffix) {
+        OldMap[Index].extLength = Rounded;
         ExtInfo->Modified = TRUE;
-        if (i &&
-           ((Extent[i-1].extLength >> 30) == EXTENT_RECORDED_ALLOCATED) &&
-           (lba == (Extent[i-1].extLocation + ((len = Extent[i-1].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh))) &&
-           ((len + (Extent[i].extLength & UDF_EXTENT_LENGTH_MASK)) <= MaxExtentLength) &&
-           (i == ((UDFGetMappingLength(Extent) / sizeof(EXTENT_MAP)) - 2)) &&
-           TRUE) {
-            // make optimization for sequentially written files
-            Extent[i-1].extLength += Extent[i].extLength;
-            Extent[i].extLocation = 0;
-            Extent[i].extLength = 0;
-        } else {
-            UDFPackMapping(Vcb, ExtInfo);
-        }
-        AdPrint(("Alloc->Rec (1) new %x\n", ExtInfo->Mapping));
-#ifdef UDF_DBG
-        ASSERT(check_size == UDFGetExtentLength(ExtInfo->Mapping));
-#endif
-        AdPrint(("Alloc->Rec: ExtInfo %x, Extent %x\n", ExtInfo, ExtInfo->Mapping));
+        UDFPackMapping(Vcb, ExtInfo);
         return STATUS_SUCCESS;
     }
-    if (Extent[i].extLocation < lba) {
-        if (  (((Extent[i].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh) - (lba - Extent[i].extLocation))
-             > sLen ) {
-            // xxxxxx ->  xxRRxx
-            NewExtent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , UDFGetMappingLength(Extent) + sizeof(EXTENT_MAP)*2,
-                                                               MEM_EXTMAP_TAG);
-            if (!NewExtent) return STATUS_INSUFFICIENT_RESOURCES;
-            Extent[i].extLength &= UDF_EXTENT_LENGTH_MASK;
-            RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-            RtlCopyMemory((int8*)&(NewExtent[i+3]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-            NewExtent[i].extLocation = Extent[i].extLocation;
-            NewExtent[i].extLength = (lba - Extent[i].extLocation) << BSh;
-            NewExtent[i+1].extLength = (Length+BS-1) & ~(BS-1);
-            NewExtent[i+1].extLocation = lba;
-            NewExtent[i+2].extLength = Extent[i].extLength - NewExtent[i].extLength - NewExtent[i+1].extLength;
-            NewExtent[i+2].extLocation = lba + ((Length+BS-1) >> BSh);
-            ASSERT(!(NewExtent[i].extLength >> 30));
-            ASSERT(!(NewExtent[i+2].extLength >> 30));
-            NewExtent[i].extLength |= (EXTENT_NOT_RECORDED_ALLOCATED << 30);
-            NewExtent[i+2].extLength |= (EXTENT_NOT_RECORDED_ALLOCATED << 30);
-            TryPack = FALSE;
-            AdPrint(("Alloc->Rec (2) new %x\n", NewExtent));
-        } else {
-            // xxxxxx ->  xxRRRR
-            NewExtent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , UDFGetMappingLength(Extent) + sizeof(EXTENT_MAP),
-                                                               MEM_EXTMAP_TAG);
-            if (!NewExtent) return STATUS_INSUFFICIENT_RESOURCES;
-            Extent[i].extLength &= UDF_EXTENT_LENGTH_MASK;
-            RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-            RtlCopyMemory((int8*)&(NewExtent[i+2]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-            NewExtent[i].extLocation = Extent[i].extLocation;
-            NewExtent[i].extLength = (lba - Extent[i].extLocation) << BSh;
-            NewExtent[i+1].extLength = Extent[i].extLength - NewExtent[i].extLength;
-            NewExtent[i+1].extLocation = lba;
-            ASSERT(!(NewExtent[i].extLength >> 30));
-            NewExtent[i].extLength |= (EXTENT_NOT_RECORDED_ALLOCATED << 30);
-            AdPrint(("Alloc->Rec (3) new %x\n", NewExtent));
-        }
-    } else {
-        // xxxxxx ->  RRRRxx
-        NewExtent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , UDFGetMappingLength(Extent) + sizeof(EXTENT_MAP),
-                                                           MEM_EXTMAP_TAG);
-        if (!NewExtent) return STATUS_INSUFFICIENT_RESOURCES;
-        Extent[i].extLength &= UDF_EXTENT_LENGTH_MASK;
-        RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-        RtlCopyMemory((int8*)&(NewExtent[i+2]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-        NewExtent[i].extLocation = Extent[i].extLocation;
-        NewExtent[i].extLength = (Length+BS-1) & ~(BS-1);
-        NewExtent[i+1].extLength = Extent[i].extLength - NewExtent[i].extLength;
-        NewExtent[i+1].extLocation = Extent[i].extLocation + (NewExtent[i].extLength >> BSh);
-        ASSERT(!(NewExtent[i+1].extLength >> 30));
-        NewExtent[i+1].extLength |= (EXTENT_NOT_RECORDED_ALLOCATED << 30);
-        AdPrint(("Alloc->Rec (4) new %x\n", NewExtent));
+    Status = UDFGetMappingByteCount(OldMap, &OldBytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    AllocationBytes = (uint64)OldBytes +
+        ((Prefix ? 1 : 0) + (Suffix ? 1 : 0)) * sizeof(EXTENT_MAP);
+    if (AllocationBytes > MAXULONG - MY_HEAP_ALIGN)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    NewMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                         (uint32)AllocationBytes, MEM_EXTMAP_TAG);
+    if (!NewMap)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlCopyMemory(NewMap, OldMap, Index * sizeof(EXTENT_MAP));
+    j = Index;
+    if (Prefix) {
+        NewMap[j].extLocation = OldMap[Index].extLocation;
+        NewMap[j++].extLength = Prefix | (EXTENT_NOT_RECORDED_ALLOCATED << 30);
     }
-
-    //ASSERT(check_size == UDFGetExtentLength(Extent));
-    //ASSERT(!(check_size & (LBS-1)));
-
-    AdPrint(("Free Extent %x (new %x)\n", Extent, NewExtent));
-    MyFreePool__(Extent);
+    NewMap[j].extLocation = Lba;
+    NewMap[j++].extLength = Rounded;
+    if (Suffix) {
+        NewMap[j].extLocation = Lba + (Rounded >> Vcb->SectorShift);
+        NewMap[j++].extLength = Suffix | (EXTENT_NOT_RECORDED_ALLOCATED << 30);
+    }
+    RtlCopyMemory(&NewMap[j], &OldMap[Index + 1],
+                  OldBytes - (Index + 1) * sizeof(EXTENT_MAP));
+    ExtInfo->Mapping = NewMap;
     ExtInfo->Modified = TRUE;
-    ExtInfo->Mapping = NewExtent;
-    if (TryPack)
-        UDFPackMapping(Vcb, ExtInfo);
-#ifdef UDF_DBG
-    ASSERT(check_size == UDFGetExtentLength(ExtInfo->Mapping));
-    ASSERT(!(check_size & (LBS-1)));
-#endif
-
-    AdPrint(("Alloc->Rec: ExtInfo %x, Extent %x\n", ExtInfo, ExtInfo->Mapping));
-
+    MyFreePool__(OldMap);
+    UDFPackMapping(Vcb, ExtInfo);
     return STATUS_SUCCESS;
 } // end UDFMarkAllocatedAsRecorded()
 
@@ -1855,136 +1495,149 @@ UDFMarkNotAllocatedAsAllocated(
     IN PEXTENT_INFO ExtInfo   // Extent array
     )
 {
-    uint32 i, len, /*lba,*/ d, l, BOffs, j;
-    PEXTENT_MAP Extent = ExtInfo->Mapping;   // Extent array
-    PEXTENT_MAP NewExtent;
-//    uint32 BS = Vcb->BlockSize;
-    uint32 BSh = Vcb->SectorShift;
-    NTSTATUS status;
-    EXTENT_INFO TmpExtInf;
-    SIZE_T aLen, sLen;
-    SIZE_T LBS = Vcb->SectorSize;
-    // I don't know what else comment can be added here.
-    // Just belive that it works
-    /*lba = */
-#ifndef ALLOW_SPARSE
-    BrutePoint();
-#endif
-    AdPrint(("Not->Alloc  ExtInfo %x, Extent %x\n", ExtInfo, Extent));
-    UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, Offset, NULL, NULL, NULL, &i);
-    if (i == (ULONG)-1) return STATUS_INVALID_PARAMETER;
-    if ((Extent[i].extLength >> 30) != EXTENT_NOT_RECORDED_NOT_ALLOCATED) return STATUS_SUCCESS;
+    uint32 Index, Lba, Type, OldBytes, TailBytes, Prefix, Suffix, j, k;
+    uint32 PartNum = LBA_OUT_OF_EXTENT, Derived;
+    uint64 Blocks, End;
+    SIZE_T Available;
+    uint64 Cover, AllocationBytes;
+    PEXTENT_MAP OldMap, NewMap = NULL;
+    PUDF_ALLOCATION_FAILURE Lease = NULL;
+    BOOLEAN Transferred = FALSE;
+    NTSTATUS LeaseStatus;
+    EXTENT_INFO Tail;
+    NTSTATUS Status;
 
-    uint32 PartNum = UDFGetRefPartNumByPhysLba(Vcb, Extent[0].extLocation);
-    BOffs = (uint32)(Offset >> BSh);
-    // length of existing Not-Alloc-Not-Rec frag
-    sLen = (( (((uint32)Offset) & (LBS-1)) + Length+LBS-1) & ~(LBS-1)) >> BSh;
-    // required allocation length increment (in bytes)
-    aLen = (uint32)( ((Offset+Length+LBS-1) & ~((ULONGLONG)LBS-1)) - (Offset & ~((ULONGLONG)LBS-1)));
-
-    // try to extend previous frag or allocate space _after_ it to
-    // avoid backward seeks, if previous frag is not Not-Rec-Not-Alloc
-    if (i && ((Extent[i-1].extLength >> 30) != EXTENT_NOT_RECORDED_NOT_ALLOCATED) ) {
-        status = UDFAllocFreeExtent(IrpContext, Vcb, aLen,
-                                      Extent[i-1].extLocation + ((Extent[i-1].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh),
-                                      min(UDFPartEnd(Vcb, PartNum), Extent[i-1].extLocation + ((Extent[i-1].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh) + sLen ),
-                                      &TmpExtInf, ExtInfo->Flags /*& EXTENT_FLAG_ALLOC_MASK*/);
-        if (status == STATUS_DISK_FULL)
-            // if there are not enough free blocks after that frag...
-            goto try_alloc_anywhere;
-    } else {
-try_alloc_anywhere:
-        // ... try to alloc required disk space anywhere
-        status = UDFAllocFreeExtent(IrpContext, Vcb, aLen,
-                                      UDFPartStart(Vcb, PartNum),
-                                      UDFPartEnd(Vcb, PartNum),
-                                      &TmpExtInf, ExtInfo->Flags /*& EXTENT_FLAG_ALLOC_MASK*/);
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || Offset < 0 || !Vcb->SectorSize ||
+        !Vcb->Partitions || !Vcb->PartitionMaps || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift))
+        return STATUS_INVALID_PARAMETER;
+    if (!Length)
+        return STATUS_SUCCESS;
+    OldMap = ExtInfo->Mapping;
+    Lba = UDFExtentOffsetToLba(Vcb, OldMap,
+        Offset & ~((int64)Vcb->SectorSize - 1), NULL, &Available, &Type, &Index);
+    Cover = (((uint64)Offset & (Vcb->SectorSize - 1)) + Length + Vcb->SectorSize - 1) &
+             ~((uint64)Vcb->SectorSize - 1);
+    if (Lba == LBA_OUT_OF_EXTENT || Index == MAXULONG || !Cover || Cover > Available)
+        return STATUS_INVALID_PARAMETER;
+    if (Type != EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+        return STATUS_SUCCESS;
+    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY)
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    Status = UDFGetMappingByteCount(OldMap, &OldBytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Prefix = (OldMap[Index].extLength & UDF_EXTENT_LENGTH_MASK) - (uint32)Available;
+    Suffix = (uint32)Available - (uint32)Cover;
+    /* A PSN cannot identify a hole's partition. Infer the domain from a
+     * real run, never from the hole's zero/placeholder address. A wholly
+     * sparse map on a metadata volume needs explicit typed owner input. */
+    for (k = 0; k + 1 < OldBytes / sizeof(EXTENT_MAP); k++) {
+        if ((OldMap[k].extLength >> 30) == EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+            continue;
+        Blocks = ((uint64)(OldMap[k].extLength & UDF_EXTENT_LENGTH_MASK) +
+                   Vcb->SectorSize - 1) >> Vcb->SectorShift;
+        End = (uint64)OldMap[k].extLocation + Blocks;
+        if (!Blocks || End > LBA_OUT_OF_EXTENT)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Derived = UDFGetRefPartNumByPhysLba(Vcb, OldMap[k].extLocation);
+        if (Derived >= Vcb->PartitionMaps ||
+            UDFGetRefPartNumByPhysLba(Vcb, (uint32)(End - 1)) != Derived ||
+            (PartNum != LBA_OUT_OF_EXTENT && PartNum != Derived))
+            return STATUS_NOT_SUPPORTED;
+        PartNum = Derived;
     }
-    // check for successfull allocation
-    if (!NT_SUCCESS(status)) {
-        AdPrint(("Not->Alloc  no free\n"));
-        return status;
-    }
-    // get number of frags in allocated block
-    d = (UDFGetMappingLength(TmpExtInf.Mapping) / sizeof(EXTENT_MAP)) - 1;
-    // calculate number of existing blocks before the frag to be changed
-    l=0;
-    for(j=0; j<i; j++) {
-        l += (uint32)((Extent[j].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh);
-    }
-    // and now just update mapping...
-    if ( (l == BOffs) && (((Extent[j].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh) == sLen) ) {
-        // xxxxxx ->  RRRRRR
-        // (d-1) - since we have to raplace last frag of Extent with 1 or more frags of TmpExtInf.Mapping
-        NewExtent = (PEXTENT_AD)MyAllocatePool__(NonPagedPool, UDFGetMappingLength(Extent) + (d-1)*sizeof(EXTENT_MAP) );
-        if (!NewExtent) {
-            MyFreePool__(TmpExtInf.Mapping);
-            return STATUS_INSUFFICIENT_RESOURCES;
+    if (PartNum == LBA_OUT_OF_EXTENT && !Vcb->MetadataFileInfo) {
+        for (k = 0; k < Vcb->PartitionMaps; k++) {
+            if (Vcb->Partitions[k].PartitionType != UDF_TYPE1_MAP15 &&
+                Vcb->Partitions[k].PartitionType != UDF_SPARABLE_MAP15)
+                continue;
+            if (PartNum != LBA_OUT_OF_EXTENT &&
+                (Vcb->Partitions[k].PartitionRoot != Vcb->Partitions[PartNum].PartitionRoot ||
+                 Vcb->Partitions[k].PartitionLen != Vcb->Partitions[PartNum].PartitionLen ||
+                 Vcb->Partitions[k].PartitionNum != Vcb->Partitions[PartNum].PartitionNum ||
+                 Vcb->Partitions[k].VolumeSeqNum != Vcb->Partitions[PartNum].VolumeSeqNum))
+                return STATUS_NOT_SUPPORTED;
+            PartNum = k;
         }
-        RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-        RtlCopyMemory((int8*)&(NewExtent[i]), (int8*)(TmpExtInf.Mapping), d*sizeof(EXTENT_MAP) );
-        RtlCopyMemory((int8*)&(NewExtent[i+d]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-        AdPrint(("Not->Alloc (1) new %x\n", NewExtent));
-    } else
-    if (l < BOffs) {
-        // .ExtLength, BOffs & l are already aligned...
-        if ( (((Extent[i].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh) - (BOffs-l)) > sLen ) {
-            // xxxxxx ->  xxRRxx
-            NewExtent = (PEXTENT_AD)MyAllocatePool__(NonPagedPool, UDFGetMappingLength(Extent) + (d+1)*sizeof(EXTENT_MAP) );
-            if (!NewExtent) {
-                MyFreePool__(TmpExtInf.Mapping);
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-            RtlCopyMemory((int8*)&(NewExtent[i+1]), (int8*)(TmpExtInf.Mapping), d*sizeof(EXTENT_MAP) );
-            RtlCopyMemory((int8*)&(NewExtent[i+d+2]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-            NewExtent[i].extLocation = 0;
-            NewExtent[i].extLength = (BOffs - l) << BSh;
-            NewExtent[i+d+1].extLength = Extent[i].extLength - NewExtent[i].extLength - aLen;
-            NewExtent[i+d+1].extLocation = 0;
-            NewExtent[i].extLength |= (EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
-            NewExtent[i+d+1].extLength |= (EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
-            AdPrint(("Not->Alloc (2) new %x\n", NewExtent));
-        } else {
-            // xxxxxx ->  xxRRRR
-            NewExtent = (PEXTENT_AD)MyAllocatePool__(NonPagedPool, UDFGetMappingLength(Extent) + d*sizeof(EXTENT_MAP) );
-            if (!NewExtent) {
-                MyFreePool__(TmpExtInf.Mapping);
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-            RtlCopyMemory((int8*)&(NewExtent[i+1]), (int8*)(TmpExtInf.Mapping), d*sizeof(EXTENT_MAP) );
-            RtlCopyMemory((int8*)&(NewExtent[i+d+1]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-            NewExtent[i].extLocation = 0;
-            NewExtent[i].extLength = (BOffs - l) << BSh;
-            NewExtent[i].extLength |= (EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
-            AdPrint(("Not->Alloc (3) new %x\n", NewExtent));
-        }
-    } else {
-        // xxxxxx ->  RRRRxx
-        NewExtent = (PEXTENT_AD)MyAllocatePool__(NonPagedPool, UDFGetMappingLength(Extent) + d*sizeof(EXTENT_MAP) );
-        if (!NewExtent) {
-            MyFreePool__(TmpExtInf.Mapping);
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-        RtlCopyMemory((int8*)&(NewExtent[i]), (int8*)(TmpExtInf.Mapping), d*sizeof(EXTENT_MAP) );
-        RtlCopyMemory((int8*)&(NewExtent[i+d+1]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-        NewExtent[i+d].extLength = (Extent[i].extLength & UDF_EXTENT_LENGTH_MASK) - aLen;
-        NewExtent[i+d].extLocation = 0;
-        NewExtent[i+d].extLength |= (EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
-        AdPrint(("Not->Alloc (4) new %x\n", NewExtent));
     }
-
-    AdPrint(("Free Extent %x, TmpExtInf.Mapping, (new %x)\n", Extent, TmpExtInf.Mapping, NewExtent));
-    MyFreePool__(Extent);
-    MyFreePool__(TmpExtInf.Mapping);
+    if (PartNum == LBA_OUT_OF_EXTENT || Vcb->Vat || Vcb->CDR_Mode)
+        return STATUS_NOT_SUPPORTED;
+    RtlZeroMemory(&Tail, sizeof(Tail));
+    _SEH2_TRY {
+    _SEH2_TRY {
+    Status = UDFAllocExtentLease(IrpContext, Vcb, PartNum, (int64)Cover,
+        UDFPartStart(Vcb, PartNum), UDFPartEnd(Vcb, PartNum), &Tail, ExtInfo->Flags, &Lease);
+    if (!NT_SUCCESS(Status)) goto split_exit;
+    if (!Lease || !Tail.Mapping) {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto split_exit;
+    }
+    Status = UDFGetMappingByteCount(Tail.Mapping, &TailBytes);
+    if (!NT_SUCCESS(Status))
+        goto split_exit;
+    if ((uint64)UDFGetExtentLength(Tail.Mapping) != Cover) {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto split_exit;
+    }
+    AllocationBytes = (uint64)OldBytes + TailBytes - 2 * sizeof(EXTENT_MAP) +
+                     ((Prefix ? 1 : 0) + (Suffix ? 1 : 0)) * sizeof(EXTENT_MAP);
+    if (AllocationBytes > MAXULONG - MY_HEAP_ALIGN) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto split_exit;
+    }
+    NewMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                         (uint32)AllocationBytes, MEM_EXTMAP_TAG);
+    if (!NewMap) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto split_exit;
+    }
+    RtlCopyMemory(NewMap, OldMap, Index * sizeof(EXTENT_MAP));
+    j = Index;
+    if (Prefix) {
+        NewMap[j].extLocation = 0;
+        NewMap[j++].extLength = Prefix | (EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
+    }
+    RtlCopyMemory(&NewMap[j], Tail.Mapping, TailBytes - sizeof(EXTENT_MAP));
+    j += TailBytes / sizeof(EXTENT_MAP) - 1;
+    if (Suffix) {
+        NewMap[j].extLocation = 0;
+        NewMap[j++].extLength = Suffix | (EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
+    }
+    RtlCopyMemory(&NewMap[j], &OldMap[Index + 1],
+                  OldBytes - (Index + 1) * sizeof(EXTENT_MAP));
+    Status = UDFPublishAllocationLease(Vcb, Lease);
+    if (!NT_SUCCESS(Status)) goto split_exit;
+    ExtInfo->Mapping = NewMap;
     ExtInfo->Modified = TRUE;
-    ExtInfo->Mapping = NewExtent;
-
-    AdPrint(("Not->Alloc: ExtInfo %x, Extent %x\n", ExtInfo, ExtInfo->Mapping));
-
-    return STATUS_SUCCESS;
+    NewMap = NULL;
+    Transferred = TRUE;
+    MyFreePool__(OldMap);
+split_exit:
+    NOTHING;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            if (Transferred) Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        }
+        if (Lease) {
+            if (Transferred && !_SEH2_AbnormalTermination())
+                LeaseStatus = UDFCommitAllocationLease(Vcb, &Lease);
+            else
+                LeaseStatus = UDFAbortAllocationLease(Vcb, &Lease, Status);
+            if (NT_SUCCESS(Status) && !NT_SUCCESS(LeaseStatus)) Status = LeaseStatus;
+            if (Lease) {
+                Lease->Uncertain = TRUE;
+                UDFAbortAllocationLease(Vcb, &Lease, Status);
+            }
+        }
+        if (NewMap) MyFreePool__(NewMap);
+    } _SEH2_END;
+    return Status;
 } // end UDFMarkNotAllocatedAsAllocated()
 
 //#if 0
@@ -2002,131 +1655,74 @@ UDFMarkAllocatedAsNotXXX(
     IN BOOLEAN Deallocate
     )
 {
-    uint32 i, len, /*lba, d,*/ l, BOffs, j;
-    PEXTENT_MAP Extent = ExtInfo->Mapping;   // Extent array
-    PEXTENT_MAP NewExtent;
-//    EXTENT_MAP TmpExtent;
-//    uint32 BS = Vcb->BlockSize;
-    uint32 BSh = Vcb->SectorShift;
-//    NTSTATUS status;
-    EXTENT_INFO TmpExtInf;
-    uint32 aLen, sLen;
-    uint32 flags;
-    uint32 target_flags = Deallocate ?
-                             EXTENT_NOT_RECORDED_NOT_ALLOCATED :
-                             EXTENT_NOT_RECORDED_ALLOCATED;
-    SIZE_T LBS = Vcb->SectorSize;
-    EXTENT_MAP DeadMapping[2];
-    // I don't know what else comment can be added here.
-    // Just belive that it works
-    /*lba = */
-#ifndef ALLOW_SPARSE
-    if (Deallocate) {
-        BrutePoint();
-    }
-#endif
+    uint32 Index, Lba, Type, Target, OldBytes, Prefix, Suffix, j;
+    SIZE_T Available;
+    uint64 AllocationBytes;
+    PEXTENT_MAP OldMap, NewMap;
+    NTSTATUS Status;
 
-    AdPrint(("Alloc->Not ExtInfo %x, Extent %x\n", ExtInfo, Extent));
-
-    DeadMapping[0].extLocation =
-        UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, Offset, NULL, NULL, NULL, &i);
-    if (i == (ULONG)-1) {
-        BrutePoint();
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || Offset < 0 || !Vcb->SectorSize ||
+        (Offset & (Vcb->SectorSize - 1)) || (Length & (Vcb->SectorSize - 1)))
         return STATUS_INVALID_PARAMETER;
-    }
-    DeadMapping[0].extLength = Extent[i].extLength;
-    DeadMapping[1].extLocation =
-    DeadMapping[1].extLength = 0;
-    TmpExtInf.Mapping = (PEXTENT_MAP)&DeadMapping;
-    TmpExtInf.Offset = 0;
-    TmpExtInf.Length = Extent[i].extLength & UDF_EXTENT_LENGTH_MASK;
-
-    flags = Extent[i].extLength >> 30;
-    if (flags == target_flags) return STATUS_SUCCESS;
-
-//    uint32 PartNum = UDFGetRefPartNumByPhysLba(Vcb, Extent[0].extLocation);
-    BOffs = (uint32)(Offset >> BSh);
-    // length of existing Alloc-(Not-)Rec frag (in sectors)
-    sLen = (( (((uint32)Offset) & (LBS-1)) + Length+LBS-1) & ~(LBS-1)) >> BSh;
-    // required deallocation length increment (in bytes)
-    aLen = (uint32)( ((Offset+Length+LBS-1) & ~((ULONGLONG)LBS-1)) - (Offset & ~((ULONGLONG)LBS-1)) );
-
-    l=0;
-    for(j=0; j<i; j++) {
-        l += (uint32)((Extent[j].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh);
-    }
-    flags <<= 30;
-    if ( (l == BOffs) && (((Extent[j].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh) == sLen) ) {
-        // xxxxxx ->  RRRRRR
-        Extent[i].extLocation = 0;
-        Extent[i].extLength = (Extent[i].extLength & UDF_EXTENT_LENGTH_MASK) | flags;
-        NewExtent = Extent;
-        Extent = NULL;
-        AdPrint(("Alloc->Not (1) NewExtent = Extent = %x\n", NewExtent));
-    } else
-    if (l < BOffs) {
-        // .ExtLength, BOffs & l are already aligned...
-        if ( (((Extent[i].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh) - (BOffs-l)) > sLen ) {
-            // xxxxxx ->  xxRRxx
-            NewExtent = (PEXTENT_MAP)MyAllocatePool__(NonPagedPool, UDFGetMappingLength(Extent) + 2*sizeof(EXTENT_MAP) );
-            if (!NewExtent) {
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-            RtlCopyMemory((int8*)&(NewExtent[i+3]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-            NewExtent[i].extLength = (BOffs - l) << BSh;
-            NewExtent[i].extLength |= flags;
-            NewExtent[i+1].extLocation = 0;
-            NewExtent[i+1].extLength = aLen | (target_flags << 30);
-            NewExtent[i+2].extLength = (Extent[i].extLength & UDF_EXTENT_LENGTH_MASK) -
-                                       (NewExtent[i].extLength & UDF_EXTENT_LENGTH_MASK) - aLen ;
-            NewExtent[i+2].extLocation = Extent[i].extLocation +
-                                       (NewExtent[i+2].extLength >> BSh);
-            NewExtent[i+2].extLength |= flags;
-            AdPrint(("Alloc->Not (2) new %x\n", NewExtent));
-        } else {
-            // xxxxxx ->  xxRRRR
-            NewExtent = (PEXTENT_MAP)MyAllocatePool__(NonPagedPool, UDFGetMappingLength(Extent) + sizeof(EXTENT_MAP) );
-            if (!NewExtent) {
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-            RtlCopyMemory((int8*)&(NewExtent[i+2]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-            NewExtent[i].extLength = ((BOffs - l) << BSh) | flags;
-            NewExtent[i+1].extLocation = 0;
-            NewExtent[i+1].extLength = aLen | (target_flags << 30);
-            AdPrint(("Alloc->Not (3) new %x\n", NewExtent));
-        }
-    } else {
-        // xxxxxx ->  RRRRxx
-        NewExtent = (PEXTENT_MAP)MyAllocatePool__(NonPagedPool, UDFGetMappingLength(Extent) + sizeof(EXTENT_MAP) );
-        if (!NewExtent) {
+    if (!Length)
+        return STATUS_SUCCESS;
+    OldMap = ExtInfo->Mapping;
+    Lba = UDFExtentOffsetToLba(Vcb, OldMap, Offset, NULL, &Available, &Type, &Index);
+    if (Lba == LBA_OUT_OF_EXTENT || Index == MAXULONG || Length > Available)
+        return STATUS_INVALID_PARAMETER;
+    Target = Deallocate ? EXTENT_NOT_RECORDED_NOT_ALLOCATED : EXTENT_NOT_RECORDED_ALLOCATED;
+    if (Type == Target || Type == EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+        return STATUS_SUCCESS;
+    if (Vcb->Vat || Vcb->CDR_Mode || (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    /* Releasing a live allocation requires the outer FE/barrier transaction.
+     * Do not free bitmap bits before the replacement FE is durable. Metadata
+     * holes need a separate typed retirement protocol, not physical bits. */
+    if (Deallocate) {
+        if (Vcb->TruncateTxnOwner != PsGetCurrentThread() || Vcb->Vat || Vcb->CDR_Mode ||
+            (Vcb->MetadataFileInfo && UDFPhysLbaToMetadata(Vcb, Lba) != LBA_OUT_OF_EXTENT))
+            return STATUS_NOT_SUPPORTED;
+        if (!NT_SUCCESS(Vcb->TruncateTxnError))
+            return Vcb->TruncateTxnError;
+        if (!Vcb->TruncateTxnReleased || Vcb->TruncateTxnCount >= Vcb->TruncateTxnCapacity)
             return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        RtlCopyMemory((int8*)NewExtent, (int8*)Extent, i*sizeof(EXTENT_MAP));
-        RtlCopyMemory((int8*)&(NewExtent[i+2]), (int8*)&(Extent[i+1]), len = UDFGetMappingLength(&(Extent[i+1])) );
-        NewExtent[i+1].extLength = (Extent[i].extLength & UDF_EXTENT_LENGTH_MASK) - aLen;
-        NewExtent[i+1].extLength |= flags;
-        NewExtent[i].extLocation = 0;
-        NewExtent[i].extLength = aLen | (target_flags << 30);
-        AdPrint(("Alloc->Not (4) new %x\n", NewExtent));
     }
-
-    if (Deallocate)
-        UDFMarkSpaceAsXXX(Vcb, (-1), TmpExtInf.Mapping, AS_DISCARDED); // mark as free
-
+    Status = UDFGetMappingByteCount(OldMap, &OldBytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Prefix = (OldMap[Index].extLength & UDF_EXTENT_LENGTH_MASK) - (uint32)Available;
+    Suffix = (uint32)Available - Length;
+    AllocationBytes = (uint64)OldBytes +
+        ((Prefix ? 1 : 0) + (Suffix ? 1 : 0)) * sizeof(EXTENT_MAP);
+    if (AllocationBytes > MAXULONG - MY_HEAP_ALIGN)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    NewMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                         (uint32)AllocationBytes, MEM_EXTMAP_TAG);
+    if (!NewMap)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlCopyMemory(NewMap, OldMap, Index * sizeof(EXTENT_MAP));
+    j = Index;
+    if (Prefix) {
+        NewMap[j].extLocation = OldMap[Index].extLocation;
+        NewMap[j++].extLength = Prefix | (Type << 30);
+    }
+    NewMap[j].extLocation = Deallocate ? 0 : Lba;
+    NewMap[j++].extLength = Length | (Target << 30);
+    if (Suffix) {
+        NewMap[j].extLocation = Lba + (Length >> Vcb->SectorShift);
+        NewMap[j++].extLength = Suffix | (Type << 30);
+    }
+    RtlCopyMemory(&NewMap[j], &OldMap[Index + 1],
+                  OldBytes - (Index + 1) * sizeof(EXTENT_MAP));
+    if (Deallocate) {
+        PEXTENT_MAP Released = &Vcb->TruncateTxnReleased[Vcb->TruncateTxnCount++];
+        Released->extLocation = Lba;
+        Released->extLength = Length;
+    }
+    ExtInfo->Mapping = NewMap;
     ExtInfo->Modified = TRUE;
-    ExtInfo->Mapping = NewExtent;
-
-    AdPrint(("Alloc->Not: ExtInfo %x, Extent %x\n", ExtInfo, ExtInfo->Mapping));
-
-    if (Extent) {
-        AdPrint(("Alloc->Not kill %x\n", Extent));
-        MyFreePool__(Extent);
-    } else {
-        AdPrint(("Alloc->Not keep %x\n", Extent));
-    }
-
+    MyFreePool__(OldMap);
+    UDFPackMapping(Vcb, ExtInfo);
     return STATUS_SUCCESS;
 } // end UDFMarkAllocatedAsNotXXX()
 //#endif //0
@@ -2134,377 +1730,520 @@ UDFMarkAllocatedAsNotXXX(
 /*
     This routine resizes extent & updates associated mapping
  */
-NTSTATUS
-UDFResizeExtent(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 PartNum,
-    IN int64 Length,          // Required Length
-    IN BOOLEAN AlwaysInIcb,   // must be TRUE for AllocDescs
-    OUT PEXTENT_INFO ExtInfo
-    )
+/* Each successful tail remains a typed allocator lease until its copy is
+ * part of the complete replacement. The list is an attempt owner, distinct
+ * from the VCB active-lease linkage and from the live file mapping. */
+typedef struct _UDF_RESIZE_CLAIM {
+    struct _UDF_RESIZE_CLAIM* Next;
+    PUDF_ALLOCATION_FAILURE Lease;
+} UDF_RESIZE_CLAIM, *PUDF_RESIZE_CLAIM;
+
+static NTSTATUS
+UDFGrowExtentPrivate(PIRP_CONTEXT IrpContext, PVCB Vcb, uint32 PartNum,
+                     int64 Length, BOOLEAN AlwaysInIcb, PEXTENT_INFO ExtInfo)
 {
-    uint32 i, flags, lba;
-    SIZE_T lim;
-    int64 l;
-    NTSTATUS status;
-    EXTENT_INFO TmpExtInf;
-    EXTENT_MAP  TmpMapping[2];
-    uint32 s, pe, BSh;
-    SIZE_T req_s;
-    int64 RequestedLength = Length;
-    SIZE_T LBS = Vcb->SectorSize;
-    BSh = Vcb->SectorShift;
-    uint32 MaxGrow = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, LBS);
+    EXTENT_INFO Candidate, Tail;
+    PEXTENT_MAP Previous;
+    PUDF_RESIZE_CLAIM Claims = NULL, Claim, Next;
+    uint32 Bytes, Count, i, LastLength, RoundedLength, MaxGrow;
+    uint64 Target, Capacity, TailBytes, Need;
+    NTSTATUS Status = STATUS_SUCCESS, LeaseStatus;
+    BOOLEAN Transferred = FALSE;
 
-    ASSERT(PartNum < 3);
+    if (!Vcb || !ExtInfo || !Vcb->Partitions || PartNum >= Vcb->PartitionMaps ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) ||
+        Length < 0 || ExtInfo->Length < 0 || Length <= ExtInfo->Length ||
+        (uint64)Length > (uint64)MAXLONGLONG - ExtInfo->Offset)
+        return STATUS_INVALID_PARAMETER;
+    Candidate = *ExtInfo;
+    Candidate.Mapping = NULL;
+    MaxGrow = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, Vcb->SectorSize);
 
-    ExtPrint(("Resize ExtInfo %x, %I64x -> %I64x\n", ExtInfo, ExtInfo->Length, Length));
-
-    if (ExtInfo->Flags & EXTENT_FLAG_CUT_PREALLOCATED) {
-        AdPrint(("  cut preallocated\n"));
-    } else
-    if (ExtInfo->Length == Length) {
-        return STATUS_SUCCESS;
-    }
-
-    UDFCheckSpaceAllocation(Vcb, 0, ExtInfo->Mapping, AS_USED); // check if used
-    if (ExtInfo->Offset) {
-        if (ExtInfo->Offset + Length <= LBS &&
-            (!AlwaysInIcb || UDFGetExtentLength(ExtInfo->Mapping) <= LBS)) {
-            ExtPrint(("Resize IN-ICB\n"));
-            ExtInfo->Length = Length;
-            return STATUS_SUCCESS;
+    _SEH2_TRY {
+    _SEH2_TRY {
+        Bytes = sizeof(EXTENT_MAP);
+        if (ExtInfo->Mapping) {
+            Status = UDFGetMappingByteCount(ExtInfo->Mapping, &Bytes);
+            if (!NT_SUCCESS(Status)) goto growth_exit;
         }
-        if (!AlwaysInIcb)           // simulate unused 1st sector in extent
-            ExtInfo->Offset = LBS; // it'll be truncated later
-        Length += ExtInfo->Offset; // convert to real offset in extent
-    }
-    lba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, Length, NULL, NULL, &flags, &i);
-    /* Both logical lengths exclude the FE-relative Offset. In particular,
-     * shrinking a staged AD chain must release its unreferenced tail rather
-     * than take the growth path after Length was converted to a map offset.
-     * An AD chain returning inside the FE also reaches the truncation below. */
-    if (ExtInfo->Length < RequestedLength) {
-        // increase extent
-        if (NT_SUCCESS(UDFGetCachedAllocation(Vcb, ExtInfo->Mapping[0].extLocation,
-                              &TmpExtInf, NULL, UDF_PREALLOC_CLASS_DIR))) {
-            AdPrint(("Resize found cached(1)\n"));
-            ExtInfo->Mapping = UDFMergeMappings(ExtInfo->Mapping, TmpExtInf.Mapping);
-            MyFreePool__(TmpExtInf.Mapping);
+        Candidate.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, Bytes, MEM_EXTMAP_TAG);
+        if (!Candidate.Mapping) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            goto growth_exit;
         }
-        if ((l = UDFGetExtentLength(ExtInfo->Mapping)) >= Length) {
-            // we have enough space inside extent
-            ExtInfo->Length = Length;
-            AdPrint(("Resize do nothing (1)\n"));
-        } else /*if (lba == LBA_OUT_OF_EXTENT)*/ {
-
-            Length -= ExtInfo->Offset;
-            if (/*Length && l &&*/  (l % MaxGrow) &&
-               (Length-1)/MaxGrow != (l-1)/MaxGrow) {
-                AdPrint(("Crossing MAX_FRAG boundary...\n"));
-                int64 l2 = ((l-1)/MaxGrow + 1)*MaxGrow;
-                status = UDFResizeExtent(IrpContext, Vcb, PartNum, l2, AlwaysInIcb, ExtInfo);
-                if (!NT_SUCCESS(status)) {
-                    UDFPrint(("Sub-call to UDFResizeExtent() failed (%x)\n", status));
-                    return status;
+        if (ExtInfo->Mapping)
+            RtlCopyMemory(Candidate.Mapping, ExtInfo->Mapping, Bytes);
+        else
+            RtlZeroMemory(Candidate.Mapping, Bytes);
+        Count = Bytes / sizeof(EXTENT_MAP) - 1;
+        if (Candidate.Offset) {
+            if (Candidate.Offset > Vcb->SectorSize || !Count ||
+                (Candidate.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) < Vcb->SectorSize ||
+                (!AlwaysInIcb && (Candidate.Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) != Vcb->SectorSize) ||
+                ((Candidate.Mapping[0].extLength >> 30) != EXTENT_RECORDED_ALLOCATED &&
+                 (!AlwaysInIcb || (Candidate.Mapping[0].extLength >> 30) != EXTENT_NOT_RECORDED_ALLOCATED))) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto growth_exit;
+            }
+            if ((uint64)Length + Candidate.Offset > Vcb->SectorSize && !AlwaysInIcb) {
+                /* Data promotion copies the inline payload in its caller.
+                 * The FE sector itself is never an allocation to release. */
+                if (Count != 1) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    goto growth_exit;
                 }
-                l = ExtInfo->Length;
-                ASSERT(l == l2);
+                RtlZeroMemory(Candidate.Mapping, Bytes);
+                Count = 0;
+                Candidate.Offset = 0;
             }
-            while((Length - l) > MaxGrow) {
-                status = UDFResizeExtent(IrpContext, Vcb, PartNum, l+MaxGrow, AlwaysInIcb, ExtInfo);
-                if (!NT_SUCCESS(status)) {
-                    UDFPrint(("Sub-call (2) to UDFResizeExtent() failed (%x)\n", status));
-                    return status;
+        }
+        Target = (uint64)Length + Candidate.Offset;
+        if (Target > (uint64)MAXLONGLONG - (Vcb->SectorSize - 1)) {
+            Status = STATUS_INVALID_PARAMETER;
+            goto growth_exit;
+        }
+        Target = (Target + Vcb->SectorSize - 1) & ~((uint64)Vcb->SectorSize - 1);
+        /* Every nonfinal run begins at a sector boundary. The existing
+         * final partial run already owns its physical final sector; round
+         * that private descriptor without claiming that block a second time. */
+        for (i = 0; i + 1 < Count; i++) {
+            if (Candidate.Mapping[i].extLength & (Vcb->SectorSize - 1)) {
+                Status = STATUS_NOT_SUPPORTED;
+                goto growth_exit;
+            }
+        }
+        if (Count) {
+            LastLength = Candidate.Mapping[Count - 1].extLength & UDF_EXTENT_LENGTH_MASK;
+            RoundedLength = (LastLength + Vcb->SectorSize - 1) & ~(Vcb->SectorSize - 1);
+            if (RoundedLength > MaxGrow) {
+                Status = STATUS_NOT_SUPPORTED;
+                goto growth_exit;
+            }
+            Candidate.Mapping[Count - 1].extLength = RoundedLength |
+                (Candidate.Mapping[Count - 1].extLength & UDF_EXTENT_FLAG_MASK);
+        }
+        Capacity = UDFGetExtentLength(Candidate.Mapping);
+        while (Capacity < Target) {
+            Need = min(Target - Capacity, (uint64)MaxGrow);
+            Claim = (PUDF_RESIZE_CLAIM)MyAllocatePool__(NonPagedPool, sizeof(*Claim));
+            if (!Claim) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                goto growth_exit;
+            }
+            RtlZeroMemory(Claim, sizeof(*Claim));
+            Claim->Next = Claims;
+            Claims = Claim; /* owns any result even if the allocator raises */
+            RtlZeroMemory(&Tail, sizeof(Tail));
+            Status = UDFAllocExtentLease(IrpContext, Vcb, PartNum, (int64)Need,
+                UDFPartStart(Vcb, PartNum), UDFPartEnd(Vcb, PartNum),
+                &Tail, Candidate.Flags, &Claim->Lease);
+            if (!NT_SUCCESS(Status)) goto growth_exit;
+            if (!Claim->Lease || !Tail.Mapping) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto growth_exit;
+            }
+            TailBytes = UDFGetExtentLength(Tail.Mapping);
+            if (TailBytes < Need || TailBytes > (uint64)MAXLONGLONG - Capacity) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto growth_exit;
+            }
+            Status = UDFAppendMapping(&Candidate.Mapping, Tail.Mapping);
+            if (!NT_SUCCESS(Status)) goto growth_exit;
+            Capacity += TailBytes;
+        }
+        Candidate.Length = Length;
+        Candidate.Modified = TRUE;
+        for (Claim = Claims; Claim; Claim = Claim->Next) {
+            Status = UDFPublishAllocationLease(Vcb, Claim->Lease);
+            if (!NT_SUCCESS(Status)) goto growth_exit;
+        }
+        /* No claim or fallible map allocation remains. Publish the complete
+         * RAM shape once. The retained old physical prefix stays allocated. */
+        Previous = ExtInfo->Mapping;
+        *ExtInfo = Candidate;
+        Candidate.Mapping = NULL;
+        Transferred = TRUE;
+        if (Previous) MyFreePool__(Previous);
+
+growth_exit:
+        NOTHING;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination()) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        }
+        for (Claim = Claims; Claim; Claim = Next) {
+            Next = Claim->Next;
+            if (Claim->Lease) {
+                if (Transferred && !_SEH2_AbnormalTermination())
+                    LeaseStatus = UDFCommitAllocationLease(Vcb, &Claim->Lease);
+                else
+                    LeaseStatus = UDFAbortAllocationLease(Vcb, &Claim->Lease, Status);
+                if (NT_SUCCESS(Status) && !NT_SUCCESS(LeaseStatus)) Status = LeaseStatus;
+                if (Claim->Lease) {
+                    Claim->Lease->Uncertain = TRUE;
+                    UDFAbortAllocationLease(Vcb, &Claim->Lease, Status);
                 }
-                l = ExtInfo->Length;
             }
-            Length += ExtInfo->Offset;
-            // at first, try to resize existing frag
-#ifndef UDF_ALLOW_FRAG_AD
-            i = UDFGetMappingLength(ExtInfo->Mapping);
-            if (i > (LBS-sizeof(EXTENDED_FILE_ENTRY))) {
-                // this is very important check since we will not
-                // be able to _record_ too long AllocDesc because of
-                // some DEMO limitations in UDFBuildXXXAllocDescs()
-                AdPrint(("  DISK_FULL\n"));
-                return STATUS_DISK_FULL;
+            MyFreePool__(Claim);
+        }
+        if (Candidate.Mapping) MyFreePool__(Candidate.Mapping);
+    } _SEH2_END;
+    return Status;
+}
+
+/* Build both the kept map and the exact retired allocation list before
+ * changing any live field. No bitmap is freed by this planner. */
+NTSTATUS
+UDFPrepareExtentShrink(PVCB Vcb, uint32 PartNum, int64 Length,
+    BOOLEAN AlwaysInIcb, PEXTENT_INFO ExtInfo, PEXTENT_INFO Replacement,
+    PUDF_EXTENT_RETIREMENT* Deferred)
+{
+    EXTENT_INFO Candidate;
+    PUDF_EXTENT_RETIREMENT Retired = NULL;
+    uint32 Bytes, Count, i, Used = 0, Kind, RunBytes, OldBlocks, KeepBlocks, KeepBytes;
+    uint32 MaxGrow;
+    uint64 Target, Offset = 0, Remaining, AllocBytes;
+    NTSTATUS Status;
+
+    if (!Replacement || !Deferred || Replacement == ExtInfo) return STATUS_INVALID_PARAMETER;
+    Replacement->Mapping = NULL;
+    *Deferred = NULL;
+    if (!Vcb || !ExtInfo || !Vcb->Partitions || PartNum >= Vcb->PartitionMaps ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) ||
+        Length < 0 || ExtInfo->Length < 0 || Length > ExtInfo->Length)
+        return STATUS_INVALID_PARAMETER;
+    if (Vcb->Partitions[PartNum].PartitionType != UDF_TYPE1_MAP15 &&
+        Vcb->Partitions[PartNum].PartitionType != UDF_SPARABLE_MAP15 &&
+        Vcb->Partitions[PartNum].PartitionType != UDF_METADATA_MAP25)
+        return STATUS_NOT_SUPPORTED;
+    Candidate = *ExtInfo;
+    Candidate.Mapping = NULL;
+    MaxGrow = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, Vcb->SectorSize);
+    Status = UDFGetMappingByteCount(ExtInfo->Mapping, &Bytes);
+    if (!NT_SUCCESS(Status)) return Status;
+    Count = Bytes / sizeof(EXTENT_MAP) - 1;
+    if (!Count || (uint64)Length > (uint64)MAXLONGLONG - Candidate.Offset)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Candidate.Offset && !AlwaysInIcb) {
+        /* An inline data FE never has a separately releasable data tail. */
+        if (Count != 1 || Candidate.Offset > Vcb->SectorSize ||
+            (ExtInfo->Mapping[0].extLength & UDF_EXTENT_LENGTH_MASK) != Vcb->SectorSize ||
+            (uint64)Length + Candidate.Offset > Vcb->SectorSize)
+            return STATUS_FILE_CORRUPT_ERROR;
+    }
+    Candidate.Mapping = NULL;
+    Target = (uint64)Length + Candidate.Offset;
+    if (Target > (uint64)MAXLONGLONG - (Vcb->SectorSize - 1))
+        return STATUS_INVALID_PARAMETER;
+    Target = (Target + Vcb->SectorSize - 1) & ~((uint64)Vcb->SectorSize - 1);
+    AllocBytes = (uint64)FIELD_OFFSET(UDF_EXTENT_RETIREMENT, Ranges) + Bytes;
+    if (AllocBytes > MAXULONG - MY_HEAP_ALIGN)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    _SEH2_TRY {
+        Candidate.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                                      max(Bytes, 2 * sizeof(EXTENT_MAP)), MEM_EXTMAP_TAG);
+        Retired = (PUDF_EXTENT_RETIREMENT)MyAllocatePool__(NonPagedPool, AllocBytes);
+        if (!Candidate.Mapping || !Retired) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            goto shrink_exit;
+        }
+        RtlZeroMemory(Candidate.Mapping, max(Bytes, 2 * sizeof(EXTENT_MAP)));
+        RtlZeroMemory(Retired, AllocBytes);
+        Retired->Capacity = Count;
+        Retired->PartRef = PartNum;
+        Retired->PartitionRoot = Vcb->Partitions[PartNum].PartitionRoot;
+        Retired->PartitionLength = Vcb->Partitions[PartNum].PartitionLen;
+        Retired->Metadata = Vcb->Partitions[PartNum].PartitionType == UDF_METADATA_MAP25;
+        for (i = 0; i < Count; i++) {
+            RunBytes = ExtInfo->Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK;
+            Kind = ExtInfo->Mapping[i].extLength >> 30;
+            if ((i + 1 < Count && (RunBytes & (Vcb->SectorSize - 1))) ||
+                RunBytes > MaxGrow) {
+                Status = STATUS_NOT_SUPPORTED;
+                goto shrink_exit;
             }
-            i /= sizeof(EXTENT_MAP);
-#else //UDF_ALLOW_FRAG_AD
-            i = UDFGetMappingLength(ExtInfo->Mapping) / sizeof(EXTENT_MAP);
-#endif //UDF_ALLOW_FRAG_AD
-#ifdef ALLOW_SPARSE
-            if (!AlwaysInIcb && !(ExtInfo->Offset) &&
-               (Length - l >= (Vcb->SparseThreshold << BSh))) {
-                // last frag will be Not-Alloc-Not-Rec...
-                AdPrint(("Resize sparse (2)\n"));
-                RtlZeroMemory(&TmpExtInf, sizeof(EXTENT_INFO));
-                TmpExtInf.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , sizeof(EXTENT_MAP)*2,
-                                                                   MEM_EXTMAP_TAG);
-                if (!TmpExtInf.Mapping) return STATUS_INSUFFICIENT_RESOURCES;
-                TmpExtInf.Mapping[0].extLength = (((uint32)(Length - l) + LBS-1) & ~(LBS-1)) | (EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
-                TmpExtInf.Mapping[0].extLocation =// 0;
-                TmpExtInf.Mapping[1].extLength =
-                TmpExtInf.Mapping[1].extLocation = 0;
-                l = Length;
-                ExtInfo->Mapping = UDFMergeMappings(ExtInfo->Mapping, TmpExtInf.Mapping);
-                MyFreePool__(TmpExtInf.Mapping);
-            } else
-#endif //ALLOW_SPARSE
-            // allocate some sectors
-            if (i>1 && !(ExtInfo->Offset)) {
-                i-=2;
-                // check if Not-Alloc-Not-Rec at the end of mapping
-                if ((uint32)Length - (uint32)l + (ExtInfo->Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK) > MaxGrow) {
-                    // do nothing, but jump directly to allocator
-                } else
-                if ((ExtInfo->Mapping[i].extLength >> 30) == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
-                    AdPrint(("Resize grow sparse (3)\n"));
-                    ExtInfo->Mapping[i].extLength +=
-                        (((uint32)Length-(uint32)l+LBS-1) & ~(LBS-1)) ;
-                    l = Length;
-                // check if Alloc-Not-Rec at the end of mapping
-                } else if ((ExtInfo->Mapping[i].extLength >> 30) == EXTENT_NOT_RECORDED_ALLOCATED) {
-                    AdPrint(("Resize grow Not-Rec (3)\n"));
-                    // current length of last frag
-                    s = ((ExtInfo->Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh);
-                    // prefered location of the next frag
-                    lba = ExtInfo->Mapping[i].extLocation + s;
-                    pe=UDFPartEnd(Vcb,PartNum);
-                    // maximum frag length
-                    lim = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, LBS) >> BSh;
-                    // required last extent length
-                    req_s = s + (uint32)( (((Length + LBS - 1) & ~((ULONGLONG)LBS-1)) -
-                                           ((l      + LBS - 1) & ~((ULONGLONG)LBS-1))   ) >> BSh);
-                    if (lim > req_s) {
-                        lim = req_s;
-                    }
-                    UDFAcquireResourceExclusive(&(Vcb->BitMapResource1),TRUE);
-/*                    if ((ExtInfo->Flags & EXTENT_FLAG_SEQUENTIAL) &&
-                       ((Length & ~(PS-1)) > (l & ~(PS-1))) &&
-                       TRUE) {
-                        status = UDFResizeExtent(Vcb, PartNum, l+MaxGrow, AlwaysInIcb, ExtInfo);
-                    }*/
-                    // how many sectors we should add
-                    req_s = lim - s;
-                    ASSERT(req_s);
-                    // Convert PSN to LBN for bitmap access
-                    {uint32 _lbn = lba - Vcb->Partitions[0].PartitionRoot;
-                    uint32 _pe_lbn = pe - Vcb->Partitions[0].PartitionRoot;
-                    BOOLEAN _free;
-                    if (Vcb->BitmapFcb) {
-                        _free = (lba < pe) && UDFIsBitmapBitFree(Vcb, _lbn);
-                        if (_free) s += UDFGetCachedBitmapLen(Vcb, _lbn, min(_pe_lbn, _lbn+req_s));
-                    } else {
-                        _free = (lba < pe) && UDFGetFreeBit(Vcb->FSBM_Bitmap, _lbn);
-                        if (_free) s += UDFGetBitmapLen((uint32*)(Vcb->FSBM_Bitmap), _lbn, min(_pe_lbn, _lbn+req_s));
-                    }}
-                    if (s==lim) {
-                        // we can just increase the last frag
-                        AdPrint(("Resize grow last Not-Rec (4)\n"));
-                        ExtInfo->Mapping[i].extLength = (lim << BSh) | (EXTENT_NOT_RECORDED_ALLOCATED << 30);
-                        l = Length;
-                        UDFMarkSpaceAsXXXNoProtect(Vcb, 0, &(ExtInfo->Mapping[i]), AS_USED); // mark as used
-                    } else {
-                        /* The old FE can still point at this allocated,
-                         * unrecorded extent.  Do not make its blocks
-                         * reusable before the replacement FE is durable.
-                         * Append the missing space below instead. */
-                        AdPrint(("Resize keep last Not-Rec (5)\n"));
-                    }
-                    UDFCheckSpaceAllocation(Vcb, 0, ExtInfo->Mapping, AS_USED); // check if used
-                    UDFReleaseResource(&(Vcb->BitMapResource1));
-                // check if Alloc-Rec
-                } else {
-                    // current length of last frag
-                    s = ((ExtInfo->Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK) >> BSh);
-                    // prefered location of the next frag
-                    lba = ExtInfo->Mapping[i].extLocation + s;
-                    pe=UDFPartEnd(Vcb,PartNum);
-                    // maximum frag length
-                    lim = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, LBS) >> BSh;
-                    // required last extent length
-                    req_s = s + (uint32)( (((Length + LBS - 1) & ~((ULONGLONG)LBS-1)) -
-                                           ((l      + LBS - 1) & ~((ULONGLONG)LBS-1))   ) >> BSh);
-                    if (lim > req_s) {
-                        lim = req_s;
-                    }
-//                    s=0;
-                    // how many sectors we should add
-                    req_s = lim - s;
-                    if (req_s) {
-                        uint32 d=0;
+            OldBlocks = (RunBytes + Vcb->SectorSize - 1) >> Vcb->SectorShift;
+            Remaining = Target > Offset ? min((uint64)RunBytes, Target - Offset) : 0;
+            KeepBlocks = (uint32)((Remaining + Vcb->SectorSize - 1) >> Vcb->SectorShift);
+            KeepBytes = KeepBlocks << Vcb->SectorShift;
+            if (KeepBlocks) {
+                Candidate.Mapping[Used] = ExtInfo->Mapping[i];
+                Candidate.Mapping[Used++].extLength = KeepBytes | (Kind << 30);
+            }
+            if (KeepBlocks < OldBlocks && Kind != EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
+                if ((uint64)ExtInfo->Mapping[i].extLocation + OldBlocks > LBA_OUT_OF_EXTENT) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    goto shrink_exit;
+                }
+                Retired->Ranges[Retired->Count].extLocation =
+                    ExtInfo->Mapping[i].extLocation + KeepBlocks;
+                Retired->Ranges[Retired->Count++].extLength =
+                    ((OldBlocks - KeepBlocks) << Vcb->SectorShift) | (Kind << 30);
+            }
+            Offset += RunBytes;
+        }
+        if (Offset > (uint64)MAXLONGLONG - (Vcb->SectorSize - 1) ||
+            Target > ((Offset + Vcb->SectorSize - 1) & ~((uint64)Vcb->SectorSize - 1))) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto shrink_exit;
+        }
+        if (!Used) {
+            Candidate.Mapping[0].extLength = Vcb->SectorSize |
+                ((uint32)EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
+        }
+        Candidate.Length = Length;
+        Candidate.Modified = TRUE;
+        *Replacement = Candidate;
+        Candidate.Mapping = NULL;
+        if (Retired->Count) {
+            *Deferred = Retired;
+            Retired = NULL;
+        }
+        Status = STATUS_SUCCESS;
+shrink_exit:
+        NOTHING;
+    } _SEH2_FINALLY {
+        if (Candidate.Mapping) MyFreePool__(Candidate.Mapping);
+        if (Retired) MyFreePool__(Retired);
+    } _SEH2_END;
+    return Status;
+}
 
-                        UDFAcquireResourceExclusive(&(Vcb->BitMapResource1),TRUE);
-                        //ASSERT(req_s);
-                        // Convert PSN to LBN for bitmap access
-                        {uint32 _lbn = lba - Vcb->Partitions[0].PartitionRoot;
-                        uint32 _pe_lbn = pe - Vcb->Partitions[0].PartitionRoot;
-                        BOOLEAN _free;
-                        if (Vcb->BitmapFcb) {
-                            _free = (lba < pe) && UDFIsBitmapBitFree(Vcb, _lbn);
-                            if (_free) s += (d = (ULONG)UDFGetCachedBitmapLen(Vcb, _lbn, min(_pe_lbn, _lbn+req_s)));
-                        } else {
-                            _free = (lba < pe) && UDFGetFreeBit(Vcb->FSBM_Bitmap, _lbn);
-                            if (_free) s += (d = (ULONG)UDFGetBitmapLen((uint32*)(Vcb->FSBM_Bitmap), _lbn, min(_pe_lbn, _lbn+req_s)));
-                        }}
+static NTSTATUS
+UDFShrinkExtentPrivate(PVCB Vcb, PUDF_FILE_INFO FileInfo, uint32 PartNum,
+                       int64 Length, BOOLEAN AlwaysInIcb, PEXTENT_INFO ExtInfo)
+{
+    EXTENT_INFO Candidate;
+    PUDF_EXTENT_RETIREMENT Retired = NULL;
+    PEXTENT_MAP Previous;
+    NTSTATUS Status;
+    BOOLEAN Published = FALSE;
+    RtlZeroMemory(&Candidate, sizeof(Candidate));
+    Status = UDFPrepareExtentShrink(Vcb, PartNum, Length, AlwaysInIcb,
+                                     ExtInfo, &Candidate, &Retired);
+    if (!NT_SUCCESS(Status)) return Status;
+    UDFAcquireResourceExclusive(&Vcb->BitMapResource1, TRUE);
+    _SEH2_TRY {
+        if (Retired) {
+            if (Vcb->PendingExtentRetirements == MAXLONG) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                _SEH2_LEAVE;
+            }
+            Retired->Next = FileInfo->Dloc->RetiredExtents;
+            FileInfo->Dloc->RetiredExtents = Retired;
+            InterlockedIncrement(&Vcb->PendingExtentRetirements);
+            Retired = NULL;
+        }
+        Previous = ExtInfo->Mapping;
+        *ExtInfo = Candidate;
+        Candidate.Mapping = NULL;
+        FileInfo->Dloc->FE_Flags |= UDF_FE_FLAG_FE_MODIFIED;
+        Published = TRUE;
+        if (Previous) MyFreePool__(Previous);
+    } _SEH2_FINALLY {
+        if (Candidate.Mapping) MyFreePool__(Candidate.Mapping);
+        if (Retired) MyFreePool__(Retired);
+        if (_SEH2_AbnormalTermination() && Published)
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        UDFReleaseResource(&Vcb->BitMapResource1);
+    } _SEH2_END;
+    return Status;
+}
 
-                        if (s==lim) {
-                            AdPrint(("Resize grow last Rec (6)\n"));
-                            // we can just increase last frag
-                            TmpMapping[0].extLength = req_s << BSh;
-                            TmpMapping[0].extLocation = lba;
-                            TmpMapping[1].extLength =
-                            TmpMapping[1].extLocation = 0;
-                            UDFMarkSpaceAsXXXNoProtect(Vcb, 0, &TmpMapping[0], AS_USED); // mark as used
-                            l += (s << BSh) - (ExtInfo->Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK);
-                            ExtInfo->Mapping[i].extLength = (ExtInfo->Mapping[i].extLength & UDF_EXTENT_FLAG_MASK) | (s << BSh);
-                        } else if (d) {
-                            AdPrint(("Resize part-grow last Rec (6)\n"));
-                            // increase last frag, then alloc rest
-                            TmpMapping[0].extLength = d << BSh;
-                            TmpMapping[0].extLocation = lba;
-                            TmpMapping[1].extLength =
-                            TmpMapping[1].extLocation = 0;
-                            UDFMarkSpaceAsXXXNoProtect(Vcb, 0, &TmpMapping[0], AS_USED); // mark as used
-                            l += (s << BSh) - (ExtInfo->Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK);
-                            ExtInfo->Mapping[i].extLength = (ExtInfo->Mapping[i].extLength & UDF_EXTENT_FLAG_MASK) | (s << BSh);
-                        } else {
-                            AdPrint(("Can't grow last Rec (6)\n"));
+static BOOLEAN
+UDFRetirementOverlapsMap(PVCB Vcb, PEXTENT_MAP Map, uint32 Lba, uint32 Blocks)
+{
+    uint32 Bytes, Count, i;
+    uint64 End = (uint64)Lba + Blocks, MapEnd;
+    if (!Map) return FALSE;
+    if (!NT_SUCCESS(UDFGetMappingByteCount(Map, &Bytes))) return TRUE;
+    Count = Bytes / sizeof(EXTENT_MAP) - 1;
+    for (i = 0; i < Count; i++) {
+        if ((Map[i].extLength >> 30) == EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+            continue;
+        MapEnd = (uint64)Map[i].extLocation +
+            (((uint64)(Map[i].extLength & UDF_EXTENT_LENGTH_MASK) +
+              Vcb->SectorSize - 1) >> Vcb->SectorShift);
+        if ((uint64)Lba < MapEnd && (uint64)Map[i].extLocation < End)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+NTSTATUS
+UDFCommitExtentRetirements(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    PUDF_EXTENT_RETIREMENT Retired;
+    PUDF_METADATA_VIEW View = NULL;
+    PUDFPartMap Part;
+    EXTENT_MAP One[2];
+    uint32 i, j, Length, Blocks, Lba, Lbn;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    UNREFERENCED_PARAMETER(IrpContext);
+    if (!Dloc->RetiredExtents) return STATUS_SUCCESS;
+    if (Dloc->DataLoc.Modified || Dloc->AllocLoc.Modified || Dloc->FELoc.Modified ||
+        (Dloc->FE_Flags & UDF_FE_FLAG_FE_MODIFIED))
+        return STATUS_DEVICE_BUSY; /* this API never substitutes for writing FE */
+    UDFAcquireResourceExclusive(&Vcb->BitMapResource1, TRUE);
+    _SEH2_TRY {
+    _SEH2_TRY {
+        View = UDFAcquireMetadataView(Vcb);
+        Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+        if (!NT_SUCCESS(Status)) goto retirement_exit;
+        while ((Retired = Dloc->RetiredExtents) != NULL) {
+            if (!Retired->Count || Retired->Count > Retired->Capacity ||
+                Retired->Completed > Retired->Count ||
+                Retired->PartRef >= Vcb->PartitionMaps ||
+                Vcb->PendingExtentRetirements <= 0) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto retirement_exit;
+            }
+            if (Retired->Uncertain) {
+                Status = NT_SUCCESS(Retired->Error) ? STATUS_FILE_CORRUPT_ERROR : Retired->Error;
+                goto retirement_exit; /* no duplicate accounting after partial mutation */
+            }
+            Part = &Vcb->Partitions[Retired->PartRef];
+            if (Part->PartitionRoot != Retired->PartitionRoot ||
+                (Retired->Metadata ? Part->PartitionLen < Retired->PartitionLength :
+                                     Part->PartitionLen != Retired->PartitionLength) ||
+                (Retired->Metadata ? Part->PartitionType != UDF_METADATA_MAP25 :
+                 (Part->PartitionType != UDF_TYPE1_MAP15 && Part->PartitionType != UDF_SPARABLE_MAP15))) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto retirement_exit;
+            }
+            for (i = Retired->Completed; i < Retired->Count; i++) {
+                One[0] = Retired->Ranges[i];
+                One[1].extLength = One[1].extLocation = 0;
+                Lba = One[0].extLocation;
+                Length = One[0].extLength & UDF_EXTENT_LENGTH_MASK;
+                Blocks = Length >> Vcb->SectorShift;
+                if (!Blocks || (Length & (Vcb->SectorSize - 1)) ||
+                    (One[0].extLength >> 30) > EXTENT_NOT_RECORDED_ALLOCATED ||
+                    (uint64)Lba + Blocks > LBA_OUT_OF_EXTENT ||
+                    UDFRetirementOverlapsMap(Vcb, Dloc->DataLoc.Mapping, Lba, Blocks) ||
+                    UDFRetirementOverlapsMap(Vcb, Dloc->AllocLoc.Mapping, Lba, Blocks) ||
+                    UDFRetirementOverlapsMap(Vcb, Dloc->FELoc.Mapping, Lba, Blocks)) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    goto retirement_exit;
+                }
+                if (Retired->Metadata) {
+                    Lbn = UDFMetadataViewPhysToLba(View, Lba);
+                    if (Retired->PartRef != Vcb->MetadataRef || !View ||
+                        !Vcb->MetadataBitmap || !Vcb->MetadataPendingAlloc ||
+                        Lbn >= Vcb->MetadataBitCount || Blocks > Vcb->MetadataBitCount - Lbn ||
+                        ((uint64)Vcb->MetadataBitCount + 7) / 8 > Vcb->MetadataBitmapByteCount ||
+                        Vcb->MetadataFreeCount > Vcb->MetadataBitCount - Blocks) {
+                        Status = STATUS_FILE_CORRUPT_ERROR;
+                        goto retirement_exit;
+                    }
+                    for (j = 0; j < Blocks; j++) {
+                        if ((Vcb->MetadataBitmap[(Lbn + j) >> 3] & (1 << ((Lbn + j) & 7))) ||
+                            UDFMetadataViewLbaToPhys(View, Lbn + j, FALSE, NULL) != Lba + j) {
+                            Status = STATUS_FILE_CORRUPT_ERROR;
+                            goto retirement_exit;
                         }
-                        UDFReleaseResource(&(Vcb->BitMapResource1));
-                    } else {
-                        AdPrint(("Max frag length reached (6)\n"));
                     }
-                }
-            }
-            if (l < Length) {
-                // we get here if simple increasing of the last frag failed
-                AdPrint(("Resize add new frag (7)\n"));
-                if (l < LBS && Length >= LBS &&
-                   (ExtInfo->Flags & EXTENT_FLAG_ALLOC_MASK) == EXTENT_FLAG_ALLOC_SEQUENTIAL) {
-                    AdPrint(("Resize tune for SEQUENTIAL i/o\n"));
-                }
-                status = UDFAllocFreeExtent(IrpContext, Vcb, Length - l,
-                                                   UDFPartStart(Vcb, PartNum),
-                                                   UDFPartEnd(Vcb, PartNum),
-                                                   &TmpExtInf,
-                                                   ExtInfo->Flags /*& EXTENT_FLAG_ALLOC_MASK*/);
-                if (!NT_SUCCESS(status)) {
-                    UDFPrint(("UDFResizeExtent: UDFAllocFreeExtent() failed (%x)\n", status));
-                    return status;
-                }
-                ExtInfo->Mapping = UDFMergeMappings(ExtInfo->Mapping, TmpExtInf.Mapping);
-                MyFreePool__(TmpExtInf.Mapping);
-            }
-            UDFPackMapping(Vcb, ExtInfo);
-        }
-    } else
-    if (Length) {
-        // decrease extent
-        AdPrint(("Resize cut (8)\n"));
-        lba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, Length-1, NULL, &lim, &flags, &i);
-        i++;
-        ASSERT(lba != LBA_OUT_OF_EXTENT);
-        ASSERT(lba != LBA_NOT_ALLOCATED);
-        ASSERT(i);
-        if (ExtInfo->Mapping[i].extLength) {
-            UDFCheckSpaceAllocation(Vcb, 0, &(ExtInfo->Mapping[i]), AS_USED); // check if used
-            if (!ExtInfo->Offset && (ExtInfo->Flags & EXTENT_FLAG_PREALLOCATED)) {
-
-                AdPrint(("Resize try save cutted (8)\n"));
-                RtlZeroMemory(&TmpExtInf, sizeof(EXTENT_INFO));
-                s = UDFGetMappingLength(&(ExtInfo->Mapping[i]));
-
-                TmpExtInf.Mapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , s, MEM_EXTMAP_TAG);
-                if (TmpExtInf.Mapping) {
-                    RtlCopyMemory(TmpExtInf.Mapping, &(ExtInfo->Mapping[i]), s);
-                    AdPrint(("Resize save cutted (8)\n"));
-                    if (NT_SUCCESS(UDFStoreCachedAllocation(Vcb, ExtInfo->Mapping[0].extLocation,
-                                               &TmpExtInf, 0, UDF_PREALLOC_CLASS_DIR))) {
-                        ExtInfo->Mapping[i].extLength = 0;
-                        ExtInfo->Mapping[i].extLocation = 0;
-                        goto tail_cached;
+                    Retired->Uncertain = TRUE;
+                    for (j = 0; j < Blocks; j++) {
+                        Vcb->MetadataBitmap[(Lbn + j) >> 3] |= (uint8)(1 << ((Lbn + j) & 7));
+                        Vcb->MetadataPendingAlloc[(Lbn + j) >> 3] &= ~(1 << ((Lbn + j) & 7));
                     }
+                    Vcb->MetadataFreeCount += Blocks;
+                    Vcb->MetadataHint = min(Vcb->MetadataHint, Lbn);
+                    Vcb->MetadataBitmapModified = TRUE;
+                    UDFSetModified(Vcb);
+                } else {
+                    if (!Vcb->PartitionMaps ||
+                        Part->PartitionRoot != Vcb->Partitions[0].PartitionRoot ||
+                        Part->PartitionLen > Vcb->FSBM_BitCount ||
+                        Lba < Part->PartitionRoot || Lba - Part->PartitionRoot >= Part->PartitionLen ||
+                        Blocks > Part->PartitionLen - (Lba - Part->PartitionRoot) ||
+                        (Vcb->MetadataFileInfo && !View)) {
+                        Status = STATUS_FILE_CORRUPT_ERROR;
+                        goto retirement_exit;
+                    }
+                    /* No physical free may cross either metadata payload. */
+                    if (View) {
+                        const EXTENT_MAP* Map;
+                        uint32 Copy, Count;
+                        for (Copy = 0; Copy < 2; Copy++) {
+                            Map = Copy ? View->MirrorMap : View->MainMap;
+                            Count = Copy ? View->MirrorCount : View->MainCount;
+                            for (j = 0; j < Count; j++) {
+                                uint64 End = (uint64)Map[j].extLocation +
+                                    ((Map[j].extLength & UDF_EXTENT_LENGTH_MASK) >> View->SectorShift);
+                                if ((uint64)Lba < End &&
+                                    (uint64)Map[j].extLocation < (uint64)Lba + Blocks) {
+                                    Status = STATUS_FILE_CORRUPT_ERROR;
+                                    goto retirement_exit;
+                                }
+                            }
+                        }
+                    }
+                    Retired->Uncertain = TRUE;
+                    /* The replacement FE is already durable. Bypass any
+                     * unrelated ambient truncate ledger using a stack copy. */
+                    UDFMarkSpaceAsXXXNoProtect(Vcb, 0, One,
+                        AS_DISCARDED | AS_PHYSICAL | AS_PRIVATE_ROLLBACK);
                 }
+                Retired->Uncertain = FALSE;
+                Retired->Error = STATUS_SUCCESS;
+                Retired->Completed++;
             }
-            UDFMarkSpaceAsXXX(Vcb, 0, &(ExtInfo->Mapping[i]), AS_DISCARDED); // mark as free
-tail_cached:;
+            Dloc->RetiredExtents = Retired->Next;
+            InterlockedDecrement(&Vcb->PendingExtentRetirements);
+            MyFreePool__(Retired);
         }
-        if ((lim-1 >= LBS) &&
-           (flags != EXTENT_NOT_RECORDED_NOT_ALLOCATED)) {
-            AdPrint(("i=%x, lba=%x, len=%x\n",i,lba,lim));
-            ASSERT(lim);
-//            BrutePoint();
-            EXTENT_MAP ClrMap[2];
+retirement_exit:
+        NOTHING;
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+        if (Dloc->RetiredExtents && Dloc->RetiredExtents->Uncertain)
+            Dloc->RetiredExtents->Error = Status;
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (_SEH2_AbnormalTermination() || !NT_SUCCESS(Status))
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        UDFReleaseMetadataView(View);
+        UDFUnpinBitmapPage(Vcb);
+        UDFReleaseResource(&Vcb->BitMapResource1);
+    } _SEH2_END;
+    return Status;
+}
 
-            ClrMap[0].extLength = ALIGN_DOWN_BY(lim - 1, LBS);
-            s = (ExtInfo->Mapping[i-1].extLength - ClrMap[0].extLength) & UDF_EXTENT_LENGTH_MASK;
-            ClrMap[0].extLocation = ExtInfo->Mapping[i-1].extLocation +
-                                   (s >> BSh);
-            ClrMap[1].extLength =
-            ClrMap[1].extLocation = 0;
-            ASSERT((ExtInfo->Mapping[i].extLocation <   ClrMap[0].extLocation) ||
-                   (ExtInfo->Mapping[i].extLocation >= (ClrMap[0].extLocation + (ClrMap[0].extLength >> BSh))));
-            UDFCheckSpaceAllocation(Vcb, 0, (PEXTENT_MAP)(&ClrMap), AS_USED); // check if used
-            UDFMarkSpaceAsXXX(Vcb, 0, (PEXTENT_MAP)(&ClrMap), AS_DISCARDED); // mark as free
-            ExtInfo->Mapping[i-1].extLength = s | (flags << 30);
-        }
-
-        s = UDFGetMappingLength(ExtInfo->Mapping);
-        if (!MyReallocPool__((int8*)(ExtInfo->Mapping), s, (int8**)&(ExtInfo->Mapping), (i+1)*sizeof(EXTENT_MAP))) {
-            // This must never happen on truncate !!!
-            AdPrint(("ResizeExtent: MyReallocPool__(8) failed\n"));
-        }
-        ExtInfo->Mapping[i].extLength =
-        ExtInfo->Mapping[i].extLocation = 0;
-    } else {
-        AdPrint(("Resize zero (9)\n"));
-        ASSERT(!ExtInfo->Offset);
-        UDFMarkSpaceAsXXX(Vcb, 0, ExtInfo->Mapping, AS_DISCARDED); // mark as free
-        s = UDFGetMappingLength(ExtInfo->Mapping);
-        if (!MyReallocPool__((int8*)(ExtInfo->Mapping), s, (int8**)&(ExtInfo->Mapping), 2*sizeof(EXTENT_MAP))) {
-            // This must never happen on truncate !!!
-            AdPrint(("ResizeExtent: MyReallocPool__(9) failed\n"));
-        }
-        ExtInfo->Mapping[0].extLength = LBS | ((uint32)EXTENT_NOT_RECORDED_NOT_ALLOCATED << 30);
-        ExtInfo->Mapping[0].extLocation =
-        ExtInfo->Mapping[1].extLength =
-        ExtInfo->Mapping[1].extLocation = 0;
-    }
-    if (ExtInfo->Offset) {
-        if (!AlwaysInIcb) {
-            // remove 1st entry pointing to FileEntry
-            s = UDFGetMappingLength(ExtInfo->Mapping);
-            ASSERT(s > sizeof(EXTENT_MAP));
-            // need this check in addition to the assert, because otherwise GCC compalins.
-            if(s > sizeof(EXTENT_MAP)) {
-                
-                RtlMoveMemory(&(ExtInfo->Mapping[0]), &(ExtInfo->Mapping[1]), s - sizeof(EXTENT_MAP));
-            }
-            if (!MyReallocPool__((int8*)(ExtInfo->Mapping), s,
-                          (int8**)&(ExtInfo->Mapping), s - sizeof(EXTENT_MAP) )) {
-                // This must never happen on truncate !!!
-                AdPrint(("ResizeExtent: MyReallocPool__(10) failed\n"));
-            }
-            Length -= ExtInfo->Offset;
-            ExtInfo->Offset = 0;
-        } else {
-            Length -= ExtInfo->Offset; // back to in-icb
-        }
-    }
-    ExtInfo->Length = Length;
-    UDFCheckSpaceAllocation(Vcb, 0, ExtInfo->Mapping, AS_USED); // check if used
-
-    for(i=0; (ExtInfo->Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK); i++) {
-        ExtPrint(("Resized Ext: type %x, loc %x, len %x\n",
-            ExtInfo->Mapping[i].extLength >> 30, ExtInfo->Mapping[i].extLocation, ExtInfo->Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK));
-    }
-
-    return STATUS_SUCCESS;
+NTSTATUS
+UDFResizeExtent(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                 uint32 PartNum, int64 Length, BOOLEAN AlwaysInIcb, PEXTENT_INFO ExtInfo)
+{
+    if (!Vcb || !FileInfo || !FileInfo->Dloc || !ExtInfo ||
+        !Vcb->Partitions || PartNum >= Vcb->PartitionMaps ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) ||
+        (ExtInfo != &FileInfo->Dloc->DataLoc && ExtInfo != &FileInfo->Dloc->AllocLoc) ||
+        (AlwaysInIcb && ExtInfo != &FileInfo->Dloc->AllocLoc) ||
+        Length < 0 || ExtInfo->Length < 0)
+        return STATUS_INVALID_PARAMETER;
+    if (Length == ExtInfo->Length && !(ExtInfo->Flags & EXTENT_FLAG_CUT_PREALLOCATED))
+        return STATUS_SUCCESS;
+    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY)
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    if (Vcb->Vat || Vcb->CDR_Mode)
+        return STATUS_NOT_SUPPORTED;
+    if (Length > ExtInfo->Length)
+        return UDFGrowExtentPrivate(IrpContext, Vcb, PartNum, Length, AlwaysInIcb, ExtInfo);
+    return UDFShrinkExtentPrivate(Vcb, FileInfo, PartNum, Length, AlwaysInIcb, ExtInfo);
 } // end UDFResizeExtent()
+
 
 /*
     This routine (re)builds AllocDescs data for all allocation modes except
@@ -2513,76 +2252,36 @@ tail_cached:;
     AllocMode in FileEntry pointed by FileInfo must be already initialized.
  */
 NTSTATUS
-UDFBuildAllocDescs(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 PartNum,
-    IN OUT PUDF_FILE_INFO FileInfo,
-    OUT int8** AllocData
-    )
+UDFBuildAllocDescs(PIRP_CONTEXT IrpContext, PVCB Vcb, uint32 PartNum,
+    PUDF_FILE_INFO FileInfo, int8** AllocData, uint32* Capacity)
 {
-//    PEXTENT_MAP InMap;
-//    uint32 i=0;
-    int8* Allocs;
-    uint16 AllocMode;
-    uint32 InitSz;
-    NTSTATUS status;
-
-    ValidateFileInfo(FileInfo);
-    AdPrint(("BuildAllocDesc\n"));
-    // get space available in the 1st LBlock after FE
-    InitSz = Vcb->SectorSize - FileInfo->Dloc->FileEntryLen;
-    Allocs = (int8*)MyAllocatePool__(NonPagedPool, InitSz);
-    if (!Allocs) {
-        *AllocData = NULL;
-        AdPrint(("BuildAllocDesc: cant alloc %x bytes for Allocs\n", InitSz));
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    RtlZeroMemory(Allocs, InitSz);
-//    InMap = FileInfo->Dloc->DataLoc.Mapping;
-    UDFCheckSpaceAllocation(Vcb, 0, InMap, AS_USED); // check if used
-
-    // TODO: move data from mapped locations here
-
-    AllocMode = ((PFILE_ENTRY)(FileInfo->Dloc->FileEntry))->icbTag.flags & ICB_FLAG_ALLOC_MASK;
-    switch(AllocMode) {
-    case ICB_FLAG_AD_IN_ICB: {
-        MyFreePool__(Allocs);
-        ASSERT(!FileInfo->Dloc->AllocLoc.Mapping);
-        Allocs = NULL;
-        status = STATUS_SUCCESS;
-        break;
-    }
-    case ICB_FLAG_AD_SHORT: {
-        status = UDFBuildShortAllocDescs(IrpContext, Vcb, PartNum, &Allocs, InitSz, FileInfo);
-        break;
-    }
-    case ICB_FLAG_AD_LONG: {
-        status = UDFBuildLongAllocDescs(IrpContext, Vcb, PartNum, &Allocs, InitSz, FileInfo);
-        break;
-    }
-/*    case ICB_FLAG_AD_EXTENDED: {
-        status = UDFBuildExtAllocDescs(Vcb, PartNum, &Allocs, InitSz, FileInfo);
-        break;
-    }*/
-    default: {
-        MyFreePool__(Allocs);
-        Allocs = NULL;
-        status = STATUS_INVALID_PARAMETER;
-    }
-    }
-
-    *AllocData = Allocs;
-    UDFCheckSpaceAllocation(Vcb, 0, FileInfo->Dloc->DataLoc.Mapping, AS_USED); // check if used
-
-    return status;
+    uint16 Mode;
+    uint32 Initial, Header;
+    NTSTATUS Status;
+    if (!AllocData || !Capacity) return STATUS_INVALID_PARAMETER;
+    *AllocData = NULL;
+    *Capacity = 0;
+    if (!Vcb || !FileInfo || !FileInfo->Dloc || !FileInfo->Dloc->FileEntry ||
+        FileInfo->Dloc->FileEntryLen > Vcb->SectorSize)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Status = UDFValidateFileEntryBuffer(Vcb, FileInfo, &Header);
+    if (!NT_SUCCESS(Status)) return Status;
+    Initial = Vcb->SectorSize - Header;
+    Mode = ((PFILE_ENTRY)FileInfo->Dloc->FileEntry)->icbTag.flags & ICB_FLAG_ALLOC_MASK;
+    if (Mode == ICB_FLAG_AD_IN_ICB)
+        return FileInfo->Dloc->AllocLoc.Mapping ? STATUS_FILE_CORRUPT_ERROR : STATUS_SUCCESS;
+    if (Mode == ICB_FLAG_AD_SHORT)
+        return UDFBuildShortAllocDescs(IrpContext, Vcb, PartNum, AllocData, Initial, FileInfo, Capacity);
+    if (Mode == ICB_FLAG_AD_LONG)
+        return UDFBuildLongAllocDescs(IrpContext, Vcb, PartNum, AllocData, Initial, FileInfo, Capacity);
+    return STATUS_NOT_SUPPORTED;
 } // end UDFBuildAllocDescs()
 
 /*
     This routine discards file's allocation
  */
-void
-UDFFreeFileAllocation(
+static VOID
+UDFFreeFileAllocationBody(
     IN PVCB Vcb,
     IN PUDF_FILE_INFO DirInfo,
     IN PUDF_FILE_INFO FileInfo
@@ -2622,125 +2321,143 @@ UDFFreeFileAllocation(
         UDFFreeFESpace(Vcb, DirInfo, &(FileInfo->Dloc->FELoc));
         UDFMarkSpaceAsXXX(Vcb, FileInfo->Dloc, FileInfo->Dloc->DataLoc.Mapping, AS_DISCARDED); // free
     }
-    FileInfo->Dloc->DataLoc.Modified =
-    FileInfo->Dloc->AllocLoc.Modified =
-    FileInfo->Dloc->FELoc.Modified = FALSE;
-} // end UDFFreeFileAllocation()
+}
+
+static NTSTATUS
+UDFCheckReleasedAllocationMap(PEXTENT_MAP Mapping)
+{
+    uint32 Bytes, i;
+    NTSTATUS Status;
+    if (!Mapping) return STATUS_SUCCESS;
+    Status = UDFGetMappingByteCount(Mapping, &Bytes);
+    if (Status != STATUS_SUCCESS) return Status;
+    for (i = 0; i + 1 < Bytes / sizeof(*Mapping); i++)
+        if ((Mapping[i].extLength >> 30) != EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+            return STATUS_IO_DEVICE_ERROR;
+    return STATUS_SUCCESS;
+}
+
+/* Only a confirmed final deletion with no remaining FI/cache/FCB owner can
+ * retire these maps. Keep its Dloc indexed/claimed through every fallible
+ * bitmap operation. An uncertain release is never replayed as a fresh free. */
+NTSTATUS
+UDFFreeFileAllocation(PVCB Vcb, PUDF_FILE_INFO DirInfo, PUDF_FILE_INFO FileInfo)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo ? FileInfo->Dloc : NULL;
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    _SEH2_VOLATILE BOOLEAN Locked = FALSE, Active = FALSE;
+    if (!Dloc || !ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource) ||
+        Dloc->CleanupOwner != PsGetCurrentThread() || !Dloc->DeleteCommitted ||
+        FileInfo->RefCount || FileInfo->OpenCount || FileInfo->Fcb ||
+        Dloc->CommonFcb || Dloc->LinkRefCount || !Dloc->FELoc.Mapping)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Dloc->AllocationReleaseActive) return STATUS_DEVICE_BUSY;
+    if (!NT_SUCCESS(Dloc->AllocationReleaseError)) return Dloc->AllocationReleaseError;
+    if (Vcb->Vat || Vcb->CDR_Mode) return STATUS_NOT_SUPPORTED;
+    if (Vcb->TruncateTxnOwner == PsGetCurrentThread())
+        return STATUS_DEVICE_BUSY; /* never donate this delete to another truncate ledger */
+    _SEH2_TRY {
+    _SEH2_TRY {
+        UDFAcquireResourceExclusive(&Vcb->BitMapResource1, TRUE);
+        Locked = TRUE;
+        Status = UDFAllocationFailureStatus(Vcb);
+        if (Status == STATUS_SUCCESS && (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+            Status = STATUS_MEDIA_WRITE_PROTECTED;
+        if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+        Dloc->AllocationReleaseActive = TRUE;
+        Active = TRUE;
+        UDFFreeFileAllocationBody(Vcb, DirInfo, FileInfo);
+        Status = UDFCheckReleasedAllocationMap(Dloc->DataLoc.Mapping);
+        if (Status == STATUS_SUCCESS) Status = UDFCheckReleasedAllocationMap(Dloc->AllocLoc.Mapping);
+        if (Status == STATUS_SUCCESS) Status = UDFCheckReleasedAllocationMap(Dloc->FELoc.Mapping);
+        if (Status == STATUS_SUCCESS) {
+            Dloc->DataLoc.Flags &= ~(EXTENT_FLAG_PREALLOCATED | EXTENT_FLAG_CUT_PREALLOCATED);
+            Dloc->DataLoc.Modified = Dloc->AllocLoc.Modified = Dloc->FELoc.Modified = FALSE;
+        }
+    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        Status = _SEH2_GetExceptionCode();
+    } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (Active) {
+            if (_SEH2_AbnormalTermination()) Status = STATUS_UNSUCCESSFUL;
+            if (Status != STATUS_SUCCESS) {
+                if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+                InterlockedCompareExchange(&Dloc->AllocationReleaseError, Status, STATUS_SUCCESS);
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+            }
+            Dloc->AllocationReleaseActive = FALSE;
+        }
+        if (Locked) UDFReleaseResource(&Vcb->BitMapResource1);
+    } _SEH2_END;
+    return Status;
+}
 
 /*
     This routine packs physically sequential extents into single one
  */
+static BOOLEAN
+UDFCanMergeMappingRuns(PVCB Vcb, const EXTENT_MAP* Left, const EXTENT_MAP* Right)
+{
+    uint32 LeftLength = Left->extLength & UDF_EXTENT_LENGTH_MASK;
+    uint32 RightLength = Right->extLength & UDF_EXTENT_LENGTH_MASK;
+    uint32 Type = Left->extLength >> 30;
+    uint32 Limit = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, Vcb->SectorSize);
+    if (!LeftLength || !RightLength || Type > EXTENT_NOT_RECORDED_NOT_ALLOCATED ||
+        Type != (Right->extLength >> 30) ||
+        (LeftLength & (Vcb->SectorSize - 1)) ||
+        (uint64)LeftLength + RightLength > Limit)
+        return FALSE;
+    return Type == EXTENT_NOT_RECORDED_NOT_ALLOCATED ||
+        (uint64)Left->extLocation + (LeftLength >> Vcb->SectorShift) == Right->extLocation;
+}
+
 void
 __fastcall
-UDFPackMapping(
-    IN PVCB Vcb,
-    IN PEXTENT_INFO ExtInfo   // Extent array
-    )
+UDFPackMapping(IN PVCB Vcb, IN PEXTENT_INFO ExtInfo)
 {
-    PEXTENT_MAP NewMap, OldMap;
-    uint32 i, j, l;
-    uint32 LastLba, LastType, OldLen;
-    uint32 OldSize, NewSize;
-    uint32 LBS = Vcb->SectorSize;
-    uint32 MaxExtentLength = ALIGN_DOWN_BY(UDF_EXTENT_LENGTH_MASK, LBS);
+    PEXTENT_MAP OldMap, NewMap;
+    EXTENT_MAP Run;
+    uint32 OldSize, NewSize, Count, Runs, i, j;
 
-#ifdef UDF_DBG
-    int64 check_size;
-#endif //UDF_DBG
-
-    AdPrint(("Pack ExtInfo %x, Mapping %x\n", ExtInfo, ExtInfo->Mapping));
-    AdPrint(("  Length %x\n", ExtInfo->Length));
-
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || !Vcb->SectorSize ||
+        Vcb->SectorShift >= 32 || Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift))
+        return;
     OldMap = ExtInfo->Mapping;
-    LastLba = OldMap[0].extLocation;
-    OldLen = (OldMap[0].extLength & UDF_EXTENT_LENGTH_MASK) >> Vcb->SectorShift;
-    LastType = OldMap[0].extLength >> 30;
-    OldSize =
-    NewSize = UDFGetMappingLength(OldMap);
-#ifdef UDF_DBG
-    check_size = UDFGetExtentLength(ExtInfo->Mapping);
-    ASSERT(!(check_size & (Vcb->SectorSize-1)));
-#endif //UDF_DBG
-
-    l=OldMap[0].extLength & UDF_EXTENT_LENGTH_MASK;
-    // calculate required length
-    for(i=1; OldMap[i].extLength; i++) {
-        if ((LastType == (OldMap[i].extLength >> 30))
-            &&
-           ((OldMap[i].extLocation == LastLba + OldLen) ||
-            (!OldMap[i].extLocation && !LastLba && (LastType == EXTENT_NOT_RECORDED_NOT_ALLOCATED)))
-            &&
-           (l + (OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK) <= MaxExtentLength)) {
-            // we can pack two blocks in one
-            l += OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK;
-            NewSize -= sizeof(EXTENT_MAP);
+    if (!NT_SUCCESS(UDFGetMappingByteCount(OldMap, &OldSize)))
+        return; /* Optional packing never consumes an invalid/unknown owner. */
+    Count = OldSize / sizeof(EXTENT_MAP) - 1;
+    if (Count < 2)
+        return;
+    Runs = 1;
+    Run = OldMap[0];
+    for (i = 1; i < Count; i++) {
+        if (UDFCanMergeMappingRuns(Vcb, &Run, &OldMap[i])) {
+            Run.extLength += OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK;
         } else {
-            l = OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK;
+            Run = OldMap[i];
+            Runs++;
         }
-        LastLba = OldMap[i].extLocation;
-        LastType = OldMap[i].extLength >> 30;
-        OldLen = (OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK) >> Vcb->SectorShift;
     }
-    // no changes ?
-    if (OldSize <= (NewSize + PACK_MAPPING_THRESHOLD)) {
-        if (OldSize == NewSize)
-            return;
-        if (NewSize >= PACK_MAPPING_THRESHOLD)
-            return;
-    }
-    AdPrint(("Pack ExtInfo %x, Mapping %x, realloc\n", ExtInfo, ExtInfo->Mapping));
-    NewMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , NewSize,
-                                                       MEM_EXTMAP_TAG);
-    // can't alloc ?
-    if (!NewMap) return;
-    // Ok, lets pack it...
-    j=0;
+    NewSize = (Runs + 1) * sizeof(EXTENT_MAP);
+    if (NewSize == OldSize ||
+        (OldSize - NewSize <= PACK_MAPPING_THRESHOLD && NewSize >= PACK_MAPPING_THRESHOLD))
+        return;
+    NewMap = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool, NewSize, MEM_EXTMAP_TAG);
+    if (!NewMap)
+        return; /* The original map remains fully owned on OOM. */
+    j = 0;
     NewMap[0] = OldMap[0];
-    LastLba = OldMap[0].extLocation;
-    OldLen = (OldMap[0].extLength & UDF_EXTENT_LENGTH_MASK) >> Vcb->SectorShift;
-    LastType = OldMap[0].extLength >> 30;
-    for(i=1; OldMap[i].extLength; i++) {
-
-        ExtPrint(("oShExt: type %x, loc %x, len %x\n",
-            OldMap[i].extLength >> 30, OldMap[i].extLocation, OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK));
-
-        if ((LastType == (OldMap[i].extLength >> 30))
-            &&
-           ((OldMap[i].extLocation == LastLba + OldLen) ||
-            (!OldMap[i].extLocation && !LastLba && (LastType == EXTENT_NOT_RECORDED_NOT_ALLOCATED)))
-            &&
-           ((NewMap[j].extLength & UDF_EXTENT_LENGTH_MASK) + (OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK) <= MaxExtentLength)) {
+    for (i = 1; i < Count; i++) {
+        if (UDFCanMergeMappingRuns(Vcb, &NewMap[j], &OldMap[i]))
             NewMap[j].extLength += OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK;
-        } else {
-            j++;
-            NewMap[j] = OldMap[i];
-        }
-
-        ExtPrint(("nShExt: type %x, loc %x, len %x\n",
-            NewMap[j].extLength >> 30, NewMap[j].extLocation, NewMap[j].extLength & UDF_EXTENT_LENGTH_MASK));
-
-        LastLba = OldMap[i].extLocation;
-        LastType = OldMap[i].extLength >> 30;
-        OldLen = (OldMap[i].extLength & UDF_EXTENT_LENGTH_MASK) >> Vcb->SectorShift;
+        else
+            NewMap[++j] = OldMap[i];
     }
-    // write terminator
-    j++;
-    ASSERT(NewSize == (j+1)*sizeof(EXTENT_MAP));
-    NewMap[j].extLength =
-    NewMap[j].extLocation = 0;
-
-#ifdef UDF_DBG
-    ASSERT(check_size == UDFGetExtentLength(ExtInfo->Mapping));
-    ASSERT(check_size == UDFGetExtentLength(NewMap));
-#endif
-
-    AdPrint(("Pack ExtInfo %x, NewMap %x, OldMap %x\n", ExtInfo, NewMap, OldMap));
-
+    NewMap[j + 1].extLength = NewMap[j + 1].extLocation = 0;
     ExtInfo->Mapping = NewMap;
     MyFreePool__(OldMap);
-
-    AdPrint(("Pack ExtInfo %x, Mapping %x\n", ExtInfo, ExtInfo->Mapping));
-    AdPrint(("  Length %x\n", ExtInfo->Length));
 } // end UDFPackMapping()
 
 /*
@@ -2753,35 +2470,52 @@ UDFUnPackMapping(
     IN PEXTENT_INFO ExtInfo   // Extent array
     )
 {
-    PEXTENT_MAP NewMapping;
-    PEXTENT_MAP Mapping = ExtInfo->Mapping;
-    uint32 LBS = Vcb->SectorSize;
-    uint32 len = (uint32)(UDFGetExtentLength(Mapping) >> Vcb->SectorShift);
-    uint32 i,j, type, base, d;
-    LONG l;
+    PEXTENT_MAP Mapping, NewMapping;
+    uint32 Bytes, Count, i, j = 0, Length, Chunk, Type;
+    uint64 Entries = 0, Blocks, Physical;
+    NTSTATUS Status;
 
-    NewMapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , (len+1)*sizeof(EXTENT_MAP),
-                                                       MEM_EXTMAP_TAG);
-    if (!NewMapping) return STATUS_INSUFFICIENT_RESOURCES;
-
-    j=0;
-    d = LBS >> Vcb->SectorShift;
-    for(i=0; (l = (Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK)); i++) {
-        base = Mapping[i].extLocation;
-        type = Mapping[i].extLength & UDF_EXTENT_FLAG_MASK;
-        for(; l>=(LONG)LBS; j++) {
-            NewMapping[j].extLength = LBS | type;
-            NewMapping[j].extLocation = base;
-            base+=d;
-            l-=LBS;
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || Vcb->SectorShift >= 32 ||
+        !Vcb->SectorSize || Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift))
+        return STATUS_INVALID_PARAMETER;
+    Mapping = ExtInfo->Mapping;
+    Status = UDFGetMappingByteCount(Mapping, &Bytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Count = Bytes / sizeof(EXTENT_MAP) - 1;
+    for (i = 0; i < Count; i++) {
+        Length = Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK;
+        Blocks = ((uint64)Length + Vcb->SectorSize - 1) >> Vcb->SectorShift;
+        Type = Mapping[i].extLength >> 30;
+        if (Type != EXTENT_NOT_RECORDED_NOT_ALLOCATED &&
+            (uint64)Mapping[i].extLocation + Blocks > LBA_OUT_OF_EXTENT)
+            return STATUS_FILE_CORRUPT_ERROR;
+        if (i + 1 < Count && (Length & (Vcb->SectorSize - 1)))
+            return STATUS_FILE_CORRUPT_ERROR;
+        Entries += Blocks;
+        if (Entries + 1 > (MAXULONG - MY_HEAP_ALIGN) / sizeof(EXTENT_MAP))
+            return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    NewMapping = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                            (Entries + 1) * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+    if (!NewMapping)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    for (i = 0; i < Count; i++) {
+        Length = Mapping[i].extLength & UDF_EXTENT_LENGTH_MASK;
+        Type = Mapping[i].extLength >> 30;
+        Physical = Mapping[i].extLocation;
+        while (Length) {
+            Chunk = min(Length, Vcb->SectorSize);
+            NewMapping[j].extLength = Chunk | (Type << 30);
+            NewMapping[j++].extLocation =
+                Type == EXTENT_NOT_RECORDED_NOT_ALLOCATED ? 0 : (uint32)Physical;
+            Length -= Chunk;
+            Physical++;
         }
     }
-    // record terminator
-    ASSERT(NewMapping);
-    RtlZeroMemory(&(NewMapping[j]), sizeof(EXTENT_MAP));
-    MyFreePool__(Mapping);
+    NewMapping[j].extLength = NewMapping[j].extLocation = 0;
     ExtInfo->Mapping = NewMapping;
-
+    MyFreePool__(Mapping);
     return STATUS_SUCCESS;
 } // end UDFUnPackMapping()
 
@@ -2865,43 +2599,50 @@ UDFReadExtent(
     OUT int8* Buffer
     )
 {
-    if (!ExtInfo || !ExtInfo->Mapping) return STATUS_INVALID_PARAMETER;
-    ASSERT((uintptr_t)Buffer > 0x1000);
+    PEXTENT_MAP Extent;
+    SIZE_T ToRead;
+    uint32 Lba, SectorOffset, Flags, Index;
+    NTSTATUS Status;
 
-    AdPrint(("Read ExtInfo %x, Mapping %x\n", ExtInfo, ExtInfo->Mapping));
-
-    PEXTENT_MAP Extent = ExtInfo->Mapping;   // Extent array
-    SIZE_T to_read;
-    uint32 Lba, sect_offs, flags;
-    uint32 index;
-    NTSTATUS status;
-    // prevent reading out of data space
-    if (Offset > ExtInfo->Length) return STATUS_END_OF_FILE;
-    if (Offset+Length > ExtInfo->Length) Length = (uint32)(ExtInfo->Length - Offset);
-    Offset += ExtInfo->Offset;               // used for in-ICB data
-    // read maximal possible part of each frag of extent
-    Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_read, &flags, &index);
-    while(Length) {
-        // EOF check
-        if (Lba == LBA_OUT_OF_EXTENT) return STATUS_END_OF_FILE;
-        Extent += (index + 1);
-        // check for reading tail
-        to_read = min(to_read, Length);
-        if (flags == EXTENT_RECORDED_ALLOCATED) {
-            status = UDFReadData(IrpContext, Vcb, TRUE, ( ((uint64)Lba) << Vcb->SectorShift) + sect_offs, to_read, Direct, Buffer);
-            if (!NT_SUCCESS(status)) return status;
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || Offset < 0 || (Length && !Buffer))
+        return STATUS_INVALID_PARAMETER;
+    if (ExtInfo->Length < 0)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Offset > ExtInfo->Length)
+        return STATUS_END_OF_FILE;
+    if ((uint64)Length > (uint64)(ExtInfo->Length - Offset))
+        Length = (SIZE_T)(ExtInfo->Length - Offset);
+    if (!Length)
+        return STATUS_SUCCESS;
+    if ((uint64)Offset + ExtInfo->Offset > MAXLONGLONG)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Offset += ExtInfo->Offset;
+    Extent = ExtInfo->Mapping;
+    Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset,
+                              &SectorOffset, &ToRead, &Flags, &Index);
+    while (Length) {
+        /* EOF was already bounded by informationLength. A missing run here
+         * is corrupt mapping, not a successful short/zero-filled read. */
+        if (Lba == LBA_OUT_OF_EXTENT || Index == MAXULONG || !ToRead ||
+            Flags > EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Extent += Index + 1;
+        ToRead = min(ToRead, Length);
+        if (Flags == EXTENT_RECORDED_ALLOCATED) {
+            Status = UDFReadData(IrpContext, Vcb, TRUE,
+                (((uint64)Lba) << Vcb->SectorShift) + SectorOffset,
+                ToRead, Direct, Buffer);
+            if (!NT_SUCCESS(Status))
+                return Status;
         } else {
-            RtlZeroMemory(Buffer, to_read);
+            RtlZeroMemory(Buffer, ToRead);
         }
-        // prepare for reading next frag...
-        Length -= to_read;
+        Length -= ToRead;
         if (!Length)
             break;
-        ASSERT(to_read);
-        Buffer += to_read;
-//        Offset += to_read;
-        Lba = UDFNextExtentToLba(Vcb, Extent, &to_read, &flags, &index);
-        sect_offs = 0;
+        Buffer += ToRead;
+        Lba = UDFNextExtentToLba(Vcb, Extent, &ToRead, &Flags, &Index);
+        SectorOffset = 0;
     }
     return STATUS_SUCCESS;
 } // end UDFReadExtent()
@@ -2922,68 +2663,75 @@ UDFReadExtentLocation(
     OUT int64* _NextOffset        // offset, caller can start from to continue
     )
 {
-    if (!ExtInfo || !ExtInfo->Mapping)
+    PEXTENT_MAP Extent, SubExtent;
+    SIZE_T Available;
+    uint32 Lba, SectorOffset, Flags, Index, Count = 0, Capacity;
+    int64 Remaining, NextOffset;
+    NTSTATUS Status;
+
+    if (!_SubExtInfo || !_SubExtInfoSz || !_NextOffset)
         return STATUS_INVALID_PARAMETER;
-
-    PEXTENT_MAP Extent = ExtInfo->Mapping;   // Extent array
-    PEXTENT_MAP SubExtInfo;
-    SIZE_T to_read;
-    uint32 Lba, sect_offs, flags, Skip_MapEntries;
-    int32 SubExtInfoSz = *_SubExtInfoSz;
-    int64 Length;
-    int64 NextOffset;
-//    NTSTATUS status = STATUS_BUFFER_OVERFLOW;
-
-    (*_SubExtInfo) = NULL;
-    (*_SubExtInfoSz) = 0;
-    NextOffset = Offset;
-    // prevent reading out of data space
+    Capacity = *_SubExtInfoSz;
+    *_SubExtInfo = NULL;
+    *_SubExtInfoSz = 0;
+    *_NextOffset = Offset;
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || Offset < 0 ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 32)
+        return STATUS_INVALID_PARAMETER;
+    /* A byte inside an FE has no sector-aligned retrieval mapping. Do not
+     * expose the descriptor sector as if it were an ordinary data cluster. */
+    if (ExtInfo->Offset)
+        return STATUS_NOT_SUPPORTED;
+    if (Offset & (Vcb->SectorSize - 1))
+        return STATUS_INVALID_PARAMETER;
+    if (ExtInfo->Length < 0)
+        return STATUS_FILE_CORRUPT_ERROR;
     if (Offset >= ExtInfo->Length)
         return STATUS_END_OF_FILE;
-    Length = ExtInfo->Length - Offset;
-    Offset += ExtInfo->Offset;               // used for in-ICB data
-    // read maximal possible part of each frag of extent
-    SubExtInfo = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool , SubExtInfoSz*sizeof(EXTENT_MAP),
-                                                       MEM_EXTMAP_TAG);
-    (*_SubExtInfo) = SubExtInfo;
-    if (!SubExtInfo)
+    if (!Capacity)
+        return STATUS_BUFFER_TOO_SMALL;
+    if (Capacity > (MAXULONG - MY_HEAP_ALIGN) / sizeof(EXTENT_MAP) - 1)
+        return STATUS_INVALID_PARAMETER;
+    SubExtent = (PEXTENT_MAP)MyAllocatePoolTag__(NonPagedPool,
+                       (Capacity + 1) * sizeof(EXTENT_MAP), MEM_EXTMAP_TAG);
+    if (!SubExtent)
         return STATUS_INSUFFICIENT_RESOURCES;
 
-    Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_read, &flags, &Skip_MapEntries);
-    while(Length && SubExtInfoSz) {
-        // EOF check
-        if (Lba == LBA_OUT_OF_EXTENT) {
-            BrutePoint();
-            return STATUS_END_OF_FILE;
+    Extent = ExtInfo->Mapping;
+    Remaining = ExtInfo->Length - Offset;
+    NextOffset = Offset;
+    Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset,
+                             &SectorOffset, &Available, &Flags, &Index);
+    while (Remaining && Count < Capacity) {
+        if (Lba == LBA_OUT_OF_EXTENT || Index == MAXULONG || !Available ||
+            SectorOffset || Flags > EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
+            MyFreePool__(SubExtent);
+            return STATUS_FILE_CORRUPT_ERROR;
         }
-        Extent += (Skip_MapEntries + 1);
-        // check for reading tail
-        to_read = (int32)min((int64)to_read, Length);
-        SubExtInfo->extLength   = to_read;
-        if (flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
-            SubExtInfo->extLocation = LBA_NOT_ALLOCATED;
-        } else
-        if (flags == EXTENT_NOT_RECORDED_ALLOCATED) {
-            ASSERT(!(Lba & 0x80000000));
-            SubExtInfo->extLocation = Lba | 0x80000000;
-        } else {
-            SubExtInfo->extLocation = Lba;
-        }
-        (*_SubExtInfoSz)++;
-        SubExtInfoSz--;
-        NextOffset += to_read;
-        // prepare for reading next frag...
-        Length -= to_read;
-        if (!Length) {
-//            status = STATUS_SUCCESS;
+        Extent += Index + 1;
+        if ((uint64)Available > (uint64)Remaining)
+            Available = (SIZE_T)Remaining;
+        /* Keep type bits in extLength. Bit 31 of a real physical LBA is
+         * address data, never an unrecorded/sparse flag. This is a counted
+         * private output map, plus a terminator, committed only on success
+         * or a deliberate BUFFER_OVERFLOW carrying complete entries. */
+        SubExtent[Count].extLength = (uint32)Available | (Flags << 30);
+        SubExtent[Count].extLocation =
+            Flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED ? 0 : Lba;
+        Count++;
+        NextOffset += Available;
+        Remaining -= Available;
+        if (!Remaining || Count == Capacity)
             break;
-        }
-        ASSERT(to_read);
-        Lba = UDFNextExtentToLba(Vcb, Extent, &to_read, &flags, &Skip_MapEntries);
-        sect_offs = 0;
+        Lba = UDFNextExtentToLba(Vcb, Extent, &Available, &Flags, &Index);
+        SectorOffset = 0;
     }
-    (*_NextOffset) = NextOffset;
-    return STATUS_SUCCESS;
+    SubExtent[Count].extLength = SubExtent[Count].extLocation = 0;
+    Status = Remaining ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+    *_SubExtInfo = SubExtent;
+    *_SubExtInfoSz = Count;
+    *_NextOffset = NextOffset;
+    return Status;
 } // end UDFReadExtentLocation()
 
 #ifdef _MSC_VER
@@ -3017,177 +2765,115 @@ NTSTATUS
 UDFWriteExtent(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN PEXTENT_INFO ExtInfo,   // Extent array
-    IN int64 Offset,        // offset in extent
+    IN PEXTENT_INFO ExtInfo,
+    IN int64 Offset,
     IN SIZE_T Length,
-    IN BOOLEAN Direct,         // setting this flag delays flushing of given
-                               // data to indefinite term
+    IN BOOLEAN Direct,
     IN int8* Buffer,
     OUT PSIZE_T WrittenBytes
     )
 {
-    if (!ExtInfo || !ExtInfo->Mapping)
+    uint32 Lba, SectorOffset, Flags, BaseLba, BaseFlags;
+    SIZE_T ToWrite, Written, PaddingWritten, Available;
+    uint64 Cover;
+    NTSTATUS Status;
+    BOOLEAN Activate;
+    int8* SectorBuffer;
+
+    if (WrittenBytes) *WrittenBytes = 0;
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || !WrittenBytes || Offset < 0 ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != ((uint32)1 << Vcb->SectorShift) ||
+        (Length && !Buffer) || (uint64)Offset + ExtInfo->Offset > MAXLONGLONG ||
+        (uint64)Length > MAXLONGLONG - ((uint64)Offset + ExtInfo->Offset))
         return STATUS_INVALID_PARAMETER;
-
-    PEXTENT_MAP Extent = ExtInfo->Mapping;   // Extent array
-    uint32 Lba, sect_offs, flags;
-    NTSTATUS status;
-    SIZE_T to_write, _WrittenBytes;
-    BOOLEAN reread_lba;
-//    BOOLEAN already_prepared = FALSE;
-//    BOOLEAN prepare = !Buffer;
-
-    AdPrint(("Write ExtInfo %x, Mapping %x\n", ExtInfo, ExtInfo->Mapping));
-
-    Offset += ExtInfo->Offset;               // used for in-ICB data
-    // write maximal possible part of each frag of extent
-    while(((LONG)Length) > 0) {
-        UDFCheckSpaceAllocation(Vcb, 0, Extent, AS_USED); // check if used
-        Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_write, &flags, NULL);
-        // EOF check
-        if (Lba == LBA_OUT_OF_EXTENT) {
-            return STATUS_END_OF_FILE;
+    Offset += ExtInfo->Offset;
+    while (Length) {
+        Lba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, Offset,
+                                  &SectorOffset, &ToWrite, &Flags, NULL);
+        if (Lba == LBA_OUT_OF_EXTENT) return STATUS_END_OF_FILE;
+        if (!ToWrite || Flags > EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+            return STATUS_FILE_CORRUPT_ERROR;
+        ToWrite = min(ToWrite, Length);
+        if (Flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
+            Status = UDFMarkNotAllocatedAsAllocated(IrpContext, Vcb, Offset, ToWrite, ExtInfo);
+            if (!NT_SUCCESS(Status)) return Status;
+            Lba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, Offset,
+                                      &SectorOffset, &ToWrite, &Flags, NULL);
+            if (Lba == LBA_OUT_OF_EXTENT || !ToWrite ||
+                Flags >= EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+                return STATUS_FILE_CORRUPT_ERROR;
+            ToWrite = min(ToWrite, Length);
         }
-/*        if ((to_write < Length) &&
-           !Direct && !prepare && !already_prepared) {
-            // rebuild mapping, allocate space, etc.
-            // to indicate this, set Buffer to NULL
-            AdPrint(("UDFWriteExtent: Prepare\n"));
-            BrutePoint();
-            _WrittenBytes = 0;
-            status = UDFWriteExtent(Vcb, ExtInfo, Offset, Length, *//*Direct*//*FALSE, NULL, &_WrittenBytes);
-            if (!NT_SUCCESS(status)) {
-                return status;
-            }
-            Extent = ExtInfo->Mapping;
-            Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_write, &flags, NULL);
-            already_prepared = TRUE;
-        }*/
-        if (flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
-            // here we should allocate space for this extent
-            if (!NT_SUCCESS(status = UDFMarkNotAllocatedAsAllocated(IrpContext, Vcb, Offset, to_write, ExtInfo)))
-                return status;
-            Extent = ExtInfo->Mapping;
-            UDFCheckSpaceAllocation(Vcb, 0, Extent, AS_USED); // check if used
-            Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_write, &flags, NULL);
-            if (Lba == LBA_OUT_OF_EXTENT) {
-                return STATUS_END_OF_FILE;
-            }
-            // we have already re-read Lba
-            reread_lba = FALSE;
-        } else {
-            // we may need to re-read Lba if some changes are
-            // made while converting from Alloc-Not-Rec
-            reread_lba = TRUE;
-        }
-        // check if writing to not recorded allocated
-        // in this case we must pad blocks with zeros around
-        // modified area
-        //
-        // ...|xxxxxxxx|xxxxxxxx|xxxxxxxx|...
-        //        .                .
-        //        .     ||         .
-        //        .     \/         .
-        //        .                .
-        // ...|000ddddd|dddddddd|dd000000|...
-        //        .                .
-        //        ^                ^
-        //        sect_offs        sect_offs+to_write
-        //        .                .
-        //        .<-- to_write -->.
-        //
-        to_write = min(to_write, Length);
-        if (flags == EXTENT_NOT_RECORDED_ALLOCATED) {
-            if (!NT_SUCCESS(status = UDFMarkAllocatedAsRecorded(Vcb, Offset, to_write, ExtInfo)))
-                return status;
-            Extent = ExtInfo->Mapping;
-            UDFCheckSpaceAllocation(Vcb, 0, Extent, AS_USED); // check if used
-            if (reread_lba) {
-                SIZE_T UnrecordedLength = to_write;
-                Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_write, &flags, NULL);
-                /* Conversion can merge an already recorded neighbor. Its
-                 * bytes must not enter this zero-initialization window. */
-                to_write = min(to_write, UnrecordedLength);
-            }
-            SIZE_T PartialWriteLen = min(to_write, Length);
-            /* A partial write into a newly recorded single sector must leave
-               its unwritten bytes zero.  Zeroing the sector on disk and then
-               doing a read-modify-write issues W-R-W to the same LBA.  Build
-               the identical final sector in private memory and commit it once.
-               Fall back to the old path if the scratch allocation fails. */
-            if (!Vcb->CDR_Mode &&
-                PartialWriteLen &&
-                (sect_offs || PartialWriteLen < Vcb->SectorSize) &&
-                (sect_offs + PartialWriteLen <= Vcb->SectorSize)) {
-                int8* SectorBuf = (int8*)MyAllocatePool__(NonPagedPool, Vcb->SectorSize);
-                if (SectorBuf) {
-                    RtlZeroMemory(SectorBuf, Vcb->SectorSize);
-                    RtlCopyMemory(SectorBuf + sect_offs, Buffer, PartialWriteLen);
-                    status = UDFWriteData(IrpContext, Vcb, TRUE,
-                                          ((uint64)Lba) << Vcb->SectorShift,
-                                          Vcb->SectorSize, Direct, SectorBuf, &_WrittenBytes);
-                    MyFreePool__(SectorBuf);
-                    if (!NT_SUCCESS(status))
-                        return status;
-                    *WrittenBytes += PartialWriteLen;
-                    Buffer += PartialWriteLen;
-                    Offset += PartialWriteLen;
-                    Length -= PartialWriteLen;
-                    continue;
+        Activate = Flags == EXTENT_NOT_RECORDED_ALLOCATED;
+        if (Activate) {
+            /* Keep the descriptor unrecorded until every requested byte and
+             * both partial-sector tails have completed. A failed/short write
+             * remains logically zero and cannot publish old allocation bytes. */
+            if (Vcb->Vat || Vcb->CDR_Mode || (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+                return STATUS_MEDIA_WRITE_PROTECTED;
+            if (SectorOffset >= Vcb->SectorSize || ToWrite > UDF_EXTENT_LENGTH_MASK)
+                return STATUS_FILE_CORRUPT_ERROR;
+            Cover = ((uint64)SectorOffset + ToWrite + Vcb->SectorSize - 1) &
+                    ~((uint64)Vcb->SectorSize - 1);
+            BaseLba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping,
+                Offset & ~((int64)Vcb->SectorSize - 1), NULL, &Available, &BaseFlags, NULL);
+            if (BaseLba != Lba || BaseFlags != EXTENT_NOT_RECORDED_ALLOCATED || Cover > Available)
+                return STATUS_FILE_CORRUPT_ERROR;
+            if (SectorOffset + ToWrite <= Vcb->SectorSize &&
+                (SectorOffset || ToWrite < Vcb->SectorSize)) {
+                SectorBuffer = (int8*)MyAllocatePool__(NonPagedPool, Vcb->SectorSize);
+                if (SectorBuffer) {
+                    _SEH2_TRY {
+                        RtlZeroMemory(SectorBuffer, Vcb->SectorSize);
+                        RtlCopyMemory(SectorBuffer + SectorOffset, Buffer, ToWrite);
+                        Status = UDFWriteData(IrpContext, Vcb, TRUE,
+                            ((uint64)Lba) << Vcb->SectorShift, Vcb->SectorSize,
+                            Direct, SectorBuffer, &Written);
+                    } _SEH2_FINALLY {
+                        MyFreePool__(SectorBuffer);
+                    } _SEH2_END;
+                    if (!NT_SUCCESS(Status)) return Status;
+                    if (Written != Vcb->SectorSize) return STATUS_IO_DEVICE_ERROR;
+                    goto activate_written_range;
                 }
             }
-            /*
-              we must fill 1st block with zeros in 1 of 2 cases:
-                1) start offset is not aligned on LBlock boundary
-                      OR
-                2) end offset is not aligned on LBlock boundary and lays in
-                   the same LBlock
-
-              we must fill last block with zeros if both
-                1) end offset is not aligned on LBlock boundary
-                      AND
-                2) end offset DOESN'T lay in the 1st LBlock
-            */
-
-//            if (!prepare) {
-                // pad 1st logical block
-            if ((sect_offs || (sect_offs + to_write < Vcb->SectorSize) )
-                                &&
-                           !Vcb->CDR_Mode) {
-                status = UDFWriteData(IrpContext, Vcb, TRUE,
-                                      ( ((uint64)Lba) << Vcb->SectorShift),
-                                      Vcb->SectorSize, Direct, Vcb->ZBuffer, &_WrittenBytes);
-                if (!NT_SUCCESS(status))
-                    return status;
+            /* Scratch OOM retains the older bounded padding fallback. Check
+             * exact completed bytes before allowing a recorded transition. */
+            if (SectorOffset || SectorOffset + ToWrite < Vcb->SectorSize) {
+                Status = UDFWriteData(IrpContext, Vcb, TRUE,
+                    ((uint64)Lba) << Vcb->SectorShift, Vcb->SectorSize,
+                    Direct, Vcb->ZBuffer, &PaddingWritten);
+                if (!NT_SUCCESS(Status)) return Status;
+                if (PaddingWritten != Vcb->SectorSize) return STATUS_IO_DEVICE_ERROR;
             }
-            // pad last logical block
-            if ((sect_offs + to_write > Vcb->SectorSize) &&
-               (sect_offs + to_write) & (Vcb->SectorSize - 1)) {
-                status = UDFWriteData(IrpContext, Vcb, TRUE,
-                                      (( ((uint64)Lba) << Vcb->SectorShift) + sect_offs + to_write) & ~((int64)(Vcb->SectorSize)-1),
-                                      Vcb->SectorSize, Direct, Vcb->ZBuffer, &_WrittenBytes);
+            if (SectorOffset + ToWrite > Vcb->SectorSize &&
+                ((SectorOffset + ToWrite) & (Vcb->SectorSize - 1))) {
+                uint64 LastSector = ((((uint64)Lba) << Vcb->SectorShift) +
+                    SectorOffset + ToWrite) & ~((uint64)Vcb->SectorSize - 1);
+                Status = UDFWriteData(IrpContext, Vcb, TRUE, LastSector,
+                    Vcb->SectorSize, Direct, Vcb->ZBuffer, &PaddingWritten);
+                if (!NT_SUCCESS(Status)) return Status;
+                if (PaddingWritten != Vcb->SectorSize) return STATUS_IO_DEVICE_ERROR;
             }
-            if (!NT_SUCCESS(status))
-                return status;
-/*            } else {
-                status = STATUS_SUCCESS;
-            }*/
         }
-        ASSERT(to_write);
-//        if (!prepare) {
-        status = UDFWriteData(IrpContext, Vcb, TRUE, ( ((uint64)Lba) << Vcb->SectorShift) + sect_offs, to_write, Direct, Buffer, &_WrittenBytes);
-        *WrittenBytes += _WrittenBytes;
-        if (!NT_SUCCESS(status)) return status;
-/*        } else {
-            status = STATUS_SUCCESS;
-            *WrittenBytes += to_write;
-        }*/
-        // prepare for writing next frag...
-        Buffer += to_write;
-        Offset += to_write;
-        Length -= to_write;
+        Status = UDFWriteData(IrpContext, Vcb, TRUE,
+            (((uint64)Lba) << Vcb->SectorShift) + SectorOffset,
+            ToWrite, Direct, Buffer, &Written);
+        if (Written > ToWrite) return STATUS_IO_DEVICE_ERROR;
+        if (!Activate) *WrittenBytes += Written;
+        if (!NT_SUCCESS(Status)) return Status;
+        if (Written != ToWrite) return STATUS_IO_DEVICE_ERROR;
+        if (Activate) {
+activate_written_range:
+            Status = UDFMarkAllocatedAsRecorded(Vcb, Offset, (uint32)ToWrite, ExtInfo);
+            if (!NT_SUCCESS(Status)) return Status;
+            *WrittenBytes += ToWrite;
+        }
+        Buffer += ToWrite;
+        Offset += ToWrite;
+        Length -= ToWrite;
     }
-    AdPrint(("Write: ExtInfo %x, Mapping %x\n", ExtInfo, ExtInfo->Mapping));
     return STATUS_SUCCESS;
 } // end UDFWriteExtent()
 
@@ -3208,94 +2894,63 @@ UDFZeroExtent(
     OUT PSIZE_T WrittenBytes
     )
 {
-    if (!ExtInfo || !ExtInfo->Mapping)
+    uint32 Lba, SectorOffset, Flags;
+    SIZE_T Available, Count, Completed, SectorSize;
+    int64 MapOffset;
+    NTSTATUS Status;
+
+    if (WrittenBytes) *WrittenBytes = 0;
+    if (!Vcb || !ExtInfo || !ExtInfo->Mapping || !WrittenBytes || Offset < 0 ||
+        (uint64)Offset + ExtInfo->Offset > MAXLONGLONG ||
+        (uint64)Length > MAXLONGLONG - ((uint64)Offset + ExtInfo->Offset))
         return STATUS_INVALID_PARAMETER;
-
-    PEXTENT_MAP Extent = ExtInfo->Mapping;   // Extent array
-    uint32 Lba, sect_offs, flags;
-    NTSTATUS status;
-    SIZE_T to_write, _WrittenBytes;
-    SIZE_T LBS = Vcb->SectorSize;
-
-    AdPrint(("Zero ExtInfo %x, Mapping %x\n", ExtInfo, ExtInfo->Mapping));
-
-    Offset += ExtInfo->Offset;               // used for in-ICB data
-    // fill/deallocate maximal possible part of each frag of extent
-    while(((LONG)Length) > 0) {
-        Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_write, &flags, NULL);
-        // EOF check
-        if (Lba == LBA_OUT_OF_EXTENT) {
+    MapOffset = Offset + ExtInfo->Offset;
+    SectorSize = Vcb->SectorSize;
+    while (Length) {
+        Lba = UDFExtentOffsetToLba(Vcb, ExtInfo->Mapping, MapOffset,
+                                  &SectorOffset, &Available, &Flags, NULL);
+        if (Lba == LBA_OUT_OF_EXTENT)
             return STATUS_END_OF_FILE;
-        }
-        // check for writing tail
-        to_write = min(to_write, Length);
-
-        if (flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
-            // here we should do nothing
-            *WrittenBytes += to_write;
-        } else
-        if (flags == EXTENT_NOT_RECORDED_ALLOCATED) {
-            // we should just deallocate this frag
-            if (Deallocate) {
-                if (!NT_SUCCESS(status = UDFMarkAllocatedAsNotAllocated(Vcb, Offset, to_write, ExtInfo)))
-                    return status;
+        if (!Available || Flags > EXTENT_NOT_RECORDED_NOT_ALLOCATED)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Count = min(Available, Length);
+        if (Flags == EXTENT_NOT_RECORDED_NOT_ALLOCATED) {
+            /* A hole is already zero and owns no sectors to release. */
+        } else if (SectorOffset || Count < SectorSize) {
+            Count = min(Count, SectorSize - SectorOffset);
+            if (Flags == EXTENT_RECORDED_ALLOCATED) {
+                Completed = 0;
+                Status = UDFWriteData(IrpContext, Vcb, TRUE,
+                    (((uint64)Lba) << Vcb->SectorShift) + SectorOffset,
+                    Count, Direct, Vcb->ZBuffer, &Completed);
+                if (Completed > Count)
+                    return STATUS_IO_DEVICE_ERROR;
+                *WrittenBytes += Completed;
+                if (!NT_SUCCESS(Status))
+                    return Status;
+                if (Completed != Count)
+                    return STATUS_IO_DEVICE_ERROR;
+                MapOffset += Count;
+                Length -= Count;
+                continue;
             }
-            Extent = ExtInfo->Mapping;
-            *WrittenBytes += to_write;
+            /* An unrecorded partial sector already reads as zero. Do not
+             * deallocate neighboring bytes outside the requested window. */
         } else {
-            // fill tail of the 1st Block with ZEROs
-            if (sect_offs) {
-                status = UDFWriteData(IrpContext, Vcb, TRUE, ( ((uint64)Lba) << Vcb->SectorShift) + sect_offs,
-                                      min(to_write, LBS-sect_offs),
-                                      Direct, Vcb->ZBuffer, &_WrittenBytes);
-                *WrittenBytes += _WrittenBytes;
-                if (!NT_SUCCESS(status))
-                    return status;
-                Offset += _WrittenBytes;
-                Length -= _WrittenBytes;
-                to_write -= _WrittenBytes;
-                Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_write, &flags, NULL);
-                ASSERT(flags != EXTENT_NOT_RECORDED_NOT_ALLOCATED);
-                ASSERT(flags != EXTENT_NOT_RECORDED_ALLOCATED);
-                ASSERT(!sect_offs);
-            }
-            // deallocate Blocks
-            if (to_write >= LBS) {
-                // use 'sect_offs' as length of extent to be deallocated
-                sect_offs = to_write & ~(LBS - 1);
-                if (Deallocate) {
-                    status = UDFMarkAllocatedAsNotAllocated(Vcb, Offset, sect_offs, ExtInfo);
-                } else {
-                    status = UDFMarkRecordedAsAllocated(Vcb, Offset, sect_offs, ExtInfo);
-                }
-                if (!NT_SUCCESS(status))
-                    return status;
-                // reload extent mapping
-                Extent = ExtInfo->Mapping;
-                Offset += sect_offs;
-                Length -= sect_offs;
-                *WrittenBytes += sect_offs;
-                to_write -= sect_offs;
-                Lba = UDFExtentOffsetToLba(Vcb, Extent, Offset, &sect_offs, &to_write, &flags, NULL);
-                ASSERT(flags != EXTENT_NOT_RECORDED_NOT_ALLOCATED);
-                ASSERT(flags != EXTENT_NOT_RECORDED_ALLOCATED);
-                ASSERT(!sect_offs);
-            }
-            // fill beginning of the last Block with ZEROs
-            if (to_write) {
-                status = UDFWriteData(IrpContext, Vcb, TRUE, ( ((uint64)Lba) << Vcb->SectorShift), to_write, Direct, Vcb->ZBuffer, &_WrittenBytes);
-                *WrittenBytes += _WrittenBytes;
-                if (!NT_SUCCESS(status))
-                    return status;
-                ASSERT(to_write == _WrittenBytes);
+            Count &= ~(SectorSize - 1);
+            if (Deallocate || Flags == EXTENT_RECORDED_ALLOCATED) {
+                Status = UDFMarkAllocatedAsNotXXX(Vcb, MapOffset,
+                                                  (uint32)Count, ExtInfo, Deallocate);
+                if (!NT_SUCCESS(Status))
+                    return Status;
             }
         }
-        AdPrint(("Zero... ExtInfo %x, Mapping %x\n", ExtInfo, ExtInfo->Mapping));
-        // prepare for filling next frag...
-        Offset += to_write;
-        Length -= to_write;
+        *WrittenBytes += Count;
+        MapOffset += Count;
+        Length -= Count;
+        /* Reload after each mutation; never replace the requested remainder
+         * with all bytes available in the next mapping fragment. */
     }
-    AdPrint(("Zero: ExtInfo %x, Mapping %x\n", ExtInfo, ExtInfo->Mapping));
     return STATUS_SUCCESS;
 } // end UDFZeroExtent()
 //#endif //0

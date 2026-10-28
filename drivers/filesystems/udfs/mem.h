@@ -14,7 +14,17 @@
     }
 
 #define MY_HEAP_ALIGN             63
-#define MyAlignSize__(size) (((size)+MY_HEAP_ALIGN)&(~MY_HEAP_ALIGN))
+
+/* The debug allocator also accepts only ULONG bytes. Check the original
+ * wide size before aligning or narrowing it; a wrapped request must not
+ * become a small successful pool allocation. */
+static __inline ULONG MyCheckedAlignSize__(ULONGLONG Size)
+{
+    if (!Size || Size > MAXULONG - MY_HEAP_ALIGN)
+        return 0;
+    return (ULONG)((Size + MY_HEAP_ALIGN) & ~((ULONGLONG)MY_HEAP_ALIGN));
+}
+#define MyAlignSize__(size) MyCheckedAlignSize__((ULONGLONG)(size))
 
 #define PAGE_SIZE_ALIGN             (PAGE_SIZE - 1)
 #define AlignToPageSize(size) (((size)+PAGE_SIZE_ALIGN)&(~PAGE_SIZE_ALIGN))
@@ -22,12 +32,29 @@
 static inline BOOLEAN MyAllocInit(VOID) {return TRUE;}
 #define MyAllocRelease()
 
+static __inline PVOID MyAllocateSizedPool__(ULONGLONG Size, ULONG Tag
 #ifdef TRACK_SYS_ALLOC_CALLERS
-  #define MyAllocatePool__(type,size) DebugAllocatePool(NonPagedPool,MyAlignSize__(size), UDF_BUG_CHECK_ID, __LINE__)
-  #define MyAllocatePoolTag__(type,size,tag) DebugAllocatePool(NonPagedPool,MyAlignSize__(size), UDF_BUG_CHECK_ID, __LINE__)
+    , ULONG Source, ULONG Line
+#endif
+    )
+{
+    ULONG Aligned = MyCheckedAlignSize__(Size);
+    if (!Aligned)
+        return NULL;
+#ifdef TRACK_SYS_ALLOC_CALLERS
+    (void)Tag;
+    return DebugAllocatePool(NonPagedPool, Aligned, Source, Line);
+#else
+    return DbgAllocatePoolWithTag(NonPagedPool, Aligned, Tag);
+#endif
+}
+
+#ifdef TRACK_SYS_ALLOC_CALLERS
+  #define MyAllocatePool__(type,size) MyAllocateSizedPool__((ULONGLONG)(size), 'fNWD', UDF_BUG_CHECK_ID, __LINE__)
+  #define MyAllocatePoolTag__(type,size,tag) MyAllocateSizedPool__((ULONGLONG)(size), tag, UDF_BUG_CHECK_ID, __LINE__)
 #else //TRACK_SYS_ALLOC_CALLERS
-  #define MyAllocatePool__(type,size) DbgAllocatePoolWithTag(NonPagedPool,MyAlignSize__(size), 'fNWD')
-  #define MyAllocatePoolTag__(type,size,tag) DbgAllocatePoolWithTag(NonPagedPool,MyAlignSize__(size), tag)
+  #define MyAllocatePool__(type,size) MyAllocateSizedPool__((ULONGLONG)(size), 'fNWD')
+  #define MyAllocatePoolTag__(type,size,tag) MyAllocateSizedPool__((ULONGLONG)(size), tag)
 #endif //TRACK_SYS_ALLOC_CALLERS
 #define MyFreePool__(addr) DbgFreePool((PCHAR)(addr))
 
@@ -37,37 +64,38 @@ static inline BOOLEAN MyAllocInit(VOID) {return TRUE;}
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
 #endif
 
-static __inline ULONG MyReallocPool__(PCHAR addr, ULONG len, PCHAR *pnewaddr, ULONG newlen) {
-    ULONG _len, _newlen;
-    _newlen = MyAlignSize__(newlen);
-    _len = MyAlignSize__(len);
-    PCHAR newaddr;
+/* Preserve the old owner and the output pointer on every failure. Zero
+ * growth in the same alignment bucket too, not only after moving it. */
+static __inline ULONG MyReallocPool__(PCHAR addr, ULONGLONG len,
+                                      PCHAR *pnewaddr, ULONGLONG newlen)
+{
+    ULONG OldAligned, NewAligned;
+    PCHAR NewAddress;
 
-    ASSERT(len && newlen);
-
-    if (_newlen != _len) {
+    if (!pnewaddr)
+        return 0;
+    *pnewaddr = addr;
+    OldAligned = MyCheckedAlignSize__(len);
+    NewAligned = MyCheckedAlignSize__(newlen);
+    if (!addr || !OldAligned || !NewAligned)
+        return 0;
+    if (OldAligned != NewAligned) {
 #ifdef TRACK_SYS_ALLOC_CALLERS
-        newaddr = (PCHAR)DebugAllocatePool(NonPagedPool,_newlen, 0x202, __LINE__);
-#else //TRACK_SYS_ALLOC_CALLERS
-        newaddr = (PCHAR)MyAllocatePool__(NonPagedPool,_newlen);
-#endif //TRACK_SYS_ALLOC_CALLERS
-        if (!newaddr) {
-            __debugbreak();
-            *pnewaddr = addr;
+        NewAddress = (PCHAR)MyAllocateSizedPool__(newlen, 'fNWD', 0x202, __LINE__);
+#else
+        NewAddress = (PCHAR)MyAllocateSizedPool__(newlen, 'fNWD');
+#endif
+        if (!NewAddress)
             return 0;
-        }
-        *pnewaddr = newaddr;
-        if (_newlen <= _len) {
-            RtlCopyMemory(newaddr, addr, newlen);
-        } else {
-            RtlCopyMemory(newaddr, addr, len);
-            RtlZeroMemory(newaddr+len, _newlen - len);
-        }
+        RtlCopyMemory(NewAddress, addr, (SIZE_T)min(len, newlen));
+        if (newlen > len)
+            RtlZeroMemory(NewAddress + (SIZE_T)len, NewAligned - (SIZE_T)len);
+        *pnewaddr = NewAddress;
         MyFreePool__(addr);
-    } else {
-        *pnewaddr = addr;
+    } else if (newlen > len) {
+        RtlZeroMemory(addr + (SIZE_T)len, (SIZE_T)(newlen - len));
     }
-    return newlen;
+    return (ULONG)newlen;
 }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop

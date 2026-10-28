@@ -62,6 +62,8 @@ UDFCommonRead(
     ULONG ReadByteCount;
     ULONG NumberBytesRead = 0;
     LONGLONG FileSize;
+    LONGLONG ValidDataLength = 0;
+    ULONG ValidReadBytes = 0;
     TYPE_OF_OPEN TypeOfOpen;
     PFCB                    Fcb = NULL;
     PCCB                    Ccb = NULL;
@@ -128,49 +130,29 @@ UDFCommonRead(
     // Must be before ASSERT_CCB — bitmap stream has no Ccb.
 
     if (TypeOfOpen == StreamFileOpen && PagingIo && Fcb == Vcb->BitmapFcb) {
-
+        PVOID BitmapBuffer = NULL;
+        ULONG BitmapBytesRead = 0;
         StartingOffset = IrpSp->Parameters.Read.ByteOffset.QuadPart;
         ByteCount = IrpSp->Parameters.Read.Length;
-
-        if (!Wait) {
-            UDFCompleteRequest(IrpContext, Irp, STATUS_CANT_WAIT);
-            return STATUS_CANT_WAIT;
-        }
-
-        Status = UDFLockUserBuffer(IrpContext, ByteCount, IoWriteAccess);
-        if (NT_SUCCESS(Status)) {
-            SystemBuffer = UDFMapUserBuffer(Irp);
-            if (SystemBuffer) {
-
-                LONGLONG Vbn = StartingOffset >> Vcb->SectorShift;
-                LONGLONG Psn;
-                LONGLONG SectorCount;
-
-                if (FsRtlLookupLargeMcbEntry(&Vcb->BitmapMcb, Vbn, &Psn,
-                        &SectorCount, NULL, NULL, NULL)) {
-
-                    ULONG SectorsToRead = (ULONG)min(SectorCount,
-                        (LONGLONG)((ByteCount + Vcb->SectorSize - 1) >> Vcb->SectorShift));
-
-                    Status = UDFReadSectors(IrpContext, Vcb, FALSE, (ULONG)Psn,
-                        SectorsToRead, FALSE, (PCHAR)SystemBuffer);
-                    if (NT_SUCCESS(Status)) {
-                        NumberBytesRead = ByteCount;
-                    } else {
-                        UDFPrint(("UDF BM: PagingIo READ FAILED Vbn=%I64x Psn=%I64x Sectors=%x Status=%x\n",
-                            Vbn, Psn, SectorsToRead, Status));
-                    }
-                } else {
-                    UDFPrint(("UDF BM: PagingIo MCB MISS Vbn=%I64x ByteCount=%x\n", Vbn, ByteCount));
-                    Status = STATUS_NONEXISTENT_SECTOR;
+        SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT);
+        Status = STATUS_SUCCESS;
+        if (ByteCount) {
+            Status = UDFLockUserBuffer(IrpContext, ByteCount, IoWriteAccess);
+            if (NT_SUCCESS(Status)) {
+                BitmapBuffer = UDFMapUserBuffer(Irp);
+                if (!BitmapBuffer)
+                    Status = STATUS_INVALID_USER_BUFFER;
+                else {
+                    _SEH2_TRY {
+                        Status = UDFBitmapStreamIo(IrpContext, Vcb, FALSE,
+                                     StartingOffset, ByteCount, BitmapBuffer, &BitmapBytesRead);
+                    } _SEH2_FINALLY {
+                        UDFUnlockCallersBuffer(IrpContext, Irp, BitmapBuffer);
+                    } _SEH2_END;
                 }
-                UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
-            } else {
-                Status = STATUS_INVALID_USER_BUFFER;
             }
         }
-
-        Irp->IoStatus.Information = NumberBytesRead;
+        Irp->IoStatus.Information = BitmapBytesRead;
         UDFCompleteRequest(IrpContext, Irp, Status);
         return Status;
     }
@@ -194,15 +176,14 @@ UDFCommonRead(
     StartingOffset = IrpSp->Parameters.Read.ByteOffset.QuadPart;
     ReadLength = ByteCount = IrpSp->Parameters.Read.Length;
 
-    ByteRange = StartingOffset + ByteCount;
-
-    // Watch for overflow
-
-    if ((MAXLONGLONG - StartingOffset) < ByteCount) {
+    // Validate before signed addition, including a negative offset.
+    if (StartingOffset < 0 || ByteCount > MAXLONGLONG - StartingOffset) {
 
         UDFCompleteRequest(IrpContext, Irp, STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
     }
+
+    ByteRange = StartingOffset + ByteCount;
 
     // Make sure that Dasd access is always non-cached.
 
@@ -237,6 +218,12 @@ UDFCommonRead(
                 UDFAcquireFcbExclusive(IrpContext, Fcb, FALSE);
                 FcbAcquired = TRUE;
 
+                /* Refuse an unreconciled cache-size generation before a
+                 * noncached read can trigger its preliminary cache flush. */
+                if (TypeOfOpen != UserVolumeOpen || !Ccb ||
+                    !FlagOn(Ccb->Flags, CCB_FLAG_DISMOUNT_ON_CLOSE))
+                    UDFVerifyFcbOperation(IrpContext, Fcb, Ccb);
+
                 CcFlushCache(&Fcb->FcbNonpaged->SegmentObject,
                              (PLARGE_INTEGER)&StartingOffset,
                              ReadLength,
@@ -259,7 +246,7 @@ UDFCommonRead(
 
             if (NonCachedIo) {
                 if (!UDFAcquireResourceShared(&Fcb->FcbNonpaged->FcbPagingIoResource, Wait)) {
-                    try_return(Status = STATUS_CANT_WAIT);
+                    try_return(Status = STATUS_PENDING);
                 } else {
                     PagingIoResourceAcquired = TRUE;
                 }
@@ -330,6 +317,16 @@ UDFCommonRead(
             }
         }
 
+        ExAcquireFastMutex(Fcb->Header.FastMutex);
+        ValidDataLength = Fcb->Header.ValidDataLength.QuadPart;
+        ExReleaseFastMutex(Fcb->Header.FastMutex);
+        if (ValidDataLength < 0 || ValidDataLength > FileSize)
+            try_return(Status = STATUS_FILE_CORRUPT_ERROR);
+        /* Raw volume handles, including extended DASD, have no file VDL. */
+        ValidReadBytes = TypeOfOpen == UserVolumeOpen ? ByteCount :
+            (StartingOffset >= ValidDataLength ? 0 :
+             (ULONG)min((LONGLONG)ByteCount, ValidDataLength - StartingOffset));
+
         // Handle the non-cached read first.
 
         if (NonCachedIo) {
@@ -340,7 +337,7 @@ UDFCommonRead(
                 //  (data lives inside the ICB sector, no disk extent to dispatch).
 
                 if (!Wait) {
-                    try_return(Status = STATUS_CANT_WAIT);
+                    try_return(Status = STATUS_PENDING);
                 }
 
                 Status = UDFLockUserBuffer(IrpContext, ByteCount, IoWriteAccess);
@@ -353,8 +350,11 @@ UDFCommonRead(
                     try_return(Status = STATUS_INVALID_USER_BUFFER);
                 }
 
-                Status = UDFReadFile__(IrpContext, Vcb, Fcb->FileInfo, StartingOffset, ByteCount,
-                               FALSE, (PCHAR)SystemBuffer);
+                Status = ValidReadBytes ? UDFReadFile__(IrpContext, Vcb, Fcb->FileInfo,
+                    StartingOffset, ValidReadBytes, FALSE, (PCHAR)SystemBuffer) : STATUS_SUCCESS;
+                if (ValidReadBytes < ByteCount)
+                    SafeZeroMemory((PUCHAR)SystemBuffer + ValidReadBytes,
+                                   ByteCount - ValidReadBytes);
                 if (NT_SUCCESS(Status)) {
                     NumberBytesRead = ByteCount;
                 }
@@ -368,16 +368,17 @@ UDFCommonRead(
             //  we must be able to wait, and cap to the original byte count
             //  so we don't overwrite past the caller's buffer.
 
-            ReadByteCount = (ByteCount + (Vcb->SectorSize - 1)) & ~(Vcb->SectorSize - 1);
-
-            if ((StartingOffset & (Vcb->SectorSize - 1)) ||
-                (ReadByteCount > ReadLength)) {
-
-                if (!Wait) {
-                    try_return(Status = STATUS_CANT_WAIT);
+            {
+                ULONGLONG Rounded = ((ULONGLONG)ByteCount + Vcb->SectorSize - 1) &
+                                     ~((ULONGLONG)Vcb->SectorSize - 1);
+                if ((StartingOffset & (Vcb->SectorSize - 1)) ||
+                    Rounded > ReadLength || Rounded > MAXULONG) {
+                    if (!Wait)
+                        try_return(Status = STATUS_PENDING);
+                    ReadByteCount = ByteCount;
+                } else {
+                    ReadByteCount = (ULONG)Rounded;
                 }
-
-                ReadByteCount = ByteCount;
             }
 
             Status = UDFLockUserBuffer(IrpContext, ReadByteCount, IoWriteAccess);
@@ -390,31 +391,11 @@ UDFCommonRead(
                 try_return(Status = STATUS_INVALID_USER_BUFFER);
             }
 
-            // Start by zeroing any part of the read after Valid Data
-
-            LARGE_INTEGER ValidDataLength = Fcb->Header.ValidDataLength;
-
-            if (StartingOffset + ByteCount > ValidDataLength.QuadPart) {
-
-                if (StartingOffset < ValidDataLength.QuadPart) {
-
-                    ULONG LBS = Vcb->SectorSize;
-                    ULONG ZeroingOffset = (ULONG)(((ValidDataLength.QuadPart - StartingOffset) + (LBS - 1)) & ~((ULONGLONG)LBS - 1));
-
-                    if (ByteCount > ZeroingOffset) {
-
-                        SafeZeroMemory((PUCHAR)SystemBuffer + ZeroingOffset, ByteCount - ZeroingOffset);
-                    }
-                } else {
-
-                    //  All we have to do now is sit here and zero the
-                    //  user's buffer, no reading is required.
-
-                    SafeZeroMemory(SystemBuffer, ByteCount);
-                    NumberBytesRead = ByteCount;
-                    UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
-                    try_return(STATUS_SUCCESS);
-                }
+            if (!ValidReadBytes && TypeOfOpen != UserVolumeOpen) {
+                SafeZeroMemory(SystemBuffer, ReadByteCount);
+                NumberBytesRead = ByteCount;
+                UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
+                try_return(Status = STATUS_SUCCESS);
             }
 
             Irp->IoStatus.Information = ReadByteCount;
@@ -460,6 +441,12 @@ UDFCommonRead(
                 IrpContext->IoContext->RequestedByteCount = ByteCount;
             }
 
+            if (!Wait && ValidReadBytes < ReadByteCount) {
+                IrpContext->IoContext->ZeroReadBuffer =
+                    (PUCHAR)SystemBuffer + ValidReadBytes;
+                IrpContext->IoContext->ZeroReadLength = ReadByteCount - ValidReadBytes;
+            }
+
             Status = UDFNonCachedIo(IrpContext, Fcb, StartingOffset, ReadByteCount);
 
             //
@@ -485,6 +472,13 @@ UDFCommonRead(
                 IrpContext->IoContext = NULL;
             }
 
+            /* Lower I/O overwrites the buffer, so sanitize invalid bytes
+             * after it finishes, also on failure. The async branch above
+             * transfers this same work to its completion context. */
+            if (ValidReadBytes < ReadByteCount)
+                SafeZeroMemory((PUCHAR)SystemBuffer + ValidReadBytes,
+                               ReadByteCount - ValidReadBytes);
+
             if (!NT_SUCCESS(Status)) {
 
                 NumberBytesRead = 0;
@@ -500,14 +494,7 @@ UDFCommonRead(
 
             } else {
 
-                //  Zero the tail of the buffer if the sector-aligned read
-                //  was larger than the actual byte count requested.
-
-                if (ReadByteCount != ByteCount) {
-
-                    SafeZeroMemory((PUCHAR)SystemBuffer + ByteCount, ReadByteCount - ByteCount);
-                }
-
+                /* The post-I/O VDL/padding tail is already sanitized. */
                 NumberBytesRead = ByteCount;
             }
 
@@ -568,7 +555,7 @@ UDFCommonRead(
                                 SystemBuffer,
                                 &Irp->IoStatus)) {
 
-                    try_return(Status = STATUS_CANT_WAIT);
+                    try_return(Status = STATUS_PENDING);
                 }
 
                 // If the call didn't succeed, raise the error status
@@ -619,9 +606,10 @@ try_exit:   NOTHING;
         }
     } _SEH2_END; // end of "__finally" processing
 
-    // Post the request if we got CANT_WAIT.
-
-    if (Status == STATUS_CANT_WAIT) {
+    /* A deferred read still owns its IRP. Only the submitted async path
+     * set Irp = NULL and handed completion to the lower I/O context. */
+    if (Status == STATUS_CANT_WAIT ||
+        (Status == STATUS_PENDING && Irp != NULL)) {
 
         Status = UDFFsdPostRequest(IrpContext, Irp);
 

@@ -123,6 +123,8 @@ UDFDrainNewFileData(PIRP_CONTEXT IrpContext, PVCB Vcb,
     if (!FileInfo || !(dloc = FileInfo->Dloc) ||
         !(dloc->FE_Flags & UDF_FE_FLAG_CACHED_DATA_PENDING))
         return STATUS_SUCCESS;
+    if (!NT_SUCCESS(dloc->ZeroDataError) && !UDFIsZeroDataRetry(dloc))
+        return dloc->ZeroDataError;
     fcb = dloc->CommonFcb;
     if (!fcb || !fcb->FileInfo || fcb->FileInfo->Dloc != dloc ||
         !fcb->FcbNonpaged)

@@ -19,6 +19,23 @@
 // define the file specific bug-check id
 #define         UDF_BUG_CHECK_ID                UDF_FILE_WRITE
 
+static VOID
+UDFRetainZeroDataError(PIRP_CONTEXT IrpContext, PFCB Fcb,
+    PFILE_OBJECT FileObject, LONGLONG Start, LONGLONG End,
+    NTSTATUS Status, UDF_DATA_REPAIR_KIND Kind);
+
+/* Cached in-place writes can share Main with paging I/O. Publish this
+ * boundary without overwriting unrelated concurrent metadata dirty bits. */
+static VOID
+UDFMarkCachedDataPending(PUDF_DATALOC_INFO Dloc)
+{
+    LONG OldFlags;
+    do {
+        OldFlags = Dloc->FE_Flags;
+    } while (InterlockedCompareExchange((PLONG)&Dloc->FE_Flags,
+                 OldFlags | UDF_FE_FLAG_CACHED_DATA_PENDING, OldFlags) != OldFlags);
+}
+
 /*************************************************************************
 *
 * Function: UDFCommonWrite()
@@ -45,7 +62,6 @@ UDFCommonWrite(
     PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
     LONGLONG StartingOffset;
     ULONG ByteCount;
-    LONGLONG ByteRange;
     ULONG TruncatedLength;
     SIZE_T                  NumberBytesWritten = 0;
     PFILE_OBJECT            FileObject = NULL;
@@ -69,9 +85,9 @@ UDFCommonWrite(
     BOOLEAN                 IsLazyWriteThread = FALSE;
     BOOLEAN                 WriteToEOF = FALSE;
     BOOLEAN                 FileSizesChanged = FALSE;
-    BOOLEAN                 RecursiveWriteThrough = FALSE;
     BOOLEAN                 ZeroBlock = FALSE;
-    BOOLEAN                 ZeroBlockDone = FALSE;
+    BOOLEAN                 GapInitialized = FALSE;
+    BOOLEAN                 CacheCopyAttempted = FALSE;
     struct UDF_IO_CONTEXT          LocalIoContext;
 
     // Examine our input parameters to determine if this is noncached and/or
@@ -102,50 +118,38 @@ UDFCommonWrite(
     // Must be before ASSERT_CCB — bitmap stream has no Ccb.
 
     if (TypeOfOpen == StreamFileOpen && PagingIo && Fcb == Vcb->BitmapFcb) {
-
-        if (!Wait) {
-            Wait = TRUE;
-            SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT);
-        }
-
+        PVOID BitmapBuffer = NULL;
+        ULONG BitmapBytesWritten = 0;
         StartingOffset = IrpSp->Parameters.Write.ByteOffset.QuadPart;
         ByteCount = IrpSp->Parameters.Write.Length;
-        ULONG NumberBytesWritten = 0;
-
-        Status = UDFLockUserBuffer(IrpContext, ByteCount, IoReadAccess);
-        if (NT_SUCCESS(Status)) {
-            PVOID SystemBuffer = UDFMapUserBuffer(Irp);
-            if (SystemBuffer) {
-
-                LONGLONG Vbn = StartingOffset >> Vcb->SectorShift;
-                LONGLONG Psn;
-                LONGLONG SectorCount;
-
-                if (FsRtlLookupLargeMcbEntry(&Vcb->BitmapMcb, Vbn, &Psn,
-                        &SectorCount, NULL, NULL, NULL)) {
-
-                    ULONG SectorsToWrite = (ULONG)min(SectorCount,
-                        (LONGLONG)((ByteCount + Vcb->SectorSize - 1) >> Vcb->SectorShift));
-                    SIZE_T WrittenBytes;
-
-                    Status = UDFWriteSectors(IrpContext, Vcb, TRUE, (ULONG)Psn,
-                        SectorsToWrite, FALSE, (PCHAR)SystemBuffer, &WrittenBytes);
-                    NumberBytesWritten = (ULONG)WrittenBytes;
-                    if (!NT_SUCCESS(Status)) {
-                        UDFPrint(("UDF BM: PagingIo WRITE FAILED Vbn=%I64x Psn=%I64x Sectors=%x Status=%x\n",
-                            Vbn, Psn, SectorsToWrite, Status));
+        SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT);
+        Status = STATUS_SUCCESS;
+        _SEH2_TRY {
+            if (ByteCount) {
+                Status = UDFLockUserBuffer(IrpContext, ByteCount, IoReadAccess);
+                if (NT_SUCCESS(Status)) {
+                    BitmapBuffer = UDFMapUserBuffer(Irp);
+                    if (!BitmapBuffer)
+                        Status = STATUS_INVALID_USER_BUFFER;
+                    else {
+                        _SEH2_TRY {
+                            Status = UDFBitmapStreamIo(IrpContext, Vcb, TRUE,
+                                         StartingOffset, ByteCount, BitmapBuffer, &BitmapBytesWritten);
+                        } _SEH2_FINALLY {
+                            UDFUnlockCallersBuffer(IrpContext, Irp, BitmapBuffer);
+                        } _SEH2_END;
                     }
-                } else {
-                    UDFPrint(("UDF BM: PagingIo WRITE MCB MISS Vbn=%I64x ByteCount=%x\n", Vbn, ByteCount));
-                    Status = STATUS_NONEXISTENT_SECTOR;
                 }
-                UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
-            } else {
-                Status = STATUS_INVALID_USER_BUFFER;
             }
+        } _SEH2_EXCEPT(UDFExceptionFilter(IrpContext, _SEH2_GetExceptionInformation())) {
+            Status = IrpContext->ExceptionStatus;
+        } _SEH2_END;
+        if (Status != STATUS_SUCCESS) {
+            if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+            InterlockedCompareExchange(&Vcb->BitmapIoError, Status, STATUS_SUCCESS);
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
         }
-
-        Irp->IoStatus.Information = NumberBytesWritten;
+        Irp->IoStatus.Information = BitmapBytesWritten;
         UDFCompleteRequest(IrpContext, Irp, Status);
         return Status;
     }
@@ -191,17 +195,14 @@ UDFCommonWrite(
 
     StartingOffset = IrpSp->Parameters.Write.ByteOffset.QuadPart;
     ByteCount = IrpSp->Parameters.Write.Length;
-    ByteRange = StartingOffset + ByteCount;
-
     Irp->IoStatus.Information = 0;
+    WriteToEOF = (StartingOffset == -1);
 
-    // Check if writing to end of file (FILE_WRITE_TO_END_OF_FILE = -1)
-
-    BOOLEAN WriteToEof = (StartingOffset < 0);
-
-    // Validate file offset - overflow check only for normal offsets
-
-    if (((MAXLONGLONG - StartingOffset) < ByteCount) && !WriteToEof) {
+    /* Validate before signed addition; only the append sentinel is legal.
+     * Paging and raw-volume I/O never append or extend through that sentinel. */
+    if ((StartingOffset < 0 && !WriteToEOF) ||
+        (WriteToEOF && (PagingIo || TypeOfOpen == UserVolumeOpen)) ||
+        (!WriteToEOF && ByteCount > MAXLONGLONG - StartingOffset)) {
 
         UDFCompleteRequest(IrpContext, Irp, STATUS_INVALID_PARAMETER);
         return STATUS_INVALID_PARAMETER;
@@ -361,34 +362,23 @@ UDFCommonWrite(
 
             MainResourceAcquired = TRUE;
 
-            // Flush and then attempt to purge the cache
-            if ((StartingOffset + TruncatedLength) > Fcb->Header.FileSize.QuadPart) {
-                NumberBytesWritten = TruncatedLength;
-            } else {
-                NumberBytesWritten = (ULONG)(Fcb->Header.FileSize.QuadPart - StartingOffset);
-            }
-
-            CcFlushCache(&Fcb->FcbNonpaged->SegmentObject,
-                         WriteToEof ? &Fcb->Header.FileSize : (PLARGE_INTEGER)&StartingOffset,
-                         NumberBytesWritten,
-                         &Irp->IoStatus);
-
-            // If the flush failed, return error to the caller
-            if (!NT_SUCCESS(Status = Irp->IoStatus.Status)) {
-                NumberBytesWritten = 0;
-                try_return(Status);
-            }
-
-            // Attempt the purge
-            BOOLEAN SuccessfulPurge = CcPurgeCacheSection(&Fcb->FcbNonpaged->SegmentObject,
-                                                          (PLARGE_INTEGER)&StartingOffset,
-                                                          NumberBytesWritten,
-                                                          FALSE);
-            NumberBytesWritten = 0;
-
-            // We are finished with our flushing and purging
-            if (!SuccessfulPurge) {
-                try_return(Status = STATUS_PURGE_FAILED);            
+            /* Flush only the old overlapping cache range. A scratch flush
+             * length is not completed user data, even if Cc raises before
+             * its return; keep NumberBytesWritten zero until actual I/O. */
+            ULONG FlushLength = StartingOffset < Fcb->Header.FileSize.QuadPart ?
+                (ULONG)min((LONGLONG)TruncatedLength,
+                           Fcb->Header.FileSize.QuadPart - StartingOffset) : 0;
+            if (FlushLength) {
+                IO_STATUS_BLOCK FlushStatus;
+                FlushStatus.Status = STATUS_SUCCESS;
+                FlushStatus.Information = 0;
+                CcFlushCache(&Fcb->FcbNonpaged->SegmentObject,
+                             (PLARGE_INTEGER)&StartingOffset, FlushLength, &FlushStatus);
+                Status = FlushStatus.Status;
+                if (Status != STATUS_SUCCESS) try_return(Status);
+                if (!CcPurgeCacheSection(&Fcb->FcbNonpaged->SegmentObject,
+                                        (PLARGE_INTEGER)&StartingOffset, FlushLength, FALSE))
+                    try_return(Status = STATUS_PURGE_FAILED);
             }
         }
 
@@ -456,6 +446,45 @@ UDFCommonWrite(
             UDFVerifyFcbOperation(IrpContext, Fcb, Ccb);
         }
 
+        ExAcquireFastMutex(Fcb->Header.FastMutex);
+        OldVDL = Fcb->Header.ValidDataLength.QuadPart;
+        ExReleaseFastMutex(Fcb->Header.FastMutex);
+
+        /* Serialize every VDL/EOF extension before evaluating its gap.
+         * Do not upgrade a held shared resource: drop our own acquisition,
+         * take exclusive, and then re-read append/VDL/EOF coordinates. */
+        if (!PagingIo && (WriteToEOF ||
+            StartingOffset + TruncatedLength > OldVDL) &&
+            !ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource)) {
+            if (ExIsResourceAcquiredSharedLite(&Fcb->FcbNonpaged->FcbResource) > 1)
+                try_return(Status = STATUS_DEVICE_BUSY); /* borrowed shared owner */
+            UDFReleaseFcb(IrpContext, Fcb);
+            MainResourceAcquired = FALSE;
+            if (!UDFAcquireFcbExclusive(IrpContext, Fcb, !Wait))
+                try_return(Status = STATUS_PENDING);
+            MainResourceAcquired = TRUE;
+        }
+        if (WriteToEOF)
+            StartingOffset = Fcb->Header.FileSize.QuadPart;
+        if (StartingOffset < 0 || TruncatedLength > MAXLONGLONG - StartingOffset)
+            try_return(Status = STATUS_INVALID_PARAMETER);
+
+        if (Fcb->FileInfo && Fcb->FileInfo->Dloc &&
+            !NT_SUCCESS(Fcb->FileInfo->Dloc->ZeroDataError) &&
+            !UDFIsZeroDataRetry(Fcb->FileInfo->Dloc))
+            try_return(Status = Fcb->FileInfo->Dloc->ZeroDataError);
+
+        /* Paging gap initialization uses the direct FS writer below.
+         * Never call Cache Manager zeroing from inside its paging write. */
+
+        /* Reject before resize/OPEN when cached gap zeroing would overwrite
+         * a live mapped generation. The helper repeats this guard for cleanup
+         * and section initialization; Main exclusive protects this decision. */
+        if (!PagingIo && StartingOffset > OldVDL &&
+            Fcb->FcbNonpaged->SegmentObject.SharedCacheMap &&
+            !MmCanFileBeTruncated(&Fcb->FcbNonpaged->SegmentObject, &UdfData.UDFLargeZero))
+            try_return(Status = STATUS_USER_MAPPED_FILE);
+
         /* Recorded-file and cached writes can bypass UDFWriteData entirely.
          * Persist OPEN LVID before accepting either route. */
         if (!Wait && (!Vcb->Modified ||
@@ -469,14 +498,15 @@ UDFCommonWrite(
         //
         //  Rule 1: PagingIo is never allowed to extend file size.
         //
-        //  Rule 2: Only the top level requestor may extend Valid
-        //          Data Length.  This may be paging IO, as when a
-        //          a user maps a file, but will never be as a result
-        //          of cache lazy writer writes since they are not the
-        //          top level request.
+        //  Rule 2: Publish VDL only for completed, initialized bytes.
+        //          A real mapped or synchronous paging write can supply
+        //          those bytes. Lazy writes persist an already admitted
+        //          cache generation and do not invent a new valid range.
         //
-        //  Rule 3: If, using Rules 1 and 2, we decide we must extend
-        //          file size or valid data, we take the Fcb exclusive.
+        //  Rule 3: Ordinary EOF/VDL extension takes MainResource exclusive.
+        //          An actual mapped writer keeps the callback's main lock
+        //          and serializes gap/extent changes with PagingIoResource.
+        //          Header VDL publication uses its FastMutex.
 
         // Check whether the current request will extend the file size,
         // or the valid data length (if the FSD supports the concept of a
@@ -487,12 +517,13 @@ UDFCommonWrite(
         // inform the Cache Manager about the new size) to ensure that the write
         // will subsequently not fail due to lack of disk space.
 
+        ExAcquireFastMutex(Fcb->Header.FastMutex);
         OldVDL = Fcb->Header.ValidDataLength.QuadPart;
+        ExReleaseFastMutex(Fcb->Header.FastMutex);
         ZeroBlock = (StartingOffset > OldVDL);
+        GapInitialized = !ZeroBlock;
 
-        if (!PagingIo &&
-            !RecursiveWriteThrough &&
-            !IsLazyWriteThread) {
+        if (!PagingIo && !IsLazyWriteThread) {
 
             BOOLEAN ExtendFS;
 
@@ -505,6 +536,17 @@ UDFCommonWrite(
                     try_return(Status = STATUS_PENDING);
 //                CanWait = TRUE;
 
+                /* Inline promotion must copy the current cached payload.
+                 * Drain it before Paging: Cc may issue a recursive write. */
+                if (ExtendFS && Fcb->FileInfo->Dloc->DataLoc.Offset) {
+                    if (Fcb->FileInfo->Dloc->FileEntryLen > Vcb->SectorSize)
+                        try_return(Status = STATUS_FILE_CORRUPT_ERROR);
+                    if ((uint64)(StartingOffset + TruncatedLength) >
+                        Vcb->SectorSize - Fcb->FileInfo->Dloc->FileEntryLen) {
+                        Status = UDFDrainNewFileData(IrpContext, Vcb, Fcb->FileInfo);
+                        if (!NT_SUCCESS(Status)) try_return(Status);
+                    }
+                }
                 UDFAcquirePagingIoExclusive(IrpContext, Fcb);
                 PagingIoResourceAcquired = TRUE;
 
@@ -515,6 +557,8 @@ UDFCommonWrite(
                         try_return(Status);
                     }
                     FileSizesChanged = TRUE;
+                    Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_MODIFIED;
+                    SetFlag(FileObject->Flags, FO_FILE_SIZE_CHANGED);
                     // ... and inform the Cache Manager about it
 
                     Fcb->Header.FileSize.QuadPart = StartingOffset + TruncatedLength;
@@ -531,29 +575,23 @@ UDFCommonWrite(
                 if (CcIsFileCached(FileObject)) {
                     if (ExtendFS) {
                         MmPrint(("    CcSetFileSizes()\n"));
-                        CcSetFileSizes(FileObject, (PCC_FILE_SIZES)&Fcb->Header.AllocationSize);
-                        Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_MODIFIED;
-                    }
-                    // Attempt to Zero newly added fragment
-                    // and ignore the return code
-                    // This should be done to inform cache manager
-                    // that given extent has no cached data
-                    // (Otherwise, CM sometimes thinks that it has)
-                    if (ZeroBlock) {
-                        Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_MODIFIED;
-                        ThPrint(("    UDFZeroDataEx(1)\n"));
-                        UDFZeroData(Vcb,
-                                    FileObject,
-                                    OldVDL,
-                                    StartingOffset - OldVDL,
-                                    Wait);
-#ifdef UDF_DBG
-                        ZeroBlockDone = TRUE;
-#endif //UDF_DBG
+                        _SEH2_TRY {
+                            CcSetFileSizes(FileObject, (PCC_FILE_SIZES)&Fcb->Header.AllocationSize);
+                        } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                                      EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                            Status = _SEH2_GetExceptionCode();
+                        } _SEH2_END;
+                        if (Status != STATUS_SUCCESS) {
+                            /* No payload from this request was admitted.
+                             * Its initialized allocation/invalid tail stays
+                             * owned until the explicit zero/size repair. */
+                            UDFRetainZeroDataError(IrpContext, Fcb, FileObject,
+                                OldVDL, Fcb->Header.FileSize.QuadPart, Status, UdfDataRepairZeroRange);
+                            try_return(Status);
+                        }
                     }
                 }
             }
-
         }
 
         // Branch here for cached vs non-cached I/O
@@ -568,24 +606,34 @@ UDFCommonWrite(
                 // This is the first cached I/O operation. You must ensure
                 // that the FCB Header contains valid sizes at this time
 
-                CcInitializeCacheMap(FileObject,
-                                     (PCC_FILE_SIZES)&Fcb->Header.AllocationSize,
-                                     FALSE,
-                                     &UdfData.CacheMgrCallBacks,
-                                     Fcb);
-
-                CcSetReadAheadGranularity(FileObject, READ_AHEAD_GRANULARITY);
+                BOOLEAN Initialized = FALSE;
+                _SEH2_TRY {
+                    CcInitializeCacheMap(FileObject,
+                                         (PCC_FILE_SIZES)&Fcb->Header.AllocationSize,
+                                         FALSE, &UdfData.CacheMgrCallBacks, Fcb);
+                    Initialized = TRUE;
+                    CcSetReadAheadGranularity(FileObject, READ_AHEAD_GRANULARITY);
+                } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                              EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                    Status = _SEH2_GetExceptionCode();
+                } _SEH2_END;
+                if (Status != STATUS_SUCCESS) {
+                    if (FileSizesChanged && !Initialized)
+                        UDFRetainZeroDataError(IrpContext, Fcb, FileObject, OldVDL,
+                            Fcb->Header.FileSize.QuadPart, Status, UdfDataRepairNoReplay);
+                    try_return(Status);
+                }
             }
 
-            if (ZeroBlock && !ZeroBlockDone) {
-                ThPrint(("    UDFZeroDataEx(2)\n"));
-                UDFZeroData(Vcb,
-                            FileObject,
-                            OldVDL,
-                            StartingOffset - OldVDL,
-                            Wait);
-                if (StartingOffset & (PAGE_SIZE-1)) {
+            if (ZeroBlock) {
+                Status = UDFZeroData(IrpContext, Fcb, FileObject, OldVDL,
+                                     StartingOffset - OldVDL, Wait, FALSE);
+                if (Status != STATUS_SUCCESS) {
+                    if (!Wait && Status == STATUS_DEVICE_BUSY)
+                        Status = STATUS_PENDING;
+                    try_return(Status);
                 }
+                GapInitialized = TRUE;
             }
 
             // Write to the cache if this is not an Mdl read.
@@ -595,26 +643,28 @@ UDFCommonWrite(
                 // Get hold of the user's buffer.
 
                 SystemBuffer = UDFMapUserBuffer(Irp);
-
+                if (!SystemBuffer) try_return(Status = STATUS_INVALID_USER_BUFFER);
                 Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_MODIFIED;
-
-                if (!CcCopyWrite(FileObject,
-                                 (PLARGE_INTEGER)&StartingOffset,
-                                 TruncatedLength,
-                                 Wait,
-                                 SystemBuffer)) {
-
-                    // The caller was not prepared to block and data is not immediately
-                    // available in the system cache
-                    // Mark Irp Pending ...
-                    try_return(Status = STATUS_PENDING);
-                }
-
+                /* The payload can become dirty or synchronously page out
+                 * inside CcCopyWrite. Establish its drain boundary first. */
+                UDFMarkCachedDataPending(Fcb->FileInfo->Dloc);
+                CacheCopyAttempted = TRUE;
+                _SEH2_TRY {
+                    Status = CcCopyWrite(FileObject, (PLARGE_INTEGER)&StartingOffset,
+                                         TruncatedLength, Wait, SystemBuffer) ?
+                             STATUS_SUCCESS : STATUS_PENDING;
+                } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                              EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                    Status = _SEH2_GetExceptionCode();
+                } _SEH2_END;
                 UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
-                // We have the data
-                Status = STATUS_SUCCESS;
+                if (Status != STATUS_SUCCESS) {
+                    if (Status != STATUS_PENDING)
+                        UDFRetainZeroDataError(IrpContext, Fcb, FileObject, StartingOffset,
+                            StartingOffset + TruncatedLength, Status, UdfDataRepairNoReplay);
+                    try_return(Status);
+                }
                 NumberBytesWritten = TruncatedLength;
-
                 try_return(Status);
 
                 // Otherwise perform the MdlRead operation.
@@ -636,30 +686,10 @@ UDFCommonWrite(
 
             MmPrint(("    Write NonCachedIo\n"));
 
-            // We needn't call CcZeroData here (like in Fat driver)
-            // 'cause we've already done it above
-            // (see call to UDFZeroDataEx() )
-            if (!RecursiveWriteThrough &&
-                !IsLazyWriteThread &&
-                (OldVDL < StartingOffset)) {
-#ifdef UDF_DBG
-                    ASSERT(!ZeroBlockDone);
-#endif //UDF_DBG
-                    UDFZeroData(Vcb,
-                                FileObject,
-                                OldVDL,
-                                StartingOffset - OldVDL,
-                                Wait);
-            }
-            if (OldVDL < (StartingOffset + TruncatedLength)) {
-                Fcb->Header.ValidDataLength.QuadPart = StartingOffset + TruncatedLength;
-            }
-
-            // Send the request to lower level drivers
-            if (!Wait) {
-
+            /* No VDL change before the payload completes. A posted request
+             * has written no payload, and must not expose its gap as valid. */
+            if (!Wait)
                 try_return(Status = STATUS_PENDING);
-            }
 
             // Lock the callers buffer
 
@@ -673,6 +703,18 @@ UDFCommonWrite(
             }
             Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_MODIFIED;
 
+            /* Cache zeroing can issue recursive paging I/O. Keep it
+             * outside this request's PagingIoResource acquisition. */
+            if (!PagingIo && !IsLazyWriteThread && ZeroBlock) {
+                Status = UDFZeroData(IrpContext, Fcb, FileObject, OldVDL,
+                                     StartingOffset - OldVDL, TRUE, FALSE);
+                if (Status != STATUS_SUCCESS) {
+                    UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
+                    try_return(Status);
+                }
+                GapInitialized = TRUE;
+            }
+
             // Acquire PagingIoResource exclusive to serialize with
             // UDFMarkAllocatedAsRecorded which may free and replace
             // ExtInfo->Mapping during NOT_RECORDED -> RECORDED conversion.
@@ -682,6 +724,33 @@ UDFCommonWrite(
             if (!PagingIoResourceAcquired) {
                 UDFAcquirePagingIoExclusive(IrpContext, Fcb);
                 PagingIoResourceAcquired = TRUE;
+            }
+
+            if (Fcb->FileInfo && Fcb->FileInfo->Dloc &&
+                !NT_SUCCESS(Fcb->FileInfo->Dloc->ZeroDataError) &&
+                !UDFIsZeroDataRetry(Fcb->FileInfo->Dloc)) {
+                Status = Fcb->FileInfo->Dloc->ZeroDataError;
+                UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
+                try_return(Status);
+            }
+
+            if (PagingIo && !IsLazyWriteThread) {
+                /* Paging writers share MainResource, so re-read VDL only
+                 * after serializing extent and initialization changes. */
+                ExAcquireFastMutex(Fcb->Header.FastMutex);
+                OldVDL = Fcb->Header.ValidDataLength.QuadPart;
+                ExReleaseFastMutex(Fcb->Header.FastMutex);
+                ZeroBlock = StartingOffset > OldVDL;
+                GapInitialized = !ZeroBlock;
+                if (ZeroBlock) {
+                    Status = UDFZeroData(IrpContext, Fcb, FileObject, OldVDL,
+                        StartingOffset - OldVDL, TRUE, PagingIo);
+                    if (Status != STATUS_SUCCESS) {
+                        UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
+                        try_return(Status);
+                    }
+                    GapInitialized = TRUE;
+                }
             }
 
             if (Fcb->FcbState & UDF_FCB_EMBEDDED_DATA) {
@@ -711,6 +780,10 @@ UDFCommonWrite(
                 NumberBytesWritten = (ULONG)Irp->IoStatus.Information;
             }
 
+            if (Status == STATUS_SUCCESS && NumberBytesWritten != TruncatedLength) {
+                Status = STATUS_IO_DEVICE_ERROR;
+                NumberBytesWritten = 0;
+            }
             UDFUnlockCallersBuffer(IrpContext, Irp, SystemBuffer);
 
             ASize = UDFGetFileAllocationSize(Vcb, Fcb->FileInfo);
@@ -722,68 +795,84 @@ UDFCommonWrite(
 try_exit:   NOTHING;
 
     } _SEH2_FINALLY {
+        BOOLEAN BodyAbnormal = _SEH2_AbnormalTermination();
+        BOOLEAN NotifySizes = FileSizesChanged;
+        _SEH2_TRY {
+        _SEH2_TRY {
+            if (BodyAbnormal && NT_SUCCESS(Status)) Status = STATUS_UNSUCCESSFUL;
+            if (Status != STATUS_SUCCESS && Status != STATUS_PENDING &&
+                Fcb->FileInfo && UDFIsZeroDataRetry(Fcb->FileInfo->Dloc))
+                InterlockedCompareExchange(&Fcb->FileInfo->Dloc->ZeroDataLastError,
+                    NT_SUCCESS(Status) ? STATUS_IO_DEVICE_ERROR : Status, STATUS_SUCCESS);
 
-        if (Irp != NULL) {
-            Irp->IoStatus.Information = NumberBytesWritten;
-            Irp->IoStatus.Status = Status;
-        }
-
-        if (NT_SUCCESS(Status) && !AbnormalTermination()) {
-
-            // For synchronous I/O, the FSD must maintain the current byte offset
-            // Do not do this however, if I/O is marked as paging-io
-
-            if (SynchronousIo && !PagingIo && NT_SUCCESS(Status)) {
-                FileObject->CurrentByteOffset.QuadPart = StartingOffset + NumberBytesWritten;
-            }
-
-            // If the write completed successfully and this was not a paging-io
-            // operation, set a flag in the CCB that indicates that a write was
-            // performed and that the file time should be updated at cleanup
-
-            if (NT_SUCCESS(Status) && !PagingIo) {
-
-                // If the file size was changed, set a flag in the FCB indicating that
-                // this occurred.
-                SetFlag(FileObject->Flags, FO_FILE_MODIFIED);
-
-                if (FileSizesChanged) {
-
-                    SetFlag(FileObject->Flags, FO_FILE_SIZE_CHANGED);
+            if (Status == STATUS_SUCCESS && NumberBytesWritten && !BodyAbnormal) {
+                if (SynchronousIo && !PagingIo)
+                    FileObject->CurrentByteOffset.QuadPart = StartingOffset + NumberBytesWritten;
+                if (!PagingIo) {
+                    SetFlag(FileObject->Flags, FO_FILE_MODIFIED);
+                    if (FileSizesChanged) SetFlag(FileObject->Flags, FO_FILE_SIZE_CHANGED);
                 }
-
-                // Update ValidDataLength
-                if (!IsLazyWriteThread) {
-
-                    if (Fcb->Header.ValidDataLength.QuadPart < (StartingOffset + NumberBytesWritten)) {
-
-                        Fcb->Header.ValidDataLength.QuadPart =
-                            min(Fcb->Header.FileSize.QuadPart,
-                                StartingOffset + NumberBytesWritten);
-
-                        if (NonCachedIo && CcIsFileCached(FileObject)) {
-                            CcSetFileSizes(FileObject, (PCC_FILE_SIZES)&Fcb->Header.AllocationSize);
-                        }
+                /* Publish VDL for initialized, accepted bytes, including a
+                 * real mapped writer. Lazy writeback does not extend VDL. */
+                if (!IsLazyWriteThread && GapInitialized) {
+                    ExAcquireFastMutex(Fcb->Header.FastMutex);
+                    if (Fcb->Header.ValidDataLength.QuadPart < StartingOffset + NumberBytesWritten) {
+                        Fcb->Header.ValidDataLength.QuadPart = min(
+                            Fcb->Header.FileSize.QuadPart, StartingOffset + NumberBytesWritten);
+                        NotifySizes = TRUE;
+                    }
+                    ExReleaseFastMutex(Fcb->Header.FastMutex);
+                }
+                /* Cached writes also publish a new header VDL. Do not leave
+                 * the cache map at the pre-copy invalid-data boundary. */
+                if (!PagingIo && NotifySizes && CcIsFileCached(FileObject)) {
+                    NTSTATUS NotifyStatus = STATUS_SUCCESS;
+                    /* The completed payload/mapping stays protected by Main.
+                     * Cc notification can recurse: release our Paging hold
+                     * first, just as for the earlier size/zero admission. */
+                    if (PagingIoResourceAcquired) {
+                        UDFReleasePagingIo(IrpContext, Fcb);
+                        PagingIoResourceAcquired = FALSE;
+                    }
+                    _SEH2_TRY {
+                        CcSetFileSizes(FileObject, (PCC_FILE_SIZES)&Fcb->Header.AllocationSize);
+                    } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                                  EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                        NotifyStatus = _SEH2_GetExceptionCode();
+                    } _SEH2_END;
+                    if (NotifyStatus != STATUS_SUCCESS) {
+                        Status = NotifyStatus;
+                        /* Bytes/VDL have already been accepted. Repair only
+                         * notification+flush; zeroing would destroy data. */
+                        UDFRetainZeroDataError(IrpContext, Fcb, FileObject, OldVDL,
+                            Fcb->Header.FileSize.QuadPart, Status, UdfDataRepairCacheSizes);
                     }
                 }
             }
-        }
-
-        // Release any resources acquired here ...
-
-        if (PagingIoResourceAcquired) {
-            UDFReleasePagingIo(IrpContext, Fcb);
-        }
-
-        if (MainResourceAcquired) {
-            UDFReleaseFcb(IrpContext, Fcb);
-        }
-
-        if (VcbAcquired) {
-            UDFReleaseVcb(IrpContext, Vcb);
-        }
-
-    } _SEH2_END; // end of "__finally" processing
+            if (BodyAbnormal && CacheCopyAttempted && Fcb->FileInfo &&
+                NT_SUCCESS(Fcb->FileInfo->Dloc->ZeroDataError))
+                UDFRetainZeroDataError(IrpContext, Fcb, FileObject, StartingOffset,
+                    StartingOffset + TruncatedLength, Status, UdfDataRepairNoReplay);
+        } _SEH2_EXCEPT(FsRtlIsNtstatusExpected(_SEH2_GetExceptionCode()) ?
+                      EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+            NTSTATUS FinalizeStatus = _SEH2_GetExceptionCode();
+            if (NT_SUCCESS(Status)) Status = FinalizeStatus;
+            if (Fcb->FileInfo && (FileSizesChanged || CacheCopyAttempted))
+                UDFRetainZeroDataError(IrpContext, Fcb, FileObject, OldVDL,
+                    Fcb->Header.FileSize.QuadPart, FinalizeStatus, UdfDataRepairNoReplay);
+        } _SEH2_END;
+        } _SEH2_FINALLY {
+            /* No Cache Manager or metadata failure can skip these releases.
+             * Final IoStatus is assigned after all fallible finalization. */
+            if (Irp) {
+                Irp->IoStatus.Information = NumberBytesWritten;
+                Irp->IoStatus.Status = Status;
+            }
+            if (PagingIoResourceAcquired) UDFReleasePagingIo(IrpContext, Fcb);
+            if (MainResourceAcquired) UDFReleaseFcb(IrpContext, Fcb);
+            if (VcbAcquired) UDFReleaseVcb(IrpContext, Vcb);
+        } _SEH2_END;
+    } _SEH2_END;
 
     // Post IRP if required
 
@@ -990,71 +1079,635 @@ UDFPurgeCacheEx_(
 #ifndef USE_CcCopyWrite_TO_ZERO
             while(Length);
 #endif //USE_CcCopyWrite_TO_ZERO
-            if (VDL < Offset)
-                Fcb->Header.ValidDataLength.QuadPart = Offset;
+            /* Evicting cache pages does not initialize file bytes. VDL is
+             * owned by successful zero/write completion, never by purge. */
         }
     } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
         BrutePoint();
     } _SEH2_END;
 } // end UDFPurgeCacheEx_()
 
-BOOLEAN
-UDFZeroData (
-    IN PVCB Vcb,
-    IN PFILE_OBJECT FileObject,
-    IN ULONG StartingZero,
-    IN ULONG ByteCount,
-    BOOLEAN CanWait
-    )
-
-/*++
-
-    **** Temporary function - Remove when CcZeroData is capable of handling
-    non sector aligned requests.
-
---*/
+static NTSTATUS
+UDFZeroLowerError(PIRP_CONTEXT IrpContext)
 {
-    LARGE_INTEGER ZeroStart = { {0,0} };
-    LARGE_INTEGER BeyondZeroEnd = { {0,0} };
+    NTSTATUS Status = IrpContext->FirstLowerIoError;
+    if (NT_SUCCESS(Status) && IrpContext->TopLevel && IrpContext->TopLevel != IrpContext)
+        Status = IrpContext->TopLevel->FirstLowerIoError;
+    return Status;
+}
 
-    BOOLEAN Finished;
+static BOOLEAN
+UDFZeroStatusCanRetry(NTSTATUS Status)
+{
+    return Status == STATUS_DISK_FULL || Status == STATUS_INSUFFICIENT_RESOURCES ||
+           Status == STATUS_DEVICE_BUSY;
+}
+
+BOOLEAN
+UDFIsZeroDataRetry(PUDF_DATALOC_INFO Dloc)
+{
+    PFCB Fcb = Dloc ? Dloc->CommonFcb : NULL;
+    return Fcb && Fcb->ZeroDataRetryThread == PsGetCurrentThread() &&
+        Fcb->FileInfo && Fcb->FileInfo->Dloc == Dloc &&
+        ExIsResourceAcquiredExclusiveLite(&Fcb->FcbNonpaged->FcbResource) &&
+        (ExIsResourceAcquiredSharedLite(&Fcb->Vcb->VcbResource) ||
+         ExIsResourceAcquiredExclusiveLite(&Fcb->Vcb->VcbResource));
+}
+
+/* Main/Paging protects the operation's lifetime; VcbMutex serializes the
+ * first error/count even for shared-Main cached copies. A retryable file owns
+ * one FILE_OBJECT reference; a
+ * hard/unreachable generation remains indexed without an extra object cycle.
+ * Publish that choice/error/count under the retry snapshot's VcbMutex. No
+ * allocation is needed after the zero operation has failed. */
+static VOID
+UDFRetainZeroDataError(PIRP_CONTEXT IrpContext, PFCB Fcb,
+                       PFILE_OBJECT FileObject, LONGLONG Start,
+                       LONGLONG End, NTSTATUS Status, UDF_DATA_REPAIR_KIND Kind)
+{
+    PVCB Vcb = Fcb->Vcb;
+    PUDF_DATALOC_INFO Dloc = Fcb->FileInfo->Dloc;
+    BOOLEAN First = NT_SUCCESS(Dloc->ZeroDataError);
+    BOOLEAN Referenced = FALSE, Transferred = FALSE;
+    if (First && Kind != UdfDataRepairNoReplay && UDFZeroStatusCanRetry(Status) && !Dloc->DeleteCommitted &&
+        !FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY)) {
+        ObReferenceObject(FileObject);
+        Referenced = TRUE;
+    }
+    UDFLockVcb(IrpContext, Vcb);
+    /* Cached in-place failures can hold Main shared. Only this mutex
+     * decision creates a generation/count; the earlier read merely chose
+     * a provisional current-request object reference. */
+    First = NT_SUCCESS(Dloc->ZeroDataError);
+    if (Kind == UdfDataRepairCacheSizes)
+        InterlockedCompareExchange(&Dloc->CacheSizeError, Status, STATUS_SUCCESS);
+    if (First) {
+        ASSERT(Fcb->ZeroDataFileObject == NULL);
+        Dloc->DataRepairKind = Kind;
+        Dloc->ZeroDataStart = Start;
+        Dloc->ZeroDataEnd = End;
+        Dloc->ZeroDataLastError = Status;
+        Dloc->ZeroDataLowerError = UDFZeroLowerError(IrpContext);
+        Dloc->ZeroDataAttempts = 0;
+        Dloc->ZeroDataCanRetry = Referenced && !Fcb->ZeroDataFileObject &&
+            NT_SUCCESS(Dloc->ZeroDataLowerError) &&
+            !Dloc->DeleteCommitted && !FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY);
+        if (Dloc->ZeroDataCanRetry) {
+            Fcb->ZeroDataFileObject = FileObject;
+            Transferred = TRUE;
+        }
+        InterlockedExchange(&Dloc->ZeroDataError, Status);
+        InterlockedIncrement(&Vcb->FailedZeroDataCount);
+    } else {
+        InterlockedCompareExchange(&Dloc->ZeroDataLastError, Status, STATUS_SUCCESS);
+        if (!NT_SUCCESS(UDFZeroLowerError(IrpContext)))
+            Dloc->ZeroDataLowerError = UDFZeroLowerError(IrpContext);
+        if (Kind == UdfDataRepairNoReplay) {
+            Dloc->DataRepairKind = Kind;
+            Dloc->ZeroDataStart = min(Dloc->ZeroDataStart, Start);
+            Dloc->ZeroDataEnd = max(Dloc->ZeroDataEnd, End);
+        }
+        if (Kind == UdfDataRepairNoReplay || !UDFZeroStatusCanRetry(Status) ||
+            !NT_SUCCESS(Dloc->ZeroDataLowerError))
+            Dloc->ZeroDataCanRetry = FALSE;
+    }
+    UDFMarkCachedDataPending(Dloc);
+    if (Kind == UdfDataRepairNoReplay || !UDFZeroStatusCanRetry(Status) || !NT_SUCCESS(Dloc->ZeroDataLowerError) ||
+        (First && Fcb->ZeroDataFileObject && !Transferred))
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    UDFUnlockVcb(IrpContext, Vcb);
+    /* The current request still owns this object. A rejected new transfer
+     * drops only its provisional reference, never the established owner. */
+    if (Referenced && !Transferred)
+        ObDereferenceObject(FileObject);
+    InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+}
+
+/* A completed size change owns the new payload/header. An explicit retry
+ * may repeat only cache notification and flush, never zero accepted data. */
+VOID
+UDFRetainCacheSizeError(PIRP_CONTEXT IrpContext, PFCB Fcb,
+                       PFILE_OBJECT FileObject, NTSTATUS Status)
+{
+    if (Status == STATUS_SUCCESS) return;
+    if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+    ASSERT_EXCLUSIVE_FCB(Fcb);
+    UDFRetainZeroDataError(IrpContext, Fcb, FileObject, 0,
+        max(Fcb->Header.FileSize.QuadPart, 0), Status, UdfDataRepairCacheSizes);
+}
+
+/* CcZeroData accepts exact byte bounds for a cached stream. Its uncached
+ * contract requires sector-aligned bounds, so use the FS extent writer for
+ * a stream without a cache map, including both partial boundary sectors.
+ * A mapped-page write also uses that route: zeroing its shared cache could
+ * erase other dirty mapped pages, or recursively enter the same paging I/O. */
+NTSTATUS
+UDFZeroData(
+    IN PIRP_CONTEXT IrpContext,
+    IN PFCB Fcb,
+    IN PFILE_OBJECT FileObject,
+    IN LONGLONG StartingZero,
+    IN LONGLONG ByteCount,
+    IN BOOLEAN CanWait,
+    IN BOOLEAN DirectDisk
+    )
+{
+    PVCB Vcb = Fcb->Vcb;
+    PUDF_DATALOC_INFO Dloc = Fcb->FileInfo ? Fcb->FileInfo->Dloc : NULL;
+    LONGLONG Position = StartingZero, End;
+    PCHAR Zeros = NULL;
+    BOOLEAN Cached, PagingAcquired = FALSE;
+    NTSTATUS Status = STATUS_SUCCESS;
+    const ULONG ChunkLimit = 64 * 1024;
 
     PAGED_CODE();
-
-    ULONG LBS = Vcb->SectorSize;
-
-    ZeroStart.LowPart = (StartingZero + (LBS - 1)) & ~(LBS - 1);
-
-    //
-    //  Detect overflow if we were asked to zero in the last sector of the file,
-    //  which must be "zeroed" already (or we're in trouble).
-    //
-    
-    if (StartingZero != 0 && ZeroStart.LowPart == 0) {
-        
-        return TRUE;
+    if (!Dloc || !FileObject || StartingZero < 0 || ByteCount < 0 ||
+        StartingZero > MAXLONGLONG - ByteCount ||
+        StartingZero < Fcb->Header.ValidDataLength.QuadPart ||
+        StartingZero > Fcb->Header.FileSize.QuadPart ||
+        ByteCount > Fcb->Header.FileSize.QuadPart - StartingZero)
+        return STATUS_INVALID_PARAMETER;
+    if (!NT_SUCCESS(Dloc->ZeroDataError) && !UDFIsZeroDataRetry(Dloc))
+        return Dloc->ZeroDataError;
+    if (!ByteCount)
+        return STATUS_SUCCESS;
+    End = StartingZero + ByteCount;
+    /* Existing gap-extension callers post before resizing when !CanWait.
+     * Do not start a partially initialized, cancellable zero generation. */
+    if (!CanWait)
+        return STATUS_DEVICE_BUSY;
+    Cached = !DirectDisk && Fcb->FcbNonpaged->SegmentObject.SharedCacheMap != NULL;
+    if (Cached) {
+        ASSERT_EXCLUSIVE_FCB(Fcb);
+        /* Header VDL can lag dirty user-mapped pages. Cache zeroing would
+         * destroy them before their paging writes can publish the range.
+         * Main exclusive excludes a new section between this probe and I/O.
+         * A cache-only section is permitted by MM; a user mapping is not. */
+        if (!MmCanFileBeTruncated(&Fcb->FcbNonpaged->SegmentObject,
+                                  &UdfData.UDFLargeZero))
+            return STATUS_USER_MAPPED_FILE;
+    } else {
+        ASSERT_SHARED_FCB(Fcb);
     }
 
-    //
-    //  Note that BeyondZeroEnd can take the value 4gb.
-    //
-    
-    BeyondZeroEnd.QuadPart = ((ULONGLONG) StartingZero + ByteCount + (LBS - 1))
-                             & (~((LONGLONG) LBS - 1));
+    _SEH2_TRY {
+        _SEH2_TRY {
+            if (!Cached) {
+                ULONG BufferBytes = (ULONG)min(ByteCount, (LONGLONG)ChunkLimit);
+                Zeros = MyAllocatePool__(NonPagedPool, BufferBytes);
+                if (!Zeros) {
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                    _SEH2_LEAVE;
+                }
+                RtlZeroMemory(Zeros, BufferBytes);
+                if (!ExIsResourceAcquiredExclusiveLite(
+                        &Fcb->FcbNonpaged->FcbPagingIoResource)) {
+                    UDFAcquirePagingIoExclusive(IrpContext, Fcb);
+                    PagingAcquired = TRUE;
+                }
+            }
+            while (Position != End) {
+                ULONG Chunk = (ULONG)min(End - Position, (LONGLONG)ChunkLimit);
+                if (Cached) {
+                    LARGE_INTEGER Begin, Finish;
+                    Begin.QuadPart = Position;
+                    Finish.QuadPart = Position + Chunk;
+                    UDFMarkCachedDataPending(Dloc);
+                    Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_MODIFIED;
+                    if (!CcZeroData(FileObject, &Begin, &Finish, CanWait)) {
+                        Status = STATUS_DEVICE_BUSY;
+                        break;
+                    }
+                    if (UDFIsZeroDataRetry(Dloc) &&
+                        !NT_SUCCESS(Dloc->ZeroDataLastError)) {
+                        Status = Dloc->ZeroDataLastError;
+                        break;
+                    }
+                } else {
+                    SIZE_T Written = 0;
+                    Status = UDFWriteFile__(IrpContext, Vcb, Fcb->FileInfo,
+                        Position, Chunk, FALSE, Zeros, &Written);
+                    if (Status == STATUS_SUCCESS && Written != Chunk)
+                        Status = STATUS_IO_DEVICE_ERROR;
+                    if (Status != STATUS_SUCCESS)
+                        break;
+                }
+                Position += Chunk;
+            }
+        } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+            Status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+    } _SEH2_FINALLY {
+        if (PagingAcquired)
+            UDFReleasePagingIo(IrpContext, Fcb);
+        if (Zeros)
+            MyFreePool__(Zeros);
+    } _SEH2_END;
+    if (!NT_SUCCESS(UDFZeroLowerError(IrpContext)))
+        Status = UDFZeroLowerError(IrpContext);
+    if (UDFIsZeroDataRetry(Dloc) && !NT_SUCCESS(Dloc->ZeroDataLastError))
+        Status = Dloc->ZeroDataLastError; /* nested lower failure wins wrapper status */
+    if (Status != STATUS_SUCCESS && NT_SUCCESS(Status))
+        Status = STATUS_IO_DEVICE_ERROR; /* no pending/informational pseudo-success */
+    if (Status != STATUS_SUCCESS)
+        UDFRetainZeroDataError(IrpContext, Fcb, FileObject, StartingZero, End, Status,
+                               UdfDataRepairZeroRange);
+    return Status;
+}
 
-    //
-    //  If we were called to just zero part of a sector we are in trouble.
-    //
-    
-    if ( ZeroStart.QuadPart == BeyondZeroEnd.QuadPart ) {
+/* Called only for a new shared-writable user section, with Main exclusive.
+ * Initialize before MM can dirty any bytes beyond the old header VDL. This is
+ * neither a cache-manager SyncTypeOther operation nor repair of a live mapping. */
+NTSTATUS
+UDFInitializeWritableSection(PFILE_OBJECT FileObject, PFCB Fcb)
+{
+    struct IRP_CONTEXT Context = {0};
+    struct THREAD_CONTEXT ThreadContext = {0};
+    PVCB Vcb = Fcb->Vcb;
+    PUDF_DATALOC_INFO Dloc = Fcb->FileInfo ? Fcb->FileInfo->Dloc : NULL;
+    LONGLONG Start, End;
+    NTSTATUS Status;
+    BOOLEAN VolumeAcquired = FALSE, InitializationStarted = FALSE;
 
-        return TRUE;
+    ASSERT_EXCLUSIVE_FCB(Fcb);
+    Status = UDFVerifyFcbOperation(NULL, Fcb, NULL);
+    if (Status != STATUS_SUCCESS)
+        return Status;
+    if (!Dloc || FlagOn(Fcb->FcbState, UDF_FCB_DIRECTORY))
+        return STATUS_INVALID_FILE_FOR_SECTION;
+    if (FlagOn(FileObject->Flags, FO_CLEANUP_COMPLETE))
+        return STATUS_FILE_CLOSED;
+    if (FlagOn(Vcb->VcbState, VCB_STATE_SHUTDOWN))
+        return STATUS_VOLUME_DISMOUNTED;
+    if (FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY | VCB_STATE_MEDIA_WRITE_PROTECT))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    if (!NT_SUCCESS(Dloc->ZeroDataError))
+        return Dloc->ZeroDataError;
+    if (Dloc->CleanupOwner || Dloc->NamespaceScratch || Dloc->NamespaceTarget ||
+        Dloc->NamespaceScratchOwner || Dloc->StreamDeleteOwner ||
+        Dloc->StreamDeleteContextOwner || FlagOn(Dloc->FE_Flags, UDF_FE_FLAG_UNDER_INIT))
+        return STATUS_DEVICE_BUSY;
+    ExAcquireFastMutex(Fcb->Header.FastMutex);
+    Start = Fcb->Header.ValidDataLength.QuadPart;
+    End = Fcb->Header.FileSize.QuadPart;
+    ExReleaseFastMutex(Fcb->Header.FastMutex);
+    if (Start < 0 || End < Start)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Start != End &&
+        !MmCanFileBeTruncated(&Fcb->FcbNonpaged->SegmentObject, &UdfData.UDFLargeZero))
+        return STATUS_USER_MAPPED_FILE;
+
+    Context.NodeIdentifier.NodeTypeCode = UDF_NODE_TYPE_IRP_CONTEXT;
+    Context.NodeIdentifier.NodeByteSize = sizeof(Context);
+    Context.Flags = IRP_CONTEXT_FLAG_ON_STACK | IRP_CONTEXT_FLAG_WAIT |
+                    IRP_CONTEXT_FLAG_METADATA_WRITER;
+    Context.MajorFunction = IRP_MJ_WRITE;
+    Context.Vcb = Vcb;
+    Context.RealDevice = Vcb->Vpb->RealDevice;
+    UDFSetThreadContext(&Context, &ThreadContext);
+    _SEH2_TRY {
+        _SEH2_TRY {
+            /* MM entered with Main already held. Never wait for VCB in this
+             * order; its exclusive owner may itself be waiting for Main. */
+            VolumeAcquired = UDFAcquireVcbShared(&Context, Vcb, TRUE);
+            if (!VolumeAcquired) {
+                Status = STATUS_DEVICE_BUSY;
+                _SEH2_LEAVE;
+            }
+            Status = UDFVerifyFcbOperation(NULL, Fcb, NULL);
+            if (Status != STATUS_SUCCESS)
+                _SEH2_LEAVE;
+            /* Writable mapping admission must open integrity even if the
+             * whole file is already initialized; paging will happen later. */
+            Status = UDFOpenIntegrityForWrite(&Context, Vcb, FALSE);
+            if (Status != STATUS_SUCCESS || Start == End)
+                _SEH2_LEAVE;
+            InitializationStarted = TRUE;
+            Status = UDFZeroData(&Context, Fcb, FileObject, Start, End - Start, TRUE, FALSE);
+            if (Status != STATUS_SUCCESS)
+                _SEH2_LEAVE;
+            ExAcquireFastMutex(Fcb->Header.FastMutex);
+            Fcb->Header.ValidDataLength.QuadPart = End;
+            ExReleaseFastMutex(Fcb->Header.FastMutex);
+            if (CcIsFileCached(FileObject))
+                CcSetFileSizes(FileObject, (PCC_FILE_SIZES)&Fcb->Header.AllocationSize);
+        } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+            Status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+        if (!NT_SUCCESS(UDFZeroLowerError(&Context)))
+            Status = UDFZeroLowerError(&Context);
+        if (Status != STATUS_SUCCESS && NT_SUCCESS(Status))
+            Status = STATUS_IO_DEVICE_ERROR;
+        /* CcSetFileSizes can raise after successful zeroing. Preserve that
+         * incomplete cache/metadata generation too; never roll VDL backwards
+         * over data already admitted to the cache. Explicit repair owns it. */
+        if (Status != STATUS_SUCCESS && InitializationStarted &&
+            NT_SUCCESS(Dloc->ZeroDataError))
+            UDFRetainZeroDataError(&Context, Fcb, FileObject, Start, End, Status,
+                                   UdfDataRepairCacheSizes);
+        if (Status == STATUS_SUCCESS) {
+            /* A mapped writer need not come through the ordinary cached
+             * write entry before dirtying data. Preserve its drain boundary. */
+            UDFMarkCachedDataPending(Dloc);
+            Fcb->NtReqFCBFlags |= UDF_NTREQ_FCB_MODIFIED;
+        }
+    } _SEH2_FINALLY {
+        if (VolumeAcquired)
+            UDFReleaseVcb(&Context, Vcb);
+        if (Context.ThreadContext) {
+            UDFRestoreThreadContext(&Context);
+        }
+    } _SEH2_END;
+    return Status;
+}
+
+/* One explicit attempt. The retained FILE_OBJECT keeps the exact opened
+ * object/FCB alive after cleanup; no old CCB/FI close reference is replayed.
+ * Keep the close barrier and original failure throughout every fallible I/O. */
+NTSTATUS
+UDFRetryZeroData(PIRP_CONTEXT IrpContext, PFCB Fcb)
+{
+    PVCB Vcb = Fcb->Vcb;
+    PUDF_FILE_INFO FileInfo = Fcb->FileInfo;
+    PUDF_DATALOC_INFO Dloc = FileInfo ? FileInfo->Dloc : NULL;
+    PFILE_OBJECT Owner, ReleaseOwner = NULL;
+    PFCB Parent = NULL;
+    BOOLEAN ParentAcquired = FALSE, PinOwned = FALSE, Retrying = FALSE;
+    _SEH2_VOLATILE BOOLEAN CacheSizeAttempted = FALSE, CacheSizeCompleted = FALSE;
+    BOOLEAN WasWriter = BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+    LONGLONG Start, End;
+    IO_STATUS_BLOCK IoStatus;
+    NTSTATUS Status = STATUS_SUCCESS;
+    PIRP_CONTEXT ThreadOwner;
+
+    ASSERT_EXCLUSIVE_FCB(Fcb);
+    if (Fcb->TeardownInProgress)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (!Dloc)
+        return STATUS_FILE_INVALID;
+    if (NT_SUCCESS(Dloc->ZeroDataError))
+        return Fcb->ZeroDataFileObject ? STATUS_FILE_CORRUPT_ERROR : STATUS_SUCCESS;
+    if (Dloc->DataRepairKind != UdfDataRepairZeroRange &&
+        Dloc->DataRepairKind != UdfDataRepairCacheSizes)
+        return Dloc->ZeroDataError; /* never zero an unknown partial user payload */
+    if (!Dloc->ZeroDataCanRetry || FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY))
+        return Dloc->ZeroDataError;
+    ThreadOwner = UDFCurrentIrpContextForLowerError();
+    if (!ThreadOwner || (ThreadOwner != IrpContext && ThreadOwner != IrpContext->TopLevel))
+        return STATUS_INVALID_DEVICE_STATE; /* every barrier failure must be attributable */
+    if (Fcb->ZeroDataRetryThread || Fcb->TeardownInProgress ||
+        Vcb->VcbCondition != VcbMounted ||
+        FlagOn(Vcb->VcbState, VCB_STATE_SHUTDOWN) ||
+        Dloc->CleanupOwner || Dloc->NamespaceScratch || Dloc->NamespaceTarget ||
+        Dloc->NamespaceScratchOwner || Dloc->StreamDeleteOwner ||
+        Dloc->StreamDeleteContextOwner || Dloc->StreamCreate || Dloc->DeleteCommitted ||
+        FlagOn(Dloc->FE_Flags, UDF_FE_FLAG_UNDER_INIT))
+        return STATUS_DEVICE_BUSY;
+    Owner = Fcb->ZeroDataFileObject;
+    if (!Owner || Owner->FsContext != Fcb ||
+        Dloc->ZeroDataStart < 0 || Dloc->ZeroDataEnd < Dloc->ZeroDataStart)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (ExIsResourceAcquiredSharedLite(&Fcb->FcbNonpaged->FcbPagingIoResource))
+        return STATUS_INVALID_DEVICE_STATE;
+    /* Main exclusive also excludes new section creation through our filter
+     * callback. Existing user mappings can contain dirty data beyond header
+     * VDL; never overwrite those bytes as an allegedly invalid zero tail. */
+    if (Dloc->DataRepairKind == UdfDataRepairZeroRange &&
+        !MmCanFileBeTruncated(&Fcb->FcbNonpaged->SegmentObject, &UdfData.UDFLargeZero))
+        return STATUS_USER_MAPPED_FILE;
+
+    if (FileInfo->ParentFile && FileInfo->ParentFile->Dloc)
+        Parent = FileInfo->ParentFile->Dloc->CommonFcb;
+    if (Parent == Fcb || (Parent && !Parent->Header.Resource))
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Parent && !ExIsResourceAcquiredExclusiveLite(Parent->Header.Resource)) {
+        if (!UDFAcquireFcbExclusive(IrpContext, Parent, TRUE))
+            return STATUS_DEVICE_BUSY;
+        ParentAcquired = TRUE;
     }
+    _SEH2_TRY {
+        UDFLockVcb(IrpContext, Vcb);
+        if (Fcb->FcbReference == MAXULONG || Vcb->VcbReference == MAXULONG)
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+        else {
+            Fcb->FcbReference++;
+            Vcb->VcbReference++;
+            PinOwned = TRUE;
+        }
+        UDFUnlockVcb(IrpContext, Vcb);
+        if (!NT_SUCCESS(Status))
+            _SEH2_LEAVE;
 
-    Finished = CcZeroData( FileObject,
-                           &ZeroStart,
-                           &BeyondZeroEnd,
-                           CanWait );
+        Fcb->ZeroDataRetryThread = PsGetCurrentThread();
+        Retrying = TRUE;
+        Dloc->ZeroDataLastError = STATUS_SUCCESS;
+        Dloc->ZeroDataLowerError = STATUS_SUCCESS;
+        if (Dloc->ZeroDataAttempts != MAXULONG)
+            Dloc->ZeroDataAttempts++;
+        SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+        _SEH2_TRY {
+            ExAcquireFastMutex(Fcb->Header.FastMutex);
+            Start = Fcb->Header.ValidDataLength.QuadPart;
+            End = Fcb->Header.FileSize.QuadPart;
+            ExReleaseFastMutex(Fcb->Header.FastMutex);
+            if (Start < 0 || End < Start || Dloc->ZeroDataEnd > End) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            if (Dloc->DataRepairKind == UdfDataRepairZeroRange) {
+                /* Only this phase proves the original payload was not
+                 * admitted. A notification-only failure preserves bytes. */
+                Status = UDFZeroData(IrpContext, Fcb, Owner, Start, End - Start, TRUE, FALSE);
+                if (Status != STATUS_SUCCESS) _SEH2_LEAVE;
+                if (!NT_SUCCESS(Dloc->ZeroDataLastError)) {
+                    Status = Dloc->ZeroDataLastError;
+                    _SEH2_LEAVE;
+                }
+                ExAcquireFastMutex(Fcb->Header.FastMutex);
+                Fcb->Header.ValidDataLength.QuadPart = End;
+                ExReleaseFastMutex(Fcb->Header.FastMutex);
+                /* Persist the completed phase across a later size/flush
+                 * failure: another repair must not repeat data mutation. */
+                Dloc->DataRepairKind = UdfDataRepairCacheSizes;
+            }
+            if (CcIsFileCached(Owner)) {
+                CacheSizeAttempted = TRUE;
+                CcSetFileSizes(Owner, (PCC_FILE_SIZES)&Fcb->Header.AllocationSize);
+                CacheSizeCompleted = TRUE;
+            } else if (!NT_SUCCESS(Dloc->CacheSizeError) &&
+                       Fcb->FcbNonpaged->SegmentObject.DataSectionObject) {
+                /* Cleanup may have detached the map while MM still owns
+                 * a section. A no-op CcSetFileSizes cannot prove that its
+                 * old sizes were reconciled. Keep the explicit owner. */
+                Status = STATUS_DEVICE_BUSY;
+                _SEH2_LEAVE;
+            }
+            if (Fcb->FcbNonpaged->SegmentObject.DataSectionObject) {
+                IoStatus.Status = STATUS_SUCCESS;
+                IoStatus.Information = 0;
+                CcFlushCache(&Fcb->FcbNonpaged->SegmentObject, NULL, 0, &IoStatus);
+                Status = IoStatus.Status;
+            }
+            if (Status != STATUS_SUCCESS)
+                _SEH2_LEAVE;
+            if (!NT_SUCCESS(Dloc->ZeroDataLastError)) {
+                Status = Dloc->ZeroDataLastError;
+                _SEH2_LEAVE;
+            }
+            Dloc->FE_Flags &= ~UDF_FE_FLAG_CACHED_DATA_PENDING;
+            Status = UDFFlushFile__(IrpContext, Vcb, FileInfo, 0);
+            if (Status != STATUS_SUCCESS)
+                _SEH2_LEAVE;
+            Status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+            if (Status != STATUS_SUCCESS)
+                _SEH2_LEAVE;
+            if (!NT_SUCCESS(Dloc->ZeroDataLastError)) {
+                Status = Dloc->ZeroDataLastError;
+                _SEH2_LEAVE;
+            }
 
-    return Finished;
+            /* The exact repair is committed; this is the only success path
+             * that retires this count/owner. Do not clear unrelated readonly
+             * or the VCB's first-error latch belonging to another operation. */
+            UDFLockVcb(IrpContext, Vcb);
+            ASSERT(Vcb->FailedZeroDataCount > 0);
+            InterlockedExchange(&Dloc->CacheSizeError, STATUS_SUCCESS);
+            InterlockedExchange(&Dloc->ZeroDataError, STATUS_SUCCESS);
+            InterlockedDecrement(&Vcb->FailedZeroDataCount);
+            Dloc->ZeroDataCanRetry = FALSE;
+            Dloc->DataRepairKind = UdfDataRepairZeroRange;
+            Dloc->ZeroDataStart = Dloc->ZeroDataEnd = 0;
+            ReleaseOwner = Fcb->ZeroDataFileObject;
+            Fcb->ZeroDataFileObject = NULL;
+            UDFUnlockVcb(IrpContext, Vcb);
+        } _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+            Status = _SEH2_GetExceptionCode();
+        } _SEH2_END;
+        if (Status != STATUS_SUCCESS) {
+            if (CacheSizeAttempted && !CacheSizeCompleted)
+                InterlockedCompareExchange(&Dloc->CacheSizeError, Status, STATUS_SUCCESS);
+            if (!NT_SUCCESS(Dloc->ZeroDataLastError))
+                Status = Dloc->ZeroDataLastError;
+            if (NT_SUCCESS(Status)) Status = STATUS_IO_DEVICE_ERROR;
+            InterlockedCompareExchange(&Dloc->ZeroDataLastError, Status, STATUS_SUCCESS);
+            if (!NT_SUCCESS(UDFZeroLowerError(IrpContext)))
+                Dloc->ZeroDataLowerError = UDFZeroLowerError(IrpContext);
+            if (!UDFZeroStatusCanRetry(Status) ||
+                !NT_SUCCESS(Dloc->ZeroDataLowerError)) {
+                Dloc->ZeroDataCanRetry = FALSE;
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            }
+            UDFMarkCachedDataPending(Dloc);
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+            if (!Dloc->ZeroDataCanRetry ||
+                FlagOn(Vcb->VcbState, VCB_STATE_VOLUME_READ_ONLY)) {
+                Dloc->ZeroDataCanRetry = FALSE;
+                UDFLockVcb(IrpContext, Vcb);
+                ReleaseOwner = Fcb->ZeroDataFileObject;
+                Fcb->ZeroDataFileObject = NULL;
+                UDFUnlockVcb(IrpContext, Vcb);
+            }
+        }
+    } _SEH2_FINALLY {
+        if (Retrying)
+            Fcb->ZeroDataRetryThread = NULL;
+        if (!WasWriter)
+            ClearFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_METADATA_WRITER);
+        if (ParentAcquired)
+            UDFReleaseFcb(IrpContext, Parent);
+        /* A last ObDereference may synchronously run IRP_CLOSE. The pin is
+         * still owned until that callback is finished; never free our caller's
+         * FCB/resource as a side effect of releasing the operation owner. */
+        _SEH2_TRY {
+            if (ReleaseOwner)
+                ObDereferenceObject(ReleaseOwner);
+        } _SEH2_FINALLY {
+            if (_SEH2_AbnormalTermination()) {
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                            STATUS_UNSUCCESSFUL, STATUS_SUCCESS);
+            }
+            if (PinOwned) {
+                UDFLockVcb(IrpContext, Vcb);
+                ASSERT(Fcb->FcbReference && Vcb->VcbReference);
+                Fcb->FcbReference--;
+                Vcb->VcbReference--;
+                UDFUnlockVcb(IrpContext, Vcb);
+                if (!Fcb->FcbReference)
+                    UDFScheduleFcbTeardownRetry(IrpContext, Fcb);
+            }
+        } _SEH2_END;
+    } _SEH2_END;
+    return Status;
+}
+
+/* Bounded explicit pass: one pinned snapshot and one attempt per owner.
+ * A failure releases only snapshot pins; it starts no more metadata work. */
+NTSTATUS
+UDFRetryVolumeZeroData(PIRP_CONTEXT IrpContext, PVCB Vcb)
+{
+    PFCB* Files = NULL;
+    PFCB Fcb;
+    PVOID Restart = NULL;
+    ULONG Capacity, Count = 0, Index;
+    NTSTATUS Status = STATUS_SUCCESS;
+    BOOLEAN TableLocked = FALSE, VcbLocked = FALSE;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    Capacity = (ULONG)InterlockedCompareExchange(&Vcb->FailedZeroDataCount, 0, 0);
+    if (!Capacity)
+        return STATUS_SUCCESS;
+    if (Capacity > MAXULONG / sizeof(PFCB))
+        return STATUS_INSUFFICIENT_RESOURCES;
+    Files = MyAllocatePool__(NonPagedPool, Capacity * sizeof(PFCB));
+    if (!Files)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    _SEH2_TRY {
+        UDFLockFcbTable(IrpContext, Vcb); TableLocked = TRUE;
+        UDFLockVcb(IrpContext, Vcb); VcbLocked = TRUE;
+        while (Count < Capacity && (Fcb = UDFGetNextFcb(IrpContext, Vcb, &Restart))) {
+            if (Fcb->TeardownInProgress || !Fcb->FileInfo || !Fcb->FileInfo->Dloc ||
+                NT_SUCCESS(Fcb->FileInfo->Dloc->ZeroDataError))
+                continue;
+            if (Fcb->FcbReference == MAXULONG || Vcb->VcbReference == MAXULONG) {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            Fcb->FcbReference++;
+            Vcb->VcbReference++;
+            Files[Count++] = Fcb;
+        }
+        UDFUnlockVcb(IrpContext, Vcb); VcbLocked = FALSE;
+        UDFUnlockFcbTable(IrpContext, Vcb); TableLocked = FALSE;
+        if (!Count && NT_SUCCESS(Status))
+            Status = STATUS_FILE_CORRUPT_ERROR;
+        for (Index = 0; Index < Count && NT_SUCCESS(Status); Index++) {
+            Fcb = Files[Index];
+            if (!UDFAcquireFcbExclusive(IrpContext, Fcb, TRUE)) {
+                Status = STATUS_DEVICE_BUSY;
+                break;
+            }
+            _SEH2_TRY {
+                Status = UDFRetryZeroData(IrpContext, Fcb);
+            } _SEH2_FINALLY {
+                UDFReleaseFcb(IrpContext, Fcb);
+            } _SEH2_END;
+        }
+    } _SEH2_FINALLY {
+        if (VcbLocked) UDFUnlockVcb(IrpContext, Vcb);
+        if (TableLocked) UDFUnlockFcbTable(IrpContext, Vcb);
+        for (Index = 0; Index < Count; Index++) {
+            Fcb = Files[Index];
+            UDFLockVcb(IrpContext, Vcb);
+            ASSERT(Fcb->FcbReference && Vcb->VcbReference);
+            Fcb->FcbReference--;
+            Vcb->VcbReference--;
+            UDFUnlockVcb(IrpContext, Vcb);
+            if (!Fcb->FcbReference)
+                UDFScheduleFcbTeardownRetry(IrpContext, Fcb);
+        }
+        MyFreePool__(Files);
+    } _SEH2_END;
+    if (NT_SUCCESS(Status) && InterlockedCompareExchange(&Vcb->FailedZeroDataCount, 0, 0))
+        return STATUS_DEVICE_BUSY;
+    return Status;
 }

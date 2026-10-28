@@ -98,8 +98,8 @@ UDFDirIndexFree(
     uint32 k;
     PDIR_INDEX_ITEM* FrameList;
 
-    FrameList = (PDIR_INDEX_ITEM*)(hDirNdx+1);
     if (!hDirNdx) return;
+    FrameList = (PDIR_INDEX_ITEM*)(hDirNdx+1);
     for(k=0; k<hDirNdx->FrameCount; k++, FrameList++) {
         if (*FrameList) MyFreePool__(*FrameList);
     }
@@ -111,52 +111,94 @@ UDFDirIndexFree(
  */
 NTSTATUS
 UDFDirIndexGrow(
-    IN PDIR_INDEX_HDR* _hDirNdx,
-    IN uint_di d // increment
+    IN PDIR_INDEX_HDR* Index,
+    IN uint_di Increment
     )
 {
-    uint_di j,k;
-    PDIR_INDEX_HDR hDirNdx = *_hDirNdx;
-    PDIR_INDEX_ITEM* FrameList;
-
-    if (d > UDF_DIR_INDEX_FRAME)
+    PDIR_INDEX_HDR Old;
+    _SEH2_VOLATILE PDIR_INDEX_HDR New = NULL;
+    PDIR_INDEX_HDR RetiredHeader = NULL;
+    PDIR_INDEX_ITEM *OldFrames, *Frames;
+    PDIR_INDEX_ITEM OldLast, Last;
+    _SEH2_VOLATILE PDIR_INDEX_ITEM Replacement = NULL, Extra = NULL;
+    uint_di Count, LastCount, Needed, NewLast;
+    uint64 Total;
+    NTSTATUS Status = STATUS_INSUFFICIENT_RESOURCES;
+    if (!Index || !(Old = *Index) || !Old->FrameCount ||
+        !Old->LastFrameCount || Old->LastFrameCount > UDF_DIR_INDEX_FRAME ||
+        Increment > UDF_DIR_INDEX_FRAME)
         return STATUS_INVALID_PARAMETER;
-
-    j = hDirNdx->LastFrameCount+d;
-
-    if (j > UDF_DIR_INDEX_FRAME) {
-        // Grow header
-        k = hDirNdx->FrameCount;
-        if (!MyReallocPool__((int8*)hDirNdx, sizeof(DIR_INDEX_HDR) + k*sizeof(PDIR_INDEX_ITEM),
-                       (int8**)(&hDirNdx), sizeof(DIR_INDEX_HDR) + (k+1)*sizeof(PDIR_INDEX_ITEM) ) )
-            return STATUS_INSUFFICIENT_RESOURCES;
-        FrameList = (PDIR_INDEX_ITEM*)(hDirNdx+1);
-        // Grow last frame
-        if (!MyReallocPool__((int8*)(FrameList[k-1]), AlignDirIndex(hDirNdx->LastFrameCount)*sizeof(DIR_INDEX_ITEM),
-                       (int8**)(&(FrameList[k-1])), UDF_DIR_INDEX_FRAME*sizeof(DIR_INDEX_ITEM) ) )
-            return STATUS_INSUFFICIENT_RESOURCES;
-        RtlZeroMemory(&(FrameList[k-1][hDirNdx->LastFrameCount]),
-                       (UDF_DIR_INDEX_FRAME-hDirNdx->LastFrameCount)*sizeof(DIR_INDEX_ITEM));
-        hDirNdx->LastFrameCount = UDF_DIR_INDEX_FRAME;
-        // Allocate new frame
-        FrameList[k] = (PDIR_INDEX_ITEM)MyAllocatePoolTag__(UDF_DIR_INDEX_MT, AlignDirIndex(j-UDF_DIR_INDEX_FRAME)*sizeof(DIR_INDEX_ITEM), MEM_DIR_NDX_TAG );
-        if (!FrameList[k])
-            return STATUS_INSUFFICIENT_RESOURCES;
-        hDirNdx->FrameCount++;
-        RtlZeroMemory(FrameList[k], (j-UDF_DIR_INDEX_FRAME)*sizeof(DIR_INDEX_ITEM));
-        hDirNdx->LastFrameCount = j-UDF_DIR_INDEX_FRAME;
-        (*_hDirNdx) = hDirNdx;
-    } else {
-        k = hDirNdx->FrameCount;
-        FrameList = (PDIR_INDEX_ITEM*)(hDirNdx+1);
-        if (!MyReallocPool__((int8*)(FrameList[k-1]), AlignDirIndex(hDirNdx->LastFrameCount)*sizeof(DIR_INDEX_ITEM),
-                       (int8**)(&(FrameList[k-1])), AlignDirIndex(j)*sizeof(DIR_INDEX_ITEM) ) )
-            return STATUS_INSUFFICIENT_RESOURCES;
-        RtlZeroMemory(&(FrameList[k-1][hDirNdx->LastFrameCount]),
-                       (j-hDirNdx->LastFrameCount)*sizeof(DIR_INDEX_ITEM));
-        hDirNdx->LastFrameCount = j;
-    }
-    return STATUS_SUCCESS;
+    if (!Increment)
+        return STATUS_SUCCESS;
+    Total = ((uint64)Old->FrameCount - 1) * UDF_DIR_INDEX_FRAME +
+        Old->LastFrameCount + Increment;
+    if (Total > MAXULONG)
+        return STATUS_INVALID_PARAMETER;
+    Count = Old->FrameCount;
+    LastCount = Old->LastFrameCount;
+    Needed = LastCount + Increment;
+    NewLast = Needed;
+    OldFrames = (PDIR_INDEX_ITEM*)(Old + 1);
+    OldLast = OldFrames[Count - 1];
+    if (!OldLast)
+        return STATUS_FILE_CORRUPT_ERROR;
+    /* Caller serializes the directory. Allocate every replacement first:
+     * an OOM must leave the caller's header and all frame pointers valid. */
+    _SEH2_TRY {
+        if (Needed > UDF_DIR_INDEX_FRAME) {
+            SIZE_T HeaderBytes;
+            if ((SIZE_T)Count > (((SIZE_T)-1) - sizeof(*Old)) / sizeof(*Frames) - 1) {
+                Status = STATUS_INVALID_PARAMETER;
+                _SEH2_LEAVE;
+            }
+            HeaderBytes = sizeof(*Old) + ((SIZE_T)Count + 1) * sizeof(*Frames);
+            New = MyAllocatePoolTag__(UDF_DIR_INDEX_MT, HeaderBytes, MEM_DIR_HDR_TAG);
+            if (!New) _SEH2_LEAVE;
+            RtlCopyMemory(New, Old, sizeof(*Old) + (SIZE_T)Count * sizeof(*Frames));
+            Frames = (PDIR_INDEX_ITEM*)(New + 1);
+            NewLast = Needed - UDF_DIR_INDEX_FRAME;
+            Extra = MyAllocatePoolTag__(UDF_DIR_INDEX_MT,
+                AlignDirIndex(NewLast) * sizeof(*Extra), MEM_DIR_NDX_TAG);
+            if (!Extra) _SEH2_LEAVE;
+            RtlZeroMemory(Extra, NewLast * sizeof(*Extra));
+            Needed = UDF_DIR_INDEX_FRAME;
+        } else {
+            Frames = OldFrames;
+        }
+        if (AlignDirIndex(Needed) > AlignDirIndex(LastCount)) {
+            Replacement = MyAllocatePoolTag__(UDF_DIR_INDEX_MT,
+                AlignDirIndex(Needed) * sizeof(*Replacement), MEM_DIR_NDX_TAG);
+            if (!Replacement) _SEH2_LEAVE;
+            RtlCopyMemory(Replacement, OldLast, LastCount * sizeof(*Replacement));
+        }
+        Last = Replacement ? Replacement : OldLast;
+        RtlZeroMemory(Last + LastCount, (Needed - LastCount) * sizeof(*Last));
+        if (New) {
+            Frames[Count - 1] = Last;
+            Frames[Count] = Extra;
+            New->FrameCount = Count + 1;
+            New->LastFrameCount = NewLast;
+            *Index = New;
+            New = NULL;
+            Extra = NULL;
+            RetiredHeader = Old;
+        } else {
+            Frames[Count - 1] = Last;
+            Old->LastFrameCount = Needed;
+        }
+        if (Replacement) {
+            Replacement = NULL; /* frame transferred into the current header */
+            MyFreePool__(OldLast);
+        }
+        if (RetiredHeader)
+            MyFreePool__(RetiredHeader);
+        Status = STATUS_SUCCESS;
+    } _SEH2_FINALLY {
+        if (Replacement) MyFreePool__(Replacement);
+        if (Extra) MyFreePool__(Extra);
+        if (New) MyFreePool__(New); /* its borrowed old frames are not ours */
+    } _SEH2_END;
+    return Status;
 } // end UDFDirIndexGrow()
 
 /*
@@ -164,66 +206,45 @@ UDFDirIndexGrow(
  */
 NTSTATUS
 UDFDirIndexTrunc(
-    IN PDIR_INDEX_HDR* _hDirNdx,
-    IN uint_di d // decrement
+    IN PDIR_INDEX_HDR* Index,
+    IN uint_di Decrement
     )
 {
-    uint_di j,k;
-
-    if (d > UDF_DIR_INDEX_FRAME) {
-        NTSTATUS status;
-        while(d) {
-            k = (d > UDF_DIR_INDEX_FRAME) ? UDF_DIR_INDEX_FRAME : d;
-            if (!NT_SUCCESS(status = UDFDirIndexTrunc(_hDirNdx, k))) {
-                return status;
-            }
-            d -= k;
-        }
+    PDIR_INDEX_HDR Header;
+    PDIR_INDEX_ITEM *Frames, Entry;
+    uint64 Total, NewTotal;
+    uint_di NewFrames, NewLast, Frame, Slot, Limit;
+    if (!Index || !(Header = *Index) || !Header->FrameCount ||
+        !Header->LastFrameCount || Header->LastFrameCount > UDF_DIR_INDEX_FRAME)
+        return STATUS_INVALID_PARAMETER;
+    Total = ((uint64)Header->FrameCount - 1) * UDF_DIR_INDEX_FRAME + Header->LastFrameCount;
+    if (Total > MAXULONG || Total < 2 || Decrement > Total - 2)
+        return STATUS_INVALID_PARAMETER;
+    if (!Decrement)
         return STATUS_SUCCESS;
-    }
-
-    PDIR_INDEX_HDR hDirNdx = *_hDirNdx;
-    PDIR_INDEX_ITEM* FrameList;
-
-    j = UDF_DIR_INDEX_FRAME+hDirNdx->LastFrameCount-d;
-    FrameList = (PDIR_INDEX_ITEM*)(hDirNdx+1);
-    k = hDirNdx->FrameCount-1;
-
-    if (j <= UDF_DIR_INDEX_FRAME) {
-        // free last frame
-        if (!k && (j < 2)) {
-            // someone tries to trunc. residual entries...
-            return STATUS_INVALID_PARAMETER;
+    NewTotal = Total - Decrement;
+    NewFrames = (uint_di)((NewTotal + UDF_DIR_INDEX_FRAME - 1) >> UDF_DIR_INDEX_FRAME_SH);
+    NewLast = (uint_di)((NewTotal - 1) & (UDF_DIR_INDEX_FRAME - 1)) + 1;
+    Frames = (PDIR_INDEX_ITEM*)(Header + 1);
+    /* The caller must first release or transfer the removed entry owners.
+     * Retain capacity; shrinking never needs a fallible realloc after it
+     * has already removed entries or freed another frame. */
+    for (Frame = (uint_di)(NewTotal >> UDF_DIR_INDEX_FRAME_SH); Frame < Header->FrameCount; Frame++) {
+        Slot = Frame == (uint_di)(NewTotal >> UDF_DIR_INDEX_FRAME_SH) ?
+            (uint_di)(NewTotal & (UDF_DIR_INDEX_FRAME - 1)) : 0;
+        Limit = Frame + 1 == Header->FrameCount ? Header->LastFrameCount : UDF_DIR_INDEX_FRAME;
+        for (; Slot < Limit; Slot++) {
+            Entry = &Frames[Frame][Slot];
+            if (Entry->FileInfo || Entry->FName.Buffer)
+                return STATUS_CANNOT_DELETE;
         }
-        MyFreePool__(FrameList[k]);
-        FrameList[k] = NULL;
-        hDirNdx->LastFrameCount = UDF_DIR_INDEX_FRAME;
-        hDirNdx->FrameCount--;
-        // Truncate new last frame
-        if (!MyReallocPool__((int8*)(FrameList[k-1]), UDF_DIR_INDEX_FRAME*sizeof(DIR_INDEX_ITEM),
-                       (int8**)(&(FrameList[k-1])), AlignDirIndex(j)*sizeof(DIR_INDEX_ITEM) ) )
-            return STATUS_INSUFFICIENT_RESOURCES;
-        hDirNdx->LastFrameCount = j;
-        // Truncate header
-        if (!MyReallocPool__((int8*)hDirNdx, sizeof(DIR_INDEX_HDR) + (k+1)*sizeof(PDIR_INDEX_ITEM),
-                       (int8**)(&hDirNdx), sizeof(DIR_INDEX_HDR) + k*sizeof(PDIR_INDEX_ITEM) ) )
-            return STATUS_INSUFFICIENT_RESOURCES;
-
-        (*_hDirNdx) = hDirNdx;
-
-    } else {
-
-        j -= UDF_DIR_INDEX_FRAME;
-        if (!k && (j < 2)) {
-            // someone tries to trunc. residual entries...
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        if (!MyReallocPool__((int8*)(FrameList[k]), AlignDirIndex(hDirNdx->LastFrameCount)*sizeof(DIR_INDEX_ITEM),
-                       (int8**)(&(FrameList[k])), AlignDirIndex(j)*sizeof(DIR_INDEX_ITEM) ) )
-            return STATUS_INSUFFICIENT_RESOURCES;
-        hDirNdx->LastFrameCount = j;
     }
+    for (Frame = NewFrames; Frame < Header->FrameCount; Frame++) {
+        MyFreePool__(Frames[Frame]);
+        Frames[Frame] = NULL;
+    }
+    Header->FrameCount = NewFrames;
+    Header->LastFrameCount = NewLast;
     return STATUS_SUCCESS;
 } // end UDFDirIndexTrunc()
 
@@ -380,14 +401,21 @@ UDFBuildHashEntry(
         hashes->hPosix = crc32((uint8*)(Name->Buffer), Name->Length);
 
     if (Mask & HASH_ULFN) {
-
-        UName.Length = 0;
-        UName.MaximumLength = Name->Length;
-        UName.Buffer = (PWCHAR)FsRtlAllocatePoolWithTag(NonPagedPool, UName.MaximumLength, TAG_FILE_NAME);
-
-        RtlUpcaseUnicodeString(&UName, Name, FALSE);
-        hashes->hLfn = crc32((uint8*)(UName.Buffer), UName.Length);
-        ExFreePoolWithTag(UName.Buffer, TAG_FILE_NAME);
+        _SEH2_VOLATILE PWCHAR Buffer = NULL;
+        NTSTATUS Status;
+        _SEH2_TRY {
+            UName.Length = 0;
+            UName.MaximumLength = Name->Length;
+            Buffer = (PWCHAR)FsRtlAllocatePoolWithTag(NonPagedPool,
+                                                     UName.MaximumLength, TAG_FILE_NAME);
+            if (!Buffer) ExRaiseStatus(STATUS_INSUFFICIENT_RESOURCES);
+            UName.Buffer = Buffer;
+            Status = RtlUpcaseUnicodeString(&UName, Name, FALSE);
+            if (!NT_SUCCESS(Status)) ExRaiseStatus(Status);
+            hashes->hLfn = crc32((uint8*)(UName.Buffer), UName.Length);
+        } _SEH2_FINALLY {
+            if (Buffer) ExFreePoolWithTag(Buffer, TAG_FILE_NAME);
+        } _SEH2_END;
     }
 
     if (Mask & HASH_DOS) {
@@ -491,18 +519,51 @@ UDFValidateDirectoryFid(
         FileId->descTag.tagLocation != ExpectedLocation)
         return STATUS_FILE_CORRUPT_ERROR;
 
+    /* Deleted names can use their erased-name representation. Every live
+     * component must be a bounded CS0 string; a parent FID has no name. */
+    if (!(FileId->fileCharacteristics & FILE_DELETED)) {
+        const uint8* Name = Bytes + sizeof(*FileId) + FileId->lengthOfImpUse;
+        if (FileId->fileCharacteristics & FILE_PARENT) {
+            if (FileId->lengthFileIdent) return STATUS_FILE_CORRUPT_ERROR;
+        } else if (FileId->lengthFileIdent < 2 ||
+            (Name[0] != UDF_COMP_ID_8 && Name[0] != UDF_COMP_ID_16) ||
+            (Name[0] == UDF_COMP_ID_16 && !(FileId->lengthFileIdent & 1))) {
+            return STATUS_FILE_CORRUPT_ERROR;
+        }
+    }
     *RecordLength = AlignedLength;
     return STATUS_SUCCESS;
 }
 
-/*
-    This routine scans directory extent & builds index table for FileIdents
- */
-NTSTATUS
-UDFIndexDirectory(
+/* Only an unpublished index owns these names outright. The generic frame
+ * destructor is also used after callers already retired their names, so do
+ * not change its contract or free borrowed dot/parent names there. */
+static VOID
+UDFDiscardDirectoryIndex(PDIR_INDEX_HDR Index)
+{
+    uint_di i;
+    PDIR_INDEX_ITEM Entry;
+    if (!Index) return;
+    for (i = 0; (Entry = UDFDirIndex(Index, i)); i++) {
+        if (!(Entry->FI_Flags & UDF_FI_FLAG_KEEP_NAME) && Entry->FName.Buffer)
+            MyFreePool__(Entry->FName.Buffer);
+    }
+    UDFDirIndexFree(Index);
+}
+
+typedef struct _UDF_DIRECTORY_INDEX_BUILD {
+    int8* Buffer;
+    PDIR_INDEX_HDR Index;
+} UDF_DIRECTORY_INDEX_BUILD;
+
+/* Both allocations are published to a volatile, private stack owner before
+ * subsequent work can raise. No partially populated index escapes to Dloc. */
+static NTSTATUS
+UDFIndexDirectoryInternal(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN OUT PUDF_FILE_INFO FileInfo
+    IN OUT PUDF_FILE_INFO FileInfo,
+    IN OUT volatile UDF_DIRECTORY_INDEX_BUILD* Build
     )
 {
     PDIR_INDEX_HDR hDirNdx;
@@ -523,17 +584,15 @@ UDFIndexDirectory(
     ValidateFileInfo(FileInfo);
 
     ExtInfo = &(FileInfo->Dloc->DataLoc);
-    FileInfo->Dloc->DirIndex = NULL;
     UDFPrint(("UDF: scaning directory\n"));
     // allocate buffer for the whole directory
-    ASSERT((uint32)(ExtInfo->Length));
-
-    if (!ExtInfo->Length || ExtInfo->Length > 0xffffffffu) {
-
+    if (ExtInfo->Length <= 0 || ExtInfo->Length > 0xffffffffu) {
         return STATUS_FILE_CORRUPT_ERROR;
     }
+    ASSERT((uint32)(ExtInfo->Length));
 
     buff = (int8*)DbgAllocatePool(PagedPool, (uint32)(ExtInfo->Length));
+    Build->Buffer = buff;
     if (!buff)
         return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -542,7 +601,6 @@ UDFIndexDirectory(
     // read FileIdents
     status = UDFReadFile__(IrpContext, Vcb, FileInfo, 0, (uint32)(ExtInfo->Length), FALSE, buff);
     if (!NT_SUCCESS(status)) {
-        DbgFreePool(buff);
         return status;
     }
     // scan Dir to get entry counter
@@ -555,7 +613,6 @@ UDFIndexDirectory(
                                          (uint32)ExtInfo->Length,
                                          &RecordLength);
         if (!NT_SUCCESS(status)) {
-            DbgFreePool(buff);
             return status;
         }
         if (((ULONG)Offset & (Vcb->SectorSize-1)) > (Vcb->SectorSize-sizeof(FILE_IDENT_DESC))) {
@@ -567,7 +624,6 @@ UDFIndexDirectory(
         Count++;
         if (ExtInfo->Length - Offset < sizeof(FILE_IDENT_DESC)) {
             if (Offset != ExtInfo->Length) {
-                DbgFreePool(buff);
                 return STATUS_FILE_CORRUPT_ERROR;
             }
             break;
@@ -577,14 +633,13 @@ UDFIndexDirectory(
     if (Offset > ExtInfo->Length) {
         BrutePoint();
         UDFPrint(("  Unexpected end of Dir\n"));
-        DbgFreePool(buff);
         return STATUS_FILE_CORRUPT_ERROR;
     }
     // allocate buffer for directory index & zero it
     DirPrint(("  Count %x\n", Count));
     hDirNdx = UDFDirIndexAlloc(Count+1);
+    Build->Index = hDirNdx;
     if (!hDirNdx) {
-        DbgFreePool(buff);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -602,8 +657,6 @@ UDFIndexDirectory(
         UDFPhysLbaToPart(Vcb, PartNum, FileInfo->Dloc->FELoc.Mapping[0].extLocation);
     if (DirNdx->FileEntryLoc.logicalBlockNum == (ULONG)-1) {
         DirPrint(("  err: FileEntryLoc=-1\n"));
-        DbgFreePool(buff);
-        UDFDirIndexFree(hDirNdx);
         return STATUS_FILE_CORRUPT_ERROR;
     }
     DirNdx->FileCharacteristics = (FileInfo->FileIdent) ?
@@ -611,9 +664,9 @@ UDFIndexDirectory(
                          FILE_DIRECTORY;
 //    DirNdx->Offset = 0;
 //    DirNdx->Length = 0;
+    DirNdx->FI_Flags |= UDF_FI_FLAG_KEEP_NAME;
     RtlInitUnicodeString(&DirNdx->FName, L".");
     DirNdx->FileInfo = FileInfo;
-    DirNdx->FI_Flags |= UDF_FI_FLAG_KEEP_NAME;
     DirNdx->FI_Flags |= UDFBuildHashEntry(Vcb, &(DirNdx->FName), &(DirNdx->hashes),
         HASH_ALL | HASH_KEEP_NAME);
     Count++;
@@ -626,8 +679,6 @@ UDFIndexDirectory(
                                          (uint32)ExtInfo->Length,
                                          &RecordLength);
         if (!NT_SUCCESS(status)) {
-            DbgFreePool(buff);
-            UDFDirIndexFree(hDirNdx);
             return status;
         }
         DirNdx = UDFDirIndex(hDirNdx,Count);
@@ -641,13 +692,22 @@ UDFIndexDirectory(
         DirPrint(("  DirNdx: Length %x, Charact %x\n", DirNdx->Length, FileId->fileCharacteristics));
         if (FileId->fileCharacteristics & FILE_PARENT) {
             DirPrint(("  parent\n"));
-            // init 'parent' entry
-            // '..' points to Parent Object (if any),
-            // otherwise it points to the Dir itself
-            RtlInitUnicodeString(&DirNdx->FName, L"..");
-            DirNdx->FileInfo = (FileInfo->ParentFile) ?
-                                      FileInfo->ParentFile : FileInfo;
+            uint32 ParentLba = UDFPartLbaToPhys(Vcb, &FileId->icb.extLocation);
+            /* ParentFile owns this FI's namespace/open context. It is a
+             * weak '..' cache only when it describes the actual FID target.
+             * A parentless open-by-ID of a non-root is not its own parent. */
             DirNdx->FI_Flags |= UDF_FI_FLAG_KEEP_NAME;
+            RtlInitUnicodeString(&DirNdx->FName, L"..");
+            DirNdx->FileInfo = NULL;
+            if (ParentLba != LBA_OUT_OF_EXTENT) {
+                if (FileInfo->ParentFile && FileInfo->ParentFile->Dloc &&
+                    FileInfo->ParentFile->Dloc->FELoc.Mapping &&
+                    FileInfo->ParentFile->Dloc->FELoc.Mapping[0].extLocation == ParentLba)
+                    DirNdx->FileInfo = FileInfo->ParentFile;
+                else if (FileInfo->Dloc->FELoc.Mapping &&
+                         FileInfo->Dloc->FELoc.Mapping[0].extLocation == ParentLba)
+                    DirNdx->FileInfo = FileInfo; /* real root/self FID only */
+            }
             DirNdx->FI_Flags |= UDFBuildHashEntry(Vcb, &(DirNdx->FName), &(DirNdx->hashes), HASH_ALL | HASH_KEEP_NAME);
         } else {
 
@@ -660,6 +720,9 @@ UDFIndexDirectory(
                              FileId->lengthFileIdent,
                              &valueCRC);
 
+            if (!DirNdx->FName.Buffer &&
+                !(FileId->fileCharacteristics & FILE_DELETED))
+                return STATUS_INSUFFICIENT_RESOURCES;
             UDFNormalizeFileName(&(DirNdx->FName), valueCRC);
 
             DirNdx->FI_Flags |= UDFBuildHashEntry(Vcb, &(DirNdx->FName), &(DirNdx->hashes), HASH_ALL);
@@ -703,23 +766,36 @@ UDFIndexDirectory(
         Count++;
         if (ExtInfo->Length - Offset < sizeof(FILE_IDENT_DESC)) {
             if (Offset != ExtInfo->Length) {
-                DbgFreePool(buff);
-                UDFDirIndexFree(hDirNdx);
                 return STATUS_FILE_CORRUPT_ERROR;
             }
             break;
         }
     } // while()
     // we needn't writing terminator 'cause the buffer is already zero-filled
-    DbgFreePool(buff);
     if (Count < 2) {
-        UDFDirIndexFree(hDirNdx);
         UDFPrint(("  Directory too short\n"));
         return STATUS_FILE_CORRUPT_ERROR;
     }
     // store index
     FileInfo->Dloc->DirIndex = hDirNdx;
+    Build->Index = NULL; /* committed to Dloc; scratch buffer stays private */
     return status;
+}
+
+NTSTATUS
+UDFIndexDirectory(PIRP_CONTEXT IrpContext, PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    _SEH2_VOLATILE UDF_DIRECTORY_INDEX_BUILD Build = {0};
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    if (!Vcb || !FileInfo || !FileInfo->Dloc) return STATUS_INVALID_PARAMETER;
+    if (FileInfo->Dloc->DirIndex) return STATUS_INVALID_DEVICE_STATE;
+    _SEH2_TRY {
+        Status = UDFIndexDirectoryInternal(IrpContext, Vcb, FileInfo, &Build);
+    } _SEH2_FINALLY {
+        if (Build.Buffer) DbgFreePool(Build.Buffer);
+        if (Build.Index) UDFDiscardDirectoryIndex(Build.Index);
+    } _SEH2_END;
+    return Status;
 } // end UDFIndexDirectory()
 
 
@@ -1040,13 +1116,22 @@ retag_complete:
     returns corresponding offset in extent if found.
  */
 NTSTATUS
-UDFFindFile(
+UDFFindFile(PVCB Vcb, BOOLEAN IgnoreCase, BOOLEAN NotDeleted,
+            PUNICODE_STRING Name, PUDF_FILE_INFO DirInfo, uint_di* Index)
+{
+    return UDFFindFileExceptIndex(Vcb, IgnoreCase, NotDeleted, Name,
+                                  DirInfo, Index, (uint_di)-1);
+}
+
+NTSTATUS
+UDFFindFileExceptIndex(
     IN PVCB Vcb,
     IN BOOLEAN IgnoreCase,
     IN BOOLEAN NotDeleted,
     IN PUNICODE_STRING Name,
     IN PUDF_FILE_INFO DirInfo,
- IN OUT uint_di* Index      // IN:start index OUT:found file index
+ IN OUT uint_di* Index,     // IN:start index OUT:found file index
+    IN uint_di ExcludedIndex
     )
 {
 //    PDIR_INDEX_HDR hDirIndex = DirInfo->Dloc->DirIndex;
@@ -1072,6 +1157,8 @@ UDFFindFile(
         // perform case sensetive sequential directory scan
 
         while((DirNdx = UDFDirIndexScan(&ScanContext, NULL))) {
+            if (ScanContext.i == ExcludedIndex)
+                continue;
             if ( (DirNdx->hashes.hPosix == hashes.hPosix) &&
                  DirNdx->FName.Buffer &&
                 (!RtlCompareUnicodeString(&(DirNdx->FName), Name, FALSE)) &&
@@ -1086,6 +1173,8 @@ UDFFindFile(
     if (hashes.hPosix == hashes.hLfn) {
 
         while((DirNdx = UDFDirIndexScan(&ScanContext, NULL))) {
+            if (ScanContext.i == ExcludedIndex)
+                continue;
             if (!DirNdx->FName.Buffer ||
                (NotDeleted && UDFIsDeleted(DirNdx)) )
                 continue;
@@ -1107,6 +1196,8 @@ UDFFindFile(
     } else {
 
         while((DirNdx = UDFDirIndexScan(&ScanContext, NULL))) {
+            if (ScanContext.i == ExcludedIndex)
+                continue;
             // perform sequential directory scan
             if (!DirNdx->FName.Buffer ||
                (NotDeleted && UDFIsDeleted(DirNdx)) )
@@ -1144,7 +1235,7 @@ UDFFindFile(
 
     return STATUS_OBJECT_NAME_NOT_FOUND;
 
-} // end UDFFindFile()
+} // end UDFFindFileExceptIndex()
 
 /*
     Find file in directory and fill enumeration context.
@@ -1312,183 +1403,376 @@ UDFFindFreeDloc(
 } // end UDFFindFreeDloc()
 
 /*
- */
-NTSTATUS
-UDFAcquireDloc(
-    IN PVCB Vcb,
-    IN PUDF_DATALOC_INFO Dloc
-    )
-{
-    UDFAcquireResourceExclusive(&(Vcb->DlocResource2),TRUE);
-    if (Dloc->FE_Flags & UDF_FE_FLAG_UNDER_INIT) {
-        UDFReleaseResource(&(Vcb->DlocResource2));
-        return STATUS_SHARING_PAUSED;
-    }
-    Dloc->FE_Flags |= UDF_FE_FLAG_UNDER_INIT;
-    UDFReleaseResource(&(Vcb->DlocResource2));
-    return STATUS_SUCCESS;
-} // end UDFAcquireDloc()
-
-/*
- */
-NTSTATUS
-UDFReleaseDloc(
-    IN PVCB Vcb,
-    IN PUDF_DATALOC_INFO Dloc
-    )
-{
-    UDFAcquireResourceExclusive(&(Vcb->DlocResource2),TRUE);
-    Dloc->FE_Flags &= ~UDF_FE_FLAG_UNDER_INIT;
-    UDFReleaseResource(&(Vcb->DlocResource2));
-    return STATUS_SUCCESS;
-} // end UDFReleaseDloc()
-
-/*
     Try to store FE location in cache
     If it is already in use, caller will be informed about it
  */
-NTSTATUS
-UDFStoreDloc(
-    IN PVCB Vcb,
-    IN PUDF_FILE_INFO fi,
-    IN uint32 Lba
-    )
+/* Existing-file constructors own one early FI reference. New private FEs
+ * remain UNDER_INIT until publication. LinkRefCount is the sum of real FI
+ * holds; each hold contributes to its exact parent's OpenCount. */
+static BOOLEAN
+UDFCanAddFileReference(PUDF_FILE_INFO FileInfo, PUDF_DATALOC_INFO Dloc)
 {
-    LONG i;
-    PUDF_DATALOC_INFO Dloc;
+    return FileInfo->RefCount < MAXLONG && Dloc->LinkRefCount < MAXLONG &&
+        (!FileInfo->ParentFile || FileInfo->ParentFile->OpenCount < MAXLONG);
+}
 
-    if (!Lba) return STATUS_INVALID_PARAMETER;
-    if (Lba == (ULONG)-1) return STATUS_INVALID_PARAMETER;
+static NTSTATUS
+UDFStoreDlocInternal(PVCB Vcb, PUDF_FILE_INFO FileInfo, uint32 Lba,
+                     BOOLEAN RequireNew)
+{
+    LONG index;
+    _SEH2_VOLATILE PUDF_DATALOC_INFO Dloc = NULL;
+    _SEH2_VOLATILE BOOLEAN NewDloc = FALSE, Attached = FALSE;
+    _SEH2_VOLATILE BOOLEAN IndexLocked = FALSE, ReferencesLocked = FALSE;
+    NTSTATUS Status = STATUS_SUCCESS;
 
-    UDFAcquireResourceExclusive(&(Vcb->DlocResource),TRUE);
-
-    // check if FE specified is already in use
-    if ((i = UDFFindDloc(Vcb, Lba)) == (-1)) {
-        // not used
-        if ((i = UDFFindFreeDloc(Vcb, Lba)) == (-1)) {
-            UDFReleaseResource(&(Vcb->DlocResource));
-            return STATUS_INSUFFICIENT_RESOURCES;
+    if (!Vcb || !FileInfo || !Lba || Lba == MAXULONG || FileInfo->Dloc ||
+        FileInfo->RefCount || FileInfo->Constructing)
+        return STATUS_INVALID_PARAMETER;
+    _SEH2_TRY {
+    UDFAcquireResourceExclusive(&Vcb->DlocResource, TRUE);
+    IndexLocked = TRUE;
+    index = UDFFindDloc(Vcb, Lba);
+    if (index >= 0) {
+        Dloc = Vcb->DlocList[index].Dloc;
+        if (RequireNew) {
+            /* A newly allocated FE must not overwrite a cached generation
+             * at the same LBA, even if the bitmap incorrectly offered it. */
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
         }
     } else {
-        if (!NT_SUCCESS(UDFAcquireDloc(Vcb, Dloc = Vcb->DlocList[i].Dloc))) {
-            UDFReleaseResource(&(Vcb->DlocResource));
-            return STATUS_SHARING_PAUSED;
+        index = UDFFindFreeDloc(Vcb, Lba);
+        if (index < 0) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            _SEH2_LEAVE;
         }
-        // update caller's structures & exit
-        fi->Dloc = Dloc;
-        UDFReleaseDloc(Vcb, Dloc);
-#if defined UDF_DBG
-        if (fi->Dloc->CommonFcb) {
-            ASSERT((uintptr_t)(fi->Dloc->CommonFcb) != 0xDEADDA7A);
-            ASSERT_FCB(fi->Dloc->CommonFcb);
+        Dloc = (PUDF_DATALOC_INFO)MyAllocatePoolTag__(
+            UDF_DATALOC_INFO_MT, sizeof(*Dloc), MEM_DLOC_INF_TAG);
+        if (!Dloc) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            _SEH2_LEAVE;
         }
-#endif // UDF_DBG
-        UDFReleaseResource(&(Vcb->DlocResource));
-        return STATUS_SUCCESS;
+        RtlZeroMemory(Dloc, sizeof(*Dloc));
+        Dloc->LinkedFileInfo = FileInfo;
+        NewDloc = TRUE;
     }
-    // allocate common DataLocation (Dloc) descriptor
-    Dloc = fi->Dloc = (PUDF_DATALOC_INFO)MyAllocatePoolTag__(UDF_DATALOC_INFO_MT, sizeof(UDF_DATALOC_INFO), MEM_DLOC_INF_TAG);
-    if (!Dloc) {
-        UDFReleaseResource(&(Vcb->DlocResource));
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    Vcb->DlocList[i].Lba = Lba;
-    Vcb->DlocList[i].Dloc = Dloc;
-    RtlZeroMemory(Dloc, sizeof(UDF_DATALOC_INFO));
-    Vcb->DlocFreeHint = (ULONG)i + 1;
-    Dloc->LinkedFileInfo = fi;
-    UDFAcquireDloc(Vcb, Dloc);
-    UDFReleaseResource(&(Vcb->DlocResource));
-    return STATUS_SUCCESS;
-} // end UDFStoreDloc()
 
-/*
-    Remove unreferenced FE location from cache & free allocated memory
-    This routine must be invoked when there are no more opened files
-    associated with given FE
- */
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    ReferencesLocked = TRUE;
+    if (Vcb->RetainedOpenCount || Dloc->CleanupOwner || Dloc->AllocationReleaseActive ||
+        !NT_SUCCESS(Dloc->AllocationReleaseError) || Dloc->NamespaceScratchOwner || Dloc->StreamDeleteContextOwner || Dloc->StreamCreate || Dloc->CreateRollbackOwner || Dloc->CreateConstructionOwner ||
+        (Dloc->FE_Flags & UDF_FE_FLAG_UNDER_INIT)) {
+        Status = Vcb->RetainedOpenCount ? STATUS_FILE_CORRUPT_ERROR :
+            !NT_SUCCESS(Dloc->AllocationReleaseError) ? Dloc->AllocationReleaseError : STATUS_SHARING_PAUSED;
+        _SEH2_LEAVE;
+    }
+    if (!RequireNew && !UDFCanAddFileReference(FileInfo, Dloc)) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        _SEH2_LEAVE;
+    }
+    /* All fallible allocation/resource admission is complete. No callback
+     * or I/O occurs in this publication/reference group. */
+    Attached = TRUE;
+    FileInfo->Dloc = Dloc;
+    FileInfo->Constructing = TRUE;
+    FileInfo->DlocInitOwner = NewDloc;
+    FileInfo->ConstructionFailed = FALSE;
+    FileInfo->ConstructionReferenceOwned = !RequireNew;
+    FileInfo->ConstructionParent = RequireNew ? NULL : FileInfo->ParentFile;
+    if (NewDloc) {
+        Dloc->FE_Flags |= UDF_FE_FLAG_UNDER_INIT;
+        Vcb->DlocList[index].Lba = Lba;
+        Vcb->DlocList[index].Dloc = Dloc;
+        Vcb->DlocFreeHint = (ULONG)index + 1;
+    } else {
+        UDFInsertLinkedFile(FileInfo, Dloc->LinkedFileInfo);
+    }
+    /* Existing-file constructors can race the old canonical FCB. Pin
+     * those immediately. A private, newly allocated FE is protected by
+     * UNDER_INIT and the creator's parent resource until publication. */
+    if (FileInfo->ConstructionReferenceOwned)
+        UDFReferenceFile__(FileInfo);
+    } _SEH2_FINALLY {
+        if (ReferencesLocked) UDFReleaseResource(&Vcb->DlocResource2);
+        if (IndexLocked) UDFReleaseResource(&Vcb->DlocResource);
+        if (NewDloc && !Attached) MyFreePool__(Dloc); /* never published */
+    } _SEH2_END;
+    return Status;
+}
+
 NTSTATUS
-UDFRemoveDloc(
-    IN PVCB Vcb,
-    IN PUDF_DATALOC_INFO Dloc
-    )
+UDFStoreDloc(PVCB Vcb, PUDF_FILE_INFO FileInfo, uint32 Lba)
 {
-    LONG i;
+    return UDFStoreDlocInternal(Vcb, FileInfo, Lba, FALSE);
+}
 
-    if (!UDFReleaseDirectoryAppend(Vcb, Dloc))
-        return STATUS_CANNOT_DELETE;
-    UDFAbandonDeletePrefreeDloc(Vcb, Dloc);
-    UDFAcquireResourceExclusive(&(Vcb->DlocResource),TRUE);
-
-    if ((i = UDFFindDlocInMem(Vcb, Dloc)) == (-1)) {
-        // FE specified is not in cache. exit
-        UDFReleaseResource(&(Vcb->DlocResource));
-        return STATUS_INVALID_PARAMETER;
-    }
-    // remove from cache
-    ASSERT(Vcb->DlocList);
-    RtlZeroMemory(&(Vcb->DlocList[i]), sizeof(UDF_DATALOC_INDEX));
-    Vcb->DlocFreeHint = min(Vcb->DlocFreeHint, (ULONG)i);
-    UDFReleaseResource(&(Vcb->DlocResource));
-    UDFReleaseDirectoryFECheckpoint(Vcb, Dloc);
-    MyFreePool__(Dloc);
-    return STATUS_SUCCESS;
-} // end UDFRemoveDloc()
-
-/*
-    Remove unlinked FE location from cache & keep allocated memory
-    This routine must be invoked when there are no more opened files
-    associated with given FE
- */
 NTSTATUS
-UDFUnlinkDloc(
-    IN PVCB Vcb,
-    IN PUDF_DATALOC_INFO Dloc
-    )
+UDFCreateDloc(PVCB Vcb, PUDF_FILE_INFO FileInfo, uint32 Lba)
 {
-    LONG i;
+    return UDFStoreDlocInternal(Vcb, FileInfo, Lba, TRUE);
+}
 
-    UDFAcquireResourceExclusive(&(Vcb->DlocResource),TRUE);
-
-    if ((i = UDFFindDlocInMem(Vcb, Dloc)) == (-1)) {
-        // FE specified is not in cache. exit
-        UDFReleaseResource(&(Vcb->DlocResource));
-        return STATUS_INVALID_PARAMETER;
+NTSTATUS
+UDFCompleteFileInfoConstruction(PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    PUDF_DATALOC_INFO Dloc = FileInfo->Dloc;
+    if (!Dloc) return STATUS_FILE_INVALID;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    if (FileInfo->ConstructionReferenceOwned &&
+        (!FileInfo->RefCount || Dloc->LinkRefCount < FileInfo->RefCount ||
+         FileInfo->ConstructionParent != FileInfo->ParentFile ||
+         (FileInfo->ConstructionParent && (!FileInfo->ConstructionParent->Dloc ||
+                                           !FileInfo->ConstructionParent->OpenCount)))) {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+    } else if (Vcb->RetainedOpenCount || !FileInfo->Constructing ||
+        FileInfo->ConstructionFailed || Dloc->CleanupOwner || Dloc->CreateRollbackOwner ||
+        (Dloc->CreateConstructionOwner && Dloc->CreateConstructionOwner != FileInfo)) {
+        Status = Vcb->RetainedOpenCount ? STATUS_FILE_CORRUPT_ERROR : STATUS_SHARING_PAUSED;
+    } else if (!FileInfo->ConstructionReferenceOwned && !UDFCanAddFileReference(FileInfo, Dloc)) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+    } else {
+        /* Transfer an early reader pin, or publish the creator's first
+         * open reference. Never acquire a second hold for a reader. */
+        if (!FileInfo->ConstructionReferenceOwned)
+            UDFReferenceFile__(FileInfo);
+        FileInfo->ConstructionReferenceOwned = FALSE;
+        FileInfo->Constructing = FALSE;
+        FileInfo->ConstructionParent = NULL;
+        if (FileInfo->DlocInitOwner)
+            Dloc->FE_Flags &= ~UDF_FE_FLAG_UNDER_INIT;
+        FileInfo->DlocInitOwner = FALSE;
     }
-    // remove from cache
-    ASSERT(Vcb->DlocList);
-    RtlZeroMemory(&(Vcb->DlocList[i]), sizeof(UDF_DATALOC_INDEX));
-    Vcb->DlocFreeHint = min(Vcb->DlocFreeHint, (ULONG)i);
-    UDFReleaseResource(&(Vcb->DlocResource));
-    return STATUS_SUCCESS;
-} // end UDFUnlinkDloc()
+    UDFReleaseResource(&Vcb->DlocResource2);
+    return Status;
+}
 
-/*
-    This routine releases memory allocated for Dloc & removes it from
-    cache (if it is still there)
- */
-void
-UDFFreeDloc(
-    IN PVCB Vcb,
-    IN PUDF_DATALOC_INFO Dloc
-    )
+VOID
+UDFDropFileInfoConstruction(PVCB Vcb, PUDF_FILE_INFO FileInfo)
 {
-    LONG i;
-
-    if (!UDFReleaseDirectoryAppend(Vcb, Dloc))
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    if (FileInfo->CreateConstructionParent ||
+        (FileInfo->Dloc && FileInfo->Dloc->CreateConstructionOwner)) {
+        /* A private publication owner must explicitly release its parent
+         * or retain the failed generation. A generic failed-open cleanup
+         * cannot erase UNDER_INIT or spend that operation's token. */
+        FileInfo->ConstructionFailed = TRUE;
+        FileInfo->CleanupPending = TRUE;
+        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                    STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+        UDFReleaseResource(&Vcb->DlocResource2);
         return;
-    UDFAbandonDeletePrefreeDloc(Vcb, Dloc);
-    UDFAcquireResourceExclusive(&(Vcb->DlocResource),TRUE);
-
-    if ((i = UDFFindDlocInMem(Vcb, Dloc)) != (-1)) {
-        ASSERT(Vcb->DlocList);
-        RtlZeroMemory(&(Vcb->DlocList[i]), sizeof(UDF_DATALOC_INDEX));
-        Vcb->DlocFreeHint = min(Vcb->DlocFreeHint, (ULONG)i);
     }
-    UDFReleaseResource(&(Vcb->DlocResource));
-    UDFReleaseDirectoryFECheckpoint(Vcb, Dloc);
-    MyFreePool__(Dloc);
-} // end UDFFreeDloc()
+    if (FileInfo->Constructing) {
+        ASSERT(FileInfo->Dloc);
+        if (FileInfo->ConstructionReferenceOwned) {
+            ASSERT(FileInfo->RefCount);
+            if (!FileInfo->Dloc || !FileInfo->RefCount ||
+                !FileInfo->Dloc->LinkRefCount ||
+                (FileInfo->ConstructionParent && !FileInfo->ConstructionParent->OpenCount)) {
+                FileInfo->ConstructionFailed = TRUE;
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+                InterlockedCompareExchange(&Vcb->MetadataWritebackError,
+                                            STATUS_FILE_CORRUPT_ERROR, STATUS_SUCCESS);
+                UDFReleaseResource(&Vcb->DlocResource2);
+                return; /* retain the unresolved hold; never underflow it */
+            }
+            InterlockedDecrement((PLONG)&FileInfo->RefCount);
+            InterlockedDecrement((PLONG)&FileInfo->Dloc->LinkRefCount);
+            if (FileInfo->ConstructionParent)
+                InterlockedDecrement((PLONG)&FileInfo->ConstructionParent->OpenCount);
+        }
+        FileInfo->ConstructionReferenceOwned = FALSE;
+        FileInfo->ConstructionParent = NULL;
+        FileInfo->Constructing = FALSE;
+        FileInfo->ConstructionFailed = TRUE;
+        /* A failed first initializer remains UNDER_INIT until discarded.
+         * Never expose its partial mapping as a successfully loaded cache. */
+    }
+    UDFReleaseResource(&Vcb->DlocResource2);
+}
+
+NTSTATUS
+UDFSetFileInfoConstructionParent(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                                 PUDF_FILE_INFO Parent)
+{
+    _SEH2_VOLATILE NTSTATUS Status = STATUS_SUCCESS;
+    PUDF_FILE_INFO OldParent;
+    if (!FileInfo || !FileInfo->Dloc || Parent == FileInfo || (Parent && !Parent->Dloc))
+        return STATUS_FILE_INVALID;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    _SEH2_TRY {
+        if (!FileInfo->Constructing || FileInfo->ConstructionFailed) {
+            Status = STATUS_FILE_INVALID;
+            _SEH2_LEAVE;
+        }
+        if (FileInfo->CreateConstructionParent && FileInfo->CreateConstructionParent != Parent) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE; /* the private constructor owner pins this exact parent */
+        }
+        OldParent = FileInfo->ConstructionParent;
+        if (FileInfo->ConstructionReferenceOwned) {
+            if (!FileInfo->RefCount || FileInfo->Dloc->LinkRefCount < FileInfo->RefCount ||
+                FileInfo->ParentFile != OldParent ||
+                (OldParent && (!OldParent->Dloc || !OldParent->OpenCount))) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+            if (OldParent != Parent) {
+                if (Parent && Parent->OpenCount >= MAXLONG) {
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                    _SEH2_LEAVE;
+                }
+                /* Both sides are admitted before changing either count.
+                 * No callback separates the exact parent-token transfer. */
+                if (Parent) InterlockedIncrement((PLONG)&Parent->OpenCount);
+                if (OldParent) InterlockedDecrement((PLONG)&OldParent->OpenCount);
+                FileInfo->ConstructionParent = Parent;
+            }
+        } else if (FileInfo->RefCount) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
+        }
+        FileInfo->ParentFile = Parent;
+    } _SEH2_FINALLY {
+        if (Status == STATUS_FILE_CORRUPT_ERROR) {
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            InterlockedCompareExchange(&Vcb->MetadataWritebackError, Status, STATUS_SUCCESS);
+        }
+        UDFReleaseResource(&Vcb->DlocResource2);
+    } _SEH2_END;
+    return Status;
+}
+
+NTSTATUS
+UDFReferenceFileChecked(PVCB Vcb, PUDF_FILE_INFO FileInfo)
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    PUDF_DATALOC_INFO Dloc = FileInfo ? FileInfo->Dloc : NULL;
+    if (!Dloc) return STATUS_FILE_INVALID;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    if (Vcb->RetainedOpenCount || Dloc->CleanupOwner || Dloc->AllocationReleaseActive ||
+        !NT_SUCCESS(Dloc->AllocationReleaseError) || Dloc->NamespaceScratchOwner || Dloc->StreamDeleteContextOwner || Dloc->StreamCreate || Dloc->CreateRollbackOwner || Dloc->CreateConstructionOwner || FileInfo->Constructing ||
+        FileInfo->ConstructionFailed || FileInfo->TemporaryRetired ||
+        (Dloc->FE_Flags & UDF_FE_FLAG_UNDER_INIT))
+        Status = Vcb->RetainedOpenCount ? STATUS_FILE_CORRUPT_ERROR :
+            !NT_SUCCESS(Dloc->AllocationReleaseError) ? Dloc->AllocationReleaseError : STATUS_SHARING_PAUSED;
+    else if (!UDFCanAddFileReference(FileInfo, Dloc))
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+    else
+        UDFReferenceFile__(FileInfo);
+    UDFReleaseResource(&Vcb->DlocResource2);
+    return Status;
+}
+
+NTSTATUS
+UDFReferenceClonedFile(PVCB Vcb, PUDF_FILE_INFO FileInfo,
+                       PUDF_FILE_INFO Source)
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    PUDF_DATALOC_INFO Dloc = Source->Dloc;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    if (!Dloc || Vcb->RetainedOpenCount || Dloc->CleanupOwner || Dloc->AllocationReleaseActive ||
+        !NT_SUCCESS(Dloc->AllocationReleaseError) || Dloc->NamespaceScratchOwner || Dloc->StreamDeleteContextOwner || Dloc->StreamCreate || Dloc->CreateRollbackOwner || Dloc->CreateConstructionOwner || Source->Constructing ||
+        Source->ConstructionFailed || Source->TemporaryRetired ||
+        (Dloc->FE_Flags & UDF_FE_FLAG_UNDER_INIT)) {
+        Status = !Dloc ? STATUS_FILE_INVALID : Vcb->RetainedOpenCount ? STATUS_FILE_CORRUPT_ERROR :
+            !NT_SUCCESS(Dloc->AllocationReleaseError) ? Dloc->AllocationReleaseError : STATUS_SHARING_PAUSED;
+    } else if (!UDFCanAddFileReference(FileInfo, Dloc)) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+    } else {
+        InitializeListHead(&FileInfo->CreateRollbackLinks);
+        FileInfo->CreateRollbackPhase = 0;
+        FileInfo->CreateRollbackCounted = FileInfo->CreateRollbackTouched = FALSE;
+        FileInfo->CreateFailureStatus = FileInfo->CreateRollbackFirstError =
+            FileInfo->CreateRollbackLastError = STATUS_SUCCESS;
+        FileInfo->CreateConstructionParent = NULL;
+        FileInfo->CreateConstructionError = STATUS_SUCCESS;
+        FileInfo->CreateConstructionCounted = FileInfo->CreateConstructionOpenOwned = FALSE;
+        FileInfo->Constructing = FALSE;
+        FileInfo->DlocInitOwner = FALSE;
+        FileInfo->ConstructionFailed = FALSE;
+        FileInfo->ConstructionReferenceOwned = FALSE;
+        FileInfo->ConstructionParent = NULL;
+        FileInfo->RetainedOpenReferences = 0;
+        FileInfo->RetainedOpenError = STATUS_SUCCESS;
+        FileInfo->CleanupPending = FALSE;
+        FileInfo->InternalOpenReleased = FALSE;
+        FileInfo->TemporaryRetired = FALSE;
+        UDFInsertLinkedFile(FileInfo, Source);
+        UDFReferenceFile__(FileInfo);
+    }
+    UDFReleaseResource(&Vcb->DlocResource2);
+    return Status;
+}
+
+/* Check before any fallible allocation release, then detach immediately
+ * before memory-only destruction. A failed decision leaves the indexed
+ * generation, cleanup claim, buffers and prefree receipt owned in place. */
+NTSTATUS
+UDFCheckDlocCleanup(PVCB Vcb, PUDF_FILE_INFO FileInfo, BOOLEAN Detach)
+{
+    PUDF_DATALOC_INFO Dloc = FileInfo ? FileInfo->Dloc : NULL;
+    _SEH2_VOLATILE BOOLEAN IndexLocked = FALSE, ReferencesLocked = FALSE;
+    NTSTATUS Status = STATUS_SUCCESS;
+    LONG Slot;
+    if (!Dloc || !ExIsResourceAcquiredExclusiveLite(&Vcb->VcbResource) ||
+        Dloc->CleanupOwner != PsGetCurrentThread())
+        return STATUS_INVALID_DEVICE_STATE;
+    if (Dloc->AllocationReleaseActive) return STATUS_DEVICE_BUSY;
+    if (!NT_SUCCESS(Dloc->AllocationReleaseError)) return Dloc->AllocationReleaseError;
+    if (!NT_SUCCESS(Dloc->ZeroDataError)) return Dloc->ZeroDataError;
+    if (!NT_SUCCESS(Dloc->CacheSizeError)) return Dloc->CacheSizeError;
+    if (!NT_SUCCESS(Dloc->NamespaceTargetError)) return Dloc->NamespaceTargetError;
+    if (!UDFReleaseDirectoryAppend(Vcb, Dloc)) return STATUS_DEVICE_BUSY;
+    _SEH2_TRY {
+        UDFAcquireResourceExclusive(&Vcb->DlocResource, TRUE);
+        IndexLocked = TRUE;
+        UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+        ReferencesLocked = TRUE;
+        Slot = UDFFindDlocInMem(Vcb, Dloc);
+        if (Slot < 0 || FileInfo->Dloc != Dloc || Dloc->LinkedFileInfo != FileInfo ||
+            FileInfo->NextLinkedFile != FileInfo || FileInfo->PrevLinkedFile != FileInfo ||
+            Dloc->CleanupOwner != PsGetCurrentThread()) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
+        }
+        if (FileInfo->RefCount || FileInfo->OpenCount || FileInfo->Fcb || FileInfo->Constructing ||
+            FileInfo->RetainedOpenReferences || FileInfo->CreateConstructionParent ||
+            Dloc->LinkRefCount || Dloc->CommonFcb || Dloc->CreateRollbackOwner ||
+            Dloc->CreateConstructionOwner || Dloc->RetiredExtents || Dloc->NamespaceScratch ||
+            Dloc->NamespaceTarget || Dloc->NamespaceFileInfo || Dloc->NamespaceScratchOwner ||
+            Dloc->NamespacePhase != UdfNamespaceNone ||
+            Dloc->NamespaceTargetState != UdfNamespaceTargetNone ||
+            !NT_SUCCESS(Dloc->NamespaceTargetError) || Dloc->StreamDeleteOwner ||
+            Dloc->StreamDeleteContextOwner || Dloc->StreamCreate ||
+            !NT_SUCCESS(Dloc->ZeroDataError) || !NT_SUCCESS(Dloc->CacheSizeError)) {
+            Status = STATUS_DEVICE_BUSY;
+            _SEH2_LEAVE;
+        }
+        if (Dloc->DeletePrefree && (Detach || !Dloc->DeleteCommitted ||
+            !(Dloc->FE_Flags & UDF_FE_FLAG_FREE_DEFERRED))) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
+        }
+        if (Detach) {
+            /* Only an already-written optimization proof is retired here.
+             * There is no allocation/cache/device I/O after index removal. */
+            UDFReleaseDirectoryFECheckpoint(Vcb, Dloc);
+            RtlZeroMemory(&Vcb->DlocList[Slot], sizeof(Vcb->DlocList[Slot]));
+            Vcb->DlocFreeHint = min(Vcb->DlocFreeHint, (ULONG)Slot);
+        }
+    } _SEH2_FINALLY {
+        if (ReferencesLocked) UDFReleaseResource(&Vcb->DlocResource2);
+        if (IndexLocked) UDFReleaseResource(&Vcb->DlocResource);
+    } _SEH2_END;
+    return Status;
+}
 
 /*
     This routine updates Dloc LBA after relocation
@@ -1512,6 +1796,51 @@ UDFRelocateDloc(
 
 } // end UDFRelocateDloc()
 
+/* The caller owns the exclusive VCB resource. A retained FI/claim prevents
+ * freeing its VCB resources even if VPB or user-handle counts reached zero. */
+BOOLEAN
+UDFHasRetainedDlocs(PVCB Vcb)
+{
+    uint32 i;
+    BOOLEAN Retained = FALSE;
+    ASSERT_EXCLUSIVE_VCB(Vcb);
+    NT_ASSERT(Vcb->VcbLockThread != PsGetCurrentThread());
+    /* Counts are independent inventory owners too. An empty FI pointer
+     * must not erase an unresolved generation or a deferred final claim. */
+    if (Vcb->FcbTeardownCount || Vcb->ClosedFcbRetryCount ||
+        Vcb->FailedZeroDataCount || Vcb->RetainedOpenCount || Vcb->AbortedOpenCount || Vcb->PendingNamespaceCount ||
+        Vcb->PendingDeleteCount || Vcb->RetainedDeleteCount ||
+        Vcb->FailedAllocations || Vcb->FailedAllocationCount ||
+        Vcb->ActiveAllocationLeases || Vcb->ActiveAllocationLeaseCount ||
+        Vcb->PendingExtentRetirements ||
+        !NT_SUCCESS(UDFAllocationFailureStatus(Vcb)))
+        return TRUE;
+    UDFAcquireResourceExclusive(&Vcb->DlocResource, TRUE);
+    UDFAcquireResourceExclusive(&Vcb->DlocResource2, TRUE);
+    for (i = 0; i < Vcb->DlocCount; i++) {
+        PUDF_DATALOC_INFO Dloc = Vcb->DlocList[i].Dloc;
+        if (Dloc && (Dloc->LinkedFileInfo || Dloc->CommonFcb ||
+                     Dloc->LinkRefCount || Dloc->CleanupOwner || Dloc->AllocationReleaseActive ||
+                     !NT_SUCCESS(Dloc->AllocationReleaseError) ||
+                     Dloc->NamespaceScratch || Dloc->NamespaceTarget ||
+                     Dloc->NamespaceFileInfo || Dloc->NamespacePhase != UdfNamespaceNone ||
+                     Dloc->NamespaceScratchOwner || Dloc->StreamDeleteOwner ||
+                     Dloc->StreamDeleteContextOwner || Dloc->StreamCreate || !NT_SUCCESS(Dloc->ZeroDataError) ||
+                     Dloc->RetiredExtents ||
+                     Dloc->DataLoc.Modified || Dloc->AllocLoc.Modified ||
+                     Dloc->FELoc.Modified ||
+                     (Dloc->FE_Flags & (UDF_FE_FLAG_UNDER_INIT |
+                         UDF_FE_FLAG_FE_MODIFIED | UDF_FE_FLAG_DIR_MODIFIED |
+                         UDF_FE_FLAG_CACHED_DATA_PENDING)))) {
+            Retained = TRUE;
+            break;
+        }
+    }
+    UDFReleaseResource(&Vcb->DlocResource2);
+    UDFReleaseResource(&Vcb->DlocResource);
+    return Retained;
+}
+
 /*
     Release FE cache
  */
@@ -1520,6 +1849,7 @@ UDFReleaseDlocList(
     IN PVCB Vcb
     )
 {
+    NT_ASSERT(!Vcb->PendingExtentRetirements);
     if (!Vcb->DlocList) return;
     UDFAcquireResourceExclusive(&(Vcb->DlocResource),TRUE);
     for(uint32 i=0; i<Vcb->DlocCount; i++) {
@@ -1549,7 +1879,8 @@ UDFLocateParallelFI(
     PUDF_FILE_INFO    ParFileInfo = fi->NextLinkedFile;
 //    PUDF_DATALOC_INFO Dloc = di->Dloc;
     while((ParFileInfo != fi) &&
-          ((ParFileInfo->ParentFile != di) ||
+          (ParFileInfo->Constructing || ParFileInfo->ConstructionFailed ||
+           (ParFileInfo->ParentFile != di) ||
            (ParFileInfo->Index != i)) ) {
         ParFileInfo = ParFileInfo->NextLinkedFile;
     }
@@ -1566,31 +1897,40 @@ UDFLocateAnyParallelFI(
     PUDF_FILE_INFO fi   // FileInfo to start search from
     )
 {
-    if (!fi->ParentFile) {
-        if (fi->NextLinkedFile == fi)
-            return NULL;
-        return fi->NextLinkedFile;
-    }
     PUDF_FILE_INFO    ParFileInfo = fi->NextLinkedFile;
-    PUDF_DATALOC_INFO Dloc = fi->ParentFile->Dloc;
-    uint_di i = fi->Index;
-    BOOLEAN NotFound = TRUE;
-    while((ParFileInfo != fi) &&
-          (NotFound =
-           ((ParFileInfo->Index != i) ||
-            (ParFileInfo->ParentFile->Dloc != Dloc))) ) {
+    /* A parentless by-ID representation shares the Dloc, not a named
+     * link's directory index. Only another parentless FI is its parallel.
+     * Conversely, never dereference that FI as a named alias's parent. */
+    while (ParFileInfo && ParFileInfo != fi) {
+        if (ParFileInfo->Constructing || ParFileInfo->ConstructionFailed) {
+            ParFileInfo = ParFileInfo->NextLinkedFile;
+            continue;
+        }
+        if (!fi->ParentFile) {
+            if (!ParFileInfo->ParentFile)
+                return ParFileInfo;
+        } else if (ParFileInfo->ParentFile &&
+                   ParFileInfo->Index == fi->Index &&
+                   ParFileInfo->ParentFile->Dloc == fi->ParentFile->Dloc) {
+            return ParFileInfo;
+        }
         ParFileInfo = ParFileInfo->NextLinkedFile;
     }
-/*    if (NotFound) {
-        if ((ParFileInfo->Index == i) &&
-           (ParFileInfo->ParentFile->Dloc == Dloc))
-            return ParFileInfo;
-        return NULL;
-    }
-    return ParFileInfo;*/
-    return NotFound ? NULL : ParFileInfo;
+    return NULL;
 //   BrutePoint();
 } // end UDFLocateAnyParallelFI()
+
+BOOLEAN
+UDFHasLiveFileInfoPeer(PUDF_FILE_INFO FileInfo)
+{
+    PUDF_FILE_INFO Peer;
+    for (Peer = FileInfo->NextLinkedFile; Peer && Peer != FileInfo;
+         Peer = Peer->NextLinkedFile) {
+        if (Peer->RefCount || Peer->OpenCount)
+            return TRUE;
+    }
+    return Peer == NULL;
+}
 
 void
 UDFInsertLinkedFile(

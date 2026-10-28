@@ -18,6 +18,14 @@ UDFReadWriteSectors(
     IN BOOLEAN IsWrite
     );
 
+/* Checked fixed-packet physical start and maximum contiguous run. */
+NTSTATUS UDFGetFixedPacketRun(IN PVCB Vcb, IN uint32 Lba, IN uint32 Requested,
+    OUT uint32* Physical, OUT uint32* Blocks);
+
+/* Media addresses, with no VAT/sparing/fixed-packet namespace translation. */
+NTSTATUS UDFReadMediaSectors(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
+    IN uint32 Lba, IN uint32 Blocks, OUT PVOID Buffer);
+
 extern NTSTATUS UDFPrepareForWriteOperation(
     IN PVCB Vcb,
     IN ULONG Lba,
@@ -52,7 +60,7 @@ NTSTATUS
 UDFReadSectors(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN BOOLEAN Translate,// Translate Logical to Physical
+    IN BOOLEAN Translate, // legacy signature; Lba is already a physical volume sector
     IN ULONG Lba,
     IN ULONG BCount,
     IN BOOLEAN Direct,
@@ -65,7 +73,7 @@ NTSTATUS
 UDFReadData(
     IN PIRP_CONTEXT IrpContext,
     IN PVCB Vcb,
-    IN BOOLEAN Translate,   // Translate Logical to Physical
+    IN BOOLEAN Translate, // legacy signature; Offset is already a physical volume byte offset
     IN LONGLONG Offset,
     IN ULONG Length,
     IN BOOLEAN Direct,

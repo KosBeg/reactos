@@ -303,7 +303,7 @@ UDFCanNameBeA8dot3(
     2. Decompresses it using UDFDecompressUnicode
     3. Returns the allocated UNICODE_STRING
 
-    The caller is responsible for freeing FileName->Buffer using MyFreePool__ or ExFreePool.
+    The caller owns FileName->Buffer and frees it using MyFreePool__.
 
     Parameters:
         FileInfo - Pointer to UDF_FILE_INFO structure
@@ -323,11 +323,14 @@ UDFGetFileNameFromFileInfo(
     PFILE_IDENT_DESC FileIdent;
     uint8* CompressedName;
     SIZE_T NameLength;
+    SIZE_T Remaining;
 
     // Validate parameters
-    if (!FileInfo || !FileName) {
+    if (!FileName) {
         return STATUS_INVALID_PARAMETER;
     }
+    RtlZeroMemory(FileName, sizeof(*FileName));
+    if (!FileInfo) return STATUS_INVALID_PARAMETER;
 
     FileIdent = FileInfo->FileIdent;
     if (!FileIdent) {
@@ -339,19 +342,37 @@ UDFGetFileNameFromFileInfo(
         return STATUS_SUCCESS;
     }
 
+    /* FileIdent owns a bounded allocation, not an arbitrary on-disk
+     * pointer. Check the fixed header before reading its length fields,
+     * then subtract before advancing to the compressed name. */
+    if (FileInfo->FileIdentLen < sizeof(*FileIdent))
+        return STATUS_FILE_CORRUPT_ERROR;
+    Remaining = FileInfo->FileIdentLen - sizeof(*FileIdent);
+    if (FileIdent->lengthOfImpUse > Remaining)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Remaining -= FileIdent->lengthOfImpUse;
+
     // Get name length from FileIdent
     NameLength = FileIdent->lengthFileIdent;
+    if (NameLength > Remaining) return STATUS_FILE_CORRUPT_ERROR;
     if (NameLength == 0) {
-        // Empty name - return empty string
-        FileName->Buffer = NULL;
-        FileName->Length = 0;
-        FileName->MaximumLength = 0;
-        return STATUS_SUCCESS;
+        /* The parent FID deliberately has no component name. An ordinary
+         * live FID cannot turn a missing name into an unnamed prefix. */
+        return (FileIdent->fileCharacteristics & FILE_PARENT) ?
+               STATUS_SUCCESS : STATUS_FILE_CORRUPT_ERROR;
     }
 
     // Get pointer to compressed name
     // Name is stored after FileIdent structure + ImpUse field
     CompressedName = ((uint8*)(FileIdent + 1)) + FileIdent->lengthOfImpUse;
+
+    /* A live name has at least one character. For compID16 its payload
+     * contains complete two-byte code units; the decoder reads pairs. */
+    if (NameLength < 2 ||
+        (CompressedName[0] != UDF_COMP_ID_8 &&
+         CompressedName[0] != UDF_COMP_ID_16) ||
+        (CompressedName[0] == UDF_COMP_ID_16 && !(NameLength & 1)))
+        return STATUS_FILE_CORRUPT_ERROR;
 
     // Decompress the name
     // UDFDecompressUnicode allocates buffer and fills FileName
@@ -371,7 +392,9 @@ UDFGetFileNameFromFileInfo(
     This function allocates a buffer and converts the source string to uppercase
     for case-insensitive comparisons.
 
-    The caller is responsible for freeing DestName->Buffer using ExFreePool.
+    The caller frees DestName->Buffer using ExFreePool, including unwind
+    after a raised conversion. A published buffer with Length zero is still
+    an owned allocation, not proof that conversion completed.
 
     Parameters:
         DestName - Output UNICODE_STRING (caller provides, we allocate Buffer)
@@ -392,9 +415,15 @@ UDFUpcaseString(
     ULONG i;
 
     // Validate parameters
-    if (!DestName || !SourceName || !SourceName->Buffer) {
+    if (!DestName || !SourceName || DestName == SourceName) {
         return STATUS_INVALID_PARAMETER;
     }
+    RtlZeroMemory(DestName, sizeof(*DestName));
+    if (SourceName->Length % sizeof(WCHAR) ||
+        SourceName->Length > SourceName->MaximumLength ||
+        SourceName->Length > MAXUSHORT - sizeof(WCHAR) ||
+        (SourceName->Length && !SourceName->Buffer))
+        return STATUS_INVALID_PARAMETER;
 
     // Handle empty string
     if (SourceName->Length == 0) {
@@ -414,6 +443,11 @@ UDFUpcaseString(
         DestName->MaximumLength = 0;
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    /* Publish ownership before character conversion can raise. A caller's
+     * unwind can then free the exact allocation even before Length commits. */
+    DestName->Buffer = Buffer;
+    DestName->MaximumLength = SourceName->Length + sizeof(WCHAR);
 
     // Copy and uppercase each character
     for (i = 0; i < SourceName->Length / sizeof(WCHAR); i++) {
@@ -459,9 +493,14 @@ UDFGenerateShortName(
     PWCHAR Buffer;
 
     // Validate parameters
-    if (!Vcb || !FileName || !ShortName || !FileName->Buffer) {
+    if (!Vcb || !FileName || !ShortName || FileName == ShortName) {
         return STATUS_INVALID_PARAMETER;
     }
+    RtlZeroMemory(ShortName, sizeof(*ShortName));
+    if (FileName->Length % sizeof(WCHAR) ||
+        FileName->Length > FileName->MaximumLength ||
+        (FileName->Length && !FileName->Buffer))
+        return STATUS_INVALID_PARAMETER;
 
     // Handle empty string
     if (FileName->Length == 0) {

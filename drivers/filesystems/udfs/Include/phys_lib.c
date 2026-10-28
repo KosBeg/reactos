@@ -160,6 +160,10 @@ UDFSendSectorIoChunk(
                  STATUS_IO_DEVICE_ERROR : Irp->IoStatus.Status;
     }
 
+    if (Status == STATUS_PENDING)
+        Status = STATUS_IO_DEVICE_ERROR; /* completion did not supply a final status */
+    UDFRecordLowerIoError(IrpContext, Status);
+
     //  Free MDL chain.
 
     while (Irp->MdlAddress != NULL) {
@@ -221,6 +225,32 @@ UDFSendSectorIo(
 } // end UDFSendSectorIo()
 
 
+/* Descriptor locations expressed in media block addresses must not pass
+ * through the mapping table they are themselves used to load or verify. */
+NTSTATUS
+UDFReadMediaSectors(PIRP_CONTEXT IrpContext, PVCB Vcb, uint32 Lba,
+                    uint32 Blocks, PVOID Buffer)
+{
+    NTSTATUS Status;
+    if (!Blocks)
+        return STATUS_SUCCESS;
+    if (!Buffer || !Vcb->TargetDeviceObject || !Vcb->PhysicalLastLbaKnown ||
+        !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift) ||
+        Blocks > (MAXULONG >> Vcb->SectorShift))
+        return STATUS_INVALID_PARAMETER;
+    if (Lba > Vcb->PhysicalLastLba ||
+        Blocks > (uint64)Vcb->PhysicalLastLba - Lba + 1)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Vcb->VcbState & UDF_VCB_FLAGS_DEAD)
+        return STATUS_NO_SUCH_DEVICE;
+    Status = UDFSendSectorIo(IrpContext, Vcb->TargetDeviceObject, Buffer,
+                 Blocks << Vcb->SectorShift, (uint64)Lba << Vcb->SectorShift, FALSE);
+    if (NT_SUCCESS(Status))
+        Vcb->VcbState &= ~UDF_VCB_LAST_WRITE;
+    return Status;
+}
+
 /*************************************************************************
 *
 *  Function: UDFReadWriteSectors()
@@ -228,7 +258,8 @@ UDFSendSectorIo(
 *  Description:
 *    Single entry point for all metadata sector I/O (read and write).
 *    Handles sparing table relocation, fixed-packet address translation,
-*    bad sector bitmap checks, and CDR_Mode NWA tracking.
+*    bad sector bitmap checks. Sequential append writes require a backend
+*    that is not implemented by this direct sector writer.
 *
 *    For file data I/O, use UDFNonCachedIo() in deviosup.cpp instead.
 *
@@ -249,29 +280,42 @@ UDFReadWriteSectorsRaw(
     PEXTENT_MAP RelocExtent;
     PEXTENT_MAP RelocExtent_saved = NULL;
 
-    uint32 Lba = (uint32)(StartingOffset >> Vcb->SectorShift);
-    uint32 BCount = ByteCount >> Vcb->SectorShift;
+    uint32 Lba, BCount;
     uint32 rLba;
 
+    if (!ByteCount)
+        return STATUS_SUCCESS;
+    if (!Buffer || StartingOffset < 0 || !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift) ||
+        (StartingOffset & (Vcb->SectorSize - 1)) ||
+        (ByteCount & (Vcb->SectorSize - 1)) ||
+        ((uint64)StartingOffset >> Vcb->SectorShift) > MAXULONG)
+        return STATUS_INVALID_PARAMETER;
+    Lba = (uint32)((uint64)StartingOffset >> Vcb->SectorShift);
+    BCount = ByteCount >> Vcb->SectorShift;
     ASSERT(Buffer);
 
     if (Vcb->VcbState & UDF_VCB_FLAGS_DEAD) {
         return STATUS_NO_SUCH_DEVICE;
     }
 
+    if (IsWrite && (Vcb->CDR_Mode ||
+        FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP)))
+        return STATUS_NOT_SUPPORTED;
+
     //
-    //  For writes in CDR_Mode, use NWA instead of the given LBA.
-    //  For all other cases, apply sparing relocation.
+    //  Input is already a physical volume address; apply device sparing only.
+    //  Never redirect a write to an
+    //  NWA that this backend neither advances nor commits into a VAT.
     //
 
-    if (IsWrite && Vcb->CDR_Mode) {
-        RelocExtent = UDF_NO_EXTENT_MAP;
-        rLba = Vcb->NWA;
-    } else {
-        RelocExtent = UDFRelocateSectors(Vcb, Lba, BCount);
-        if (!RelocExtent) return STATUS_INSUFFICIENT_RESOURCES;
-        rLba = Lba;
+    RC = UDFMapVolumeSectorSpan(Vcb, Lba, BCount, &RelocExtent);
+    if (!NT_SUCCESS(RC)) {
+        if (!ReturnError) ExRaiseStatus(RC);
+        return RC;
     }
+    RelocExtent_saved = RelocExtent == UDF_NO_EXTENT_MAP ? NULL : RelocExtent;
+    rLba = Lba;
 
     _SEH2_TRY {
 
@@ -283,17 +327,14 @@ UDFReadWriteSectorsRaw(
 
             if (!IsWrite) {
 
-                //  Read beyond end of recorded area returns zeros.
-
-                if (rLba >= (Vcb->CDR_Mode ? Vcb->NWA : Vcb->SessionEndLba + 1)) {
-                    RtlZeroMemory(Buffer, ByteCount);
-                    try_return(RC = STATUS_SUCCESS);
-                }
+                // The full recorded span was validated before any I/O.
 
                 RC = UDFPrepareForReadOperation(IrpContext, Vcb, rLba, BCount);
                 if (!NT_SUCCESS(RC)) try_return(RC);
 
                 rLba = UDFFixFPAddress(Vcb, rLba);
+                if (rLba == LBA_OUT_OF_EXTENT)
+                    try_return(RC = STATUS_FILE_CORRUPT_ERROR);
 
                 RC = UDFSendSectorIo(IrpContext,
                          Vcb->TargetDeviceObject, Buffer, ByteCount,
@@ -328,16 +369,14 @@ UDFReadWriteSectorsRaw(
 
             if (!IsWrite) {
 
-                if (rLba >= (Vcb->CDR_Mode ? Vcb->NWA : Vcb->SessionEndLba + 1)) {
-                    RtlZeroMemory(Buffer, FragLength);
-                    *((uint32*)&Buffer) += FragLength;
-                    continue;
-                }
-
                 RC = UDFPrepareForReadOperation(IrpContext, Vcb, rLba, FragBCount);
                 if (!NT_SUCCESS(RC)) break;
 
                 rLba = UDFFixFPAddress(Vcb, rLba);
+                if (rLba == LBA_OUT_OF_EXTENT) {
+                    RC = STATUS_FILE_CORRUPT_ERROR;
+                    break;
+                }
 
                 RC = UDFSendSectorIo(IrpContext,
                          Vcb->TargetDeviceObject, Buffer, FragLength,
@@ -356,7 +395,7 @@ UDFReadWriteSectorsRaw(
             }
 
             if (!NT_SUCCESS(RC)) break;
-            *((uint32*)&Buffer) += FragLength;
+            Buffer = (PUCHAR)Buffer + FragLength;
         }
 
 try_exit: NOTHING;
@@ -384,68 +423,69 @@ UDFReadWriteSectors(
     IN BOOLEAN IsWrite
     )
 {
-    NTSTATUS status;
-    uint32 firstLba, count, i, metadataLbn, mirrorLba, mirrorFlags;
-    PEXTENT_MAP mirrorMap;
+    NTSTATUS Status = STATUS_SUCCESS;
+    PUDF_METADATA_VIEW View = NULL;
+    uint32 FirstLba, Count, i, MetadataLbn, MirrorLba;
 
-    // Write the primary copy before its mirror, including sector updates
-    // made by the file-entry and directory paths.  The mirror has its own
-    // physical allocation only when the duplicate flag is set.
-    status = UDFReadWriteSectorsRaw(IrpContext, Vcb, StartingOffset,
-                                   ByteCount, ReturnError, Buffer, IsWrite);
-    if (!NT_SUCCESS(status) || !IsWrite ||
-        !(Vcb->MetadataFlags & UDF_METADATA_DUPLICATED) ||
-        !Vcb->MetadataFileInfo || !Vcb->MetadataMirrorFileInfo)
-        return status;
-
-    mirrorMap = Vcb->MetadataMirrorFileInfo->Dloc->DataLoc.Mapping;
-    if (!mirrorMap || (StartingOffset & (Vcb->SectorSize - 1)) ||
-        (ByteCount & (Vcb->SectorSize - 1)))
-        return STATUS_FILE_CORRUPT_ERROR;
-
-    firstLba = (uint32)(StartingOffset >> Vcb->SectorShift);
-    count = ByteCount >> Vcb->SectorShift;
-    for (i = 0; i < count; i++) {
-        metadataLbn = UDFPhysLbaToMetadata(Vcb, firstLba + i);
-        if (metadataLbn == LBA_OUT_OF_EXTENT)
-            continue;
-
-        mirrorLba = UDFExtentOffsetToLba(Vcb, mirrorMap,
-                                         ((int64)metadataLbn) << Vcb->SectorShift,
-                                         NULL, NULL, &mirrorFlags, NULL);
-        if (mirrorLba == LBA_OUT_OF_EXTENT ||
-            mirrorFlags != EXTENT_RECORDED_ALLOCATED) {
-            status = STATUS_FILE_CORRUPT_ERROR;
-            break;
+    _SEH2_TRY {
+        View = UDFAcquireMetadataView(Vcb);
+        if (IsWrite && (Vcb->MetadataFlags & UDF_METADATA_DUPLICATED) &&
+            (Vcb->MetadataFileInfo || Vcb->MetadataMirrorFileInfo) && !View) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE; /* no primary write without the required mirror authority */
         }
 
-        status = UDFReadWriteSectorsRaw(IrpContext, Vcb,
-                     ((LONGLONG)mirrorLba) << Vcb->SectorShift,
-                     Vcb->SectorSize, ReturnError,
-                     (PUCHAR)Buffer + (((SIZE_T)i) << Vcb->SectorShift), TRUE);
-        if (!NT_SUCCESS(status))
-            break;
-    }
+        if (IsWrite && View && (View->Flags & UDF_METADATA_DUPLICATED) &&
+            View->MirrorBlocks < View->MainBlocks) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE; /* a known incomplete mirror cannot authorize writes */
+        }
 
-    if (!NT_SUCCESS(status)) {
-        Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
-        if (!ReturnError)
-            ExRaiseStatus(status);
+        /* Hold the same independent generation across primary and mirror I/O.
+         * Growth may retire the Dloc buffers while these arrays remain live. */
+        Status = UDFReadWriteSectorsRaw(IrpContext, Vcb, StartingOffset,
+                                        ByteCount, TRUE, Buffer, IsWrite);
+        if (!NT_SUCCESS(Status) || !IsWrite || !ByteCount || !View ||
+            !(View->Flags & UDF_METADATA_DUPLICATED))
+            _SEH2_LEAVE;
+
+        /* Raw validated alignment, geometry and the complete physical span
+         * before its first I/O. Therefore these casts/additions stay bounded. */
+        FirstLba = (uint32)((uint64)StartingOffset >> View->SectorShift);
+        Count = ByteCount >> View->SectorShift;
+        for (i = 0; i < Count; i++) {
+            MetadataLbn = UDFMetadataViewPhysToLba(View, FirstLba + i);
+            if (MetadataLbn == LBA_OUT_OF_EXTENT)
+                continue;
+            MirrorLba = UDFMetadataViewLbaToPhys(View, MetadataLbn, TRUE, NULL);
+            if (MirrorLba == LBA_OUT_OF_EXTENT) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                break;
+            }
+            Status = UDFReadWriteSectorsRaw(IrpContext, Vcb,
+                ((LONGLONG)MirrorLba) << View->SectorShift,
+                View->SectorSize, TRUE,
+                (PUCHAR)Buffer + (((SIZE_T)i) << View->SectorShift), TRUE);
+            if (!NT_SUCCESS(Status))
+                break;
+        }
+    } _SEH2_FINALLY {
+        UDFReleaseMetadataView(View);
+        if (_SEH2_AbnormalTermination() && IsWrite)
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    } _SEH2_END;
+
+    if (!NT_SUCCESS(Status)) {
+        if (IsWrite) Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+        if (!ReturnError) ExRaiseStatus(Status);
     }
-    return status;
+    return Status;
 } // end UDFReadWriteSectors()
 
 /*
-    This routine performs media-type dependent preparations
-    for write operation.
-
-    For CDR/RW it sets WriteParameters according to track parameters,
-    in some cases issues SYNC_CACHE command.
-    It can also send OPC info if requered.
-    If write-requested block is located beyond last formatted LBA
-    on incompletely formatted DVD media, this routine performs
-    all neccessary formatting operations in order to satisfy
-    subsequent write request.
+    Check the physical write's overlap with the known bad-block bitmap.
+    This routine does not configure an optical writer, advance NWA or
+    implement packet formatting/append completion.
  */
 NTSTATUS
 UDFPrepareForWriteOperation(
@@ -454,11 +494,25 @@ UDFPrepareForWriteOperation(
     IN uint32 BCount
     )
 {
+    if (!BCount)
+        return STATUS_SUCCESS;
+    if ((uint64)Lba + BCount > (uint64)MAXULONG + 1)
+        return STATUS_INVALID_PARAMETER;
     if (Vcb->BSBM_Bitmap) {
-        ULONG i;
-        uint32 lbn = Lba - Vcb->Partitions[0].PartitionRoot;
-        for(i=0; i<BCount; i++) {
-            if (UDFGetBit((uint32*)(Vcb->BSBM_Bitmap), lbn+i)) {
+        uint64 First, End, Root;
+        uint32 i, LastBit;
+        if (!Vcb->Partitions || !Vcb->PartitionMaps)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Root = Vcb->Partitions[0].PartitionRoot;
+        First = max((uint64)Lba, Root);
+        End = min((uint64)Lba + BCount, Root + Vcb->FSBM_BitCount);
+        /* LVID/VDS sectors can precede this partition. Only its overlapping
+         * physical range has bad-bitmap indices; never underflow at Lba-Root. */
+        if (First < End) {
+            LastBit = (uint32)(End - Root);
+            for (i = (uint32)(First - Root); i < LastBit; i++) {
+                if (!(((const uint8*)Vcb->BSBM_Bitmap)[i >> 3] & (1U << (i & 7))))
+                    continue;
                 UDFPrint(("W: Known BB @ %#x\n", Lba));
                 //return STATUS_FT_WRITE_RECOVERY; // this shall not be treated as error and
                                                    // we shall get IO request to BAD block
@@ -781,88 +835,108 @@ try_exit: NOTHING;
  */
 static
 NTSTATUS
-UDFGetBlockSize(
-    IN PDEVICE_OBJECT DeviceObject,      // the target device object
-    IN PVCB           Vcb                // Volume control block from this DevObj
-    )
+UDFGetBlockSize(IN PDEVICE_OBJECT DeviceObject, IN PVCB Vcb)
 {
-    NTSTATUS        RC = STATUS_SUCCESS;
-    DISK_GEOMETRY_EX DiskGeometryEx;
-    GET_LENGTH_INFORMATION LengthInfo;
+    NTSTATUS Status;
+    IO_STATUS_BLOCK IoStatus;
+    DISK_GEOMETRY_EX Geometry;
+    GET_LENGTH_INFORMATION Length;
+    uint64 Bytes, Sectors;
 
+    Vcb->PhysicalLastLbaKnown = FALSE;
+    if (!Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift))
+        return STATUS_INVALID_PARAMETER;
+    RtlZeroMemory(&IoStatus, sizeof(IoStatus));
     if (DeviceObject->DeviceType == FILE_DEVICE_DISK) {
-
-        UDFPrint(("UDFGetBlockSize: HDD\n"));
-        RC = UDFPerformDevIoCtrl(IOCTL_DISK_GET_LENGTH_INFO, DeviceObject,
-            NULL,
-            0,
-            &LengthInfo, 
-            sizeof(GET_LENGTH_INFORMATION),
-            TRUE,
-            NULL);
-
-        if (!NT_SUCCESS(RC))
-            try_return(RC);
+        RtlZeroMemory(&Length, sizeof(Length));
+        Status = UDFPerformDevIoCtrl(IOCTL_DISK_GET_LENGTH_INFO, DeviceObject,
+                    NULL, 0, &Length, sizeof(Length), TRUE, &IoStatus);
+        if (Status != STATUS_SUCCESS)
+            return NT_SUCCESS(Status) ? STATUS_IO_DEVICE_ERROR : Status;
+        if (IoStatus.Information != sizeof(Length) || Length.Length.QuadPart <= 0)
+            return STATUS_IO_DEVICE_ERROR;
+        Bytes = (uint64)Length.Length.QuadPart;
     } else {
-        RC = UDFPerformDevIoCtrl(IOCTL_CDROM_GET_DRIVE_GEOMETRY_EX,DeviceObject,
-            &DiskGeometryEx,sizeof(DISK_GEOMETRY_EX),
-            &DiskGeometryEx,sizeof(DISK_GEOMETRY_EX),
-            TRUE,NULL );
-
-        if (RC == STATUS_DEVICE_NOT_READY) {
-            // probably, the device is really busy, may be by CD/DVD recording
-            UserPrint(("  busy (0)\n"));
-            try_return(RC);
-        }
+        RtlZeroMemory(&Geometry, sizeof(Geometry));
+        Status = UDFPerformDevIoCtrl(IOCTL_CDROM_GET_DRIVE_GEOMETRY_EX,
+                    DeviceObject, NULL, 0, &Geometry, sizeof(Geometry), TRUE, &IoStatus);
+        if (Status != STATUS_SUCCESS)
+            return NT_SUCCESS(Status) ? STATUS_IO_DEVICE_ERROR : Status;
+        if (IoStatus.Information < (ULONG_PTR)FIELD_OFFSET(DISK_GEOMETRY_EX, DiskSize) +
+                                      sizeof(Geometry.DiskSize) ||
+            IoStatus.Information > sizeof(Geometry) || Geometry.DiskSize.QuadPart <= 0 ||
+            Geometry.Geometry.BytesPerSector != Vcb->SectorSize)
+            return STATUS_IO_DEVICE_ERROR;
+        Bytes = (uint64)Geometry.DiskSize.QuadPart;
     }
-
-    if (DeviceObject->DeviceType == FILE_DEVICE_DISK ||
-        FALSE) {
-        Vcb->SessionEndLba = (uint32)(LengthInfo.Length.QuadPart >> Vcb->SectorShift) - 1;
-    } else {
-        if (NT_SUCCESS(RC)) {
-            Vcb->SessionEndLba = (uint32)(DiskGeometryEx.Geometry.Cylinders.QuadPart *
-                                    DiskGeometryEx.Geometry.TracksPerCylinder *
-                                    DiskGeometryEx.Geometry.SectorsPerTrack - 1);
-            if (Vcb->SessionEndLba == 0x7fffffff) {
-                ASSERT(FALSE);
-            }
-        } else {
-
-            try_return(RC = STATUS_UNRECOGNIZED_VOLUME);
-        }
-    }
-
-    RC = STATUS_SUCCESS;
-
-try_exit:   NOTHING;
-
-    UDFPrint(("UDFGetBlockSize:\nBlock size is %x, Block size bits %x, SessionEndLba is %x\n",
-              Vcb->SectorSize, Vcb->SectorShift, Vcb->SessionEndLba));
-
-    return RC;
-
+    if (Bytes & (Vcb->SectorSize - 1))
+        return STATUS_UNRECOGNIZED_VOLUME;
+    Sectors = Bytes >> Vcb->SectorShift;
+    /* The driver reserves UINT32_MAX as an invalid LBA. Reject an
+     * unrepresentable device instead of truncating its size modulo 2^32. */
+    if (!Sectors || Sectors > MAXULONG)
+        return STATUS_NOT_SUPPORTED;
+    Vcb->SessionEndLba = (uint32)Sectors - 1;
+    Vcb->PhysicalLastLba = Vcb->SessionEndLba;
+    Vcb->PhysicalLastLbaKnown = TRUE;
+    return STATUS_SUCCESS;
 } // end UDFGetBlockSize()
 
-uint32
-UDFFixFPAddress(
-    IN PVCB           Vcb,               // Volume control block from this DevObj
-    IN uint32         Lba
-    )
+/* Limit an I/O run before the next fixed-packet link/runout gap. The
+ * caller uses the returned physical start only for this bounded run. */
+NTSTATUS
+UDFGetFixedPacketRun(PVCB Vcb, uint32 Lba, uint32 Requested,
+                     uint32* Physical, uint32* Blocks)
 {
-    uint32 i = Vcb->LastReadTrack;
-    uint32 pk;
-    uint32 rel;
-
-    if(FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP)) {
-        if (Lba < 0x20)
-            return Lba;
-        pk = Lba / Vcb->TrackMap[i].PacketSize;
-        rel = Lba % Vcb->TrackMap[i].PacketSize;
-        UDFPrint(("FixFPAddr: %x -> %x\n", Lba, pk*(Vcb->TrackMap[i].PacketSize+7) + rel));
-        return pk*(Vcb->TrackMap[i].PacketSize+7) + rel /*- Vcb->TrackMap[i].PacketFPOffset*/;
+    uint32 Track, Packet, Count;
+    uint64 DiskStart;
+    if (!Requested || (uint64)Lba + Requested > (uint64)MAXULONG + 1)
+        return STATUS_INVALID_PARAMETER;
+    *Physical = Lba;
+    *Blocks = Requested;
+    if (!FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP))
+        return STATUS_SUCCESS;
+    if (Lba < 0x20) {
+        *Blocks = min(Requested, 0x20 - Lba);
+        return STATUS_SUCCESS;
     }
-    return Lba;
+    if (!Vcb->TrackMap || Vcb->FirstTrackNum > Vcb->LastTrackNum)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Track = Vcb->LastReadTrack;
+    if (Track < Vcb->FirstTrackNum || Track > Vcb->LastTrackNum ||
+        !Vcb->TrackMap[Track].PacketSize) {
+        if (Vcb->FirstTrackNum != Vcb->LastTrackNum)
+            return STATUS_NOT_SUPPORTED; /* no guessed track for this namespace */
+        Track = Vcb->FirstTrackNum;
+    }
+    if (Vcb->TrackMap[Track].FirstLba || Vcb->TrackMap[Track].TrackFPOffset ||
+        Vcb->TrackMap[Track].PacketFPOffset)
+        return STATUS_NOT_SUPPORTED; /* zero-origin conversion only */
+    Packet = Vcb->TrackMap[Track].PacketSize;
+    if (!Packet || Packet > MAXULONG - 7)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Count = min(Requested, Packet - Lba % Packet);
+    DiskStart = (uint64)(Lba / Packet) * ((uint64)Packet + 7) + Lba % Packet;
+    if (DiskStart > MAXULONG || Count > (uint64)MAXULONG - DiskStart + 1)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (!Vcb->PhysicalLastLbaKnown)
+        return STATUS_NOT_SUPPORTED; /* no unproved physical capacity */
+    if (DiskStart > Vcb->PhysicalLastLba ||
+        Count > (uint64)Vcb->PhysicalLastLba - DiskStart + 1)
+        return STATUS_FILE_CORRUPT_ERROR;
+    *Physical = (uint32)DiskStart;
+    *Blocks = Count;
+    return STATUS_SUCCESS;
+}
+
+uint32
+UDFFixFPAddress(IN PVCB Vcb, IN uint32 Lba)
+{
+    uint32 Physical, Blocks;
+    if (!NT_SUCCESS(UDFGetFixedPacketRun(Vcb, Lba, 1, &Physical, &Blocks)))
+        return LBA_OUT_OF_EXTENT;
+    return Physical;
 } // end UDFFixFPAddress()
 
 /*
@@ -921,6 +995,10 @@ try_exit:   NOTHING;
             }
         }
 
+        /* This direct writer has no fixed-packet write/commit backend.
+         * Do not expose a writable mount based only on its read fixup. */
+        if (FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP))
+            Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
         if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY) {
             if (!Vcb->BlankCD && Vcb->MediaType != MediaType_UnknownSize_CDRW) {
                 UDFPrint(("UDFGetDiskInfo: R/O+!Blank+!RW -> !RAW\n"));
@@ -951,53 +1029,83 @@ try_exit:   NOTHING;
 } // end UDFGetDiskInfo()
 
 NTSTATUS
-UDFPrepareForReadOperation(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN uint32 Lba,
-    IN uint32 BCount
-    )
+UDFPrepareForReadOperation(PIRP_CONTEXT IrpContext, PVCB Vcb, uint32 Lba, uint32 BCount)
 {
-    if ( (Vcb->FsDeviceType != FILE_DEVICE_CD_ROM_FILE_SYSTEM) ) {
+    UNREFERENCED_PARAMETER(IrpContext);
+    if (!BCount)
+        return STATUS_SUCCESS;
+    if ((uint64)Lba + BCount > (uint64)MAXULONG + 1)
+        return STATUS_INVALID_PARAMETER;
+    if (Vcb->FsDeviceType != FILE_DEVICE_CD_ROM_FILE_SYSTEM) {
         Vcb->VcbState &= ~UDF_VCB_LAST_WRITE;
         return STATUS_SUCCESS;
     }
-    // uint32 i = Vcb->LastReadTrack;
-
     if (Vcb->BSBM_Bitmap) {
-        ULONG i;
-        uint32 lbn = Lba - Vcb->Partitions[0].PartitionRoot;
-        for(i=0; i<BCount; i++) {
-            if (UDFGetBit((uint32*)(Vcb->BSBM_Bitmap), lbn+i)) {
-                UDFPrint(("R: Known BB @ %#x\n", Lba));
-                //return STATUS_FT_WRITE_RECOVERY; // this shall not be treated as error and
-                                                   // we shall get IO request to BAD block
-                return STATUS_DEVICE_DATA_ERROR;
+        uint64 First, End, Root;
+        uint32 Bit, Last;
+        if (!Vcb->Partitions || !Vcb->PartitionMaps)
+            return STATUS_FILE_CORRUPT_ERROR;
+        Root = Vcb->Partitions[0].PartitionRoot;
+        First = max((uint64)Lba, Root);
+        End = min((uint64)Lba + BCount, Root + Vcb->FSBM_BitCount);
+        if (First < End) {
+            Last = (uint32)(End - Root);
+            for (Bit = (uint32)(First - Root); Bit < Last; Bit++) {
+                if (((const uint8*)Vcb->BSBM_Bitmap)[Bit >> 3] & (1U << (Bit & 7)))
+                    return STATUS_DEVICE_DATA_ERROR;
             }
         }
     }
-
     return STATUS_SUCCESS;
 } // end UDFPrepareForReadOperation()
+
+/* Physical volume byte offsets only. Check the original request before any
+ * narrowing/multiplication or OPEN-LVID write; a wrapped sector count must
+ * never become a successful zero/smaller transfer. */
+static NTSTATUS
+UDFCheckVolumeByteSpan(PVCB Vcb, int64 Offset, uint64 Length)
+{
+    uint64 Last;
+    if (!Length)
+        return STATUS_SUCCESS;
+    if (Offset < 0 || !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift) ||
+        ((uint64)Offset >> Vcb->SectorShift) >= LBA_OUT_OF_EXTENT)
+        return STATUS_INVALID_PARAMETER;
+    if (Length > MAXULONG)
+        return STATUS_NOT_SUPPORTED; /* this lower batch interface is ULONG-sized */
+    Last = (uint64)Offset + Length - 1; /* bounded start + ULONG cannot overflow */
+    if ((Last >> Vcb->SectorShift) >= LBA_OUT_OF_EXTENT ||
+        (Last >> Vcb->SectorShift) > Vcb->SessionEndLba)
+        return STATUS_FILE_CORRUPT_ERROR;
+    if (Vcb->VcbState & UDF_VCB_FLAGS_DEAD)
+        return STATUS_NO_SUCH_DEVICE;
+    return STATUS_SUCCESS;
+}
 
 /*
     This routine reads physical sectors.
  */
 NTSTATUS
-UDFReadSectors(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN BOOLEAN Translate,
-    IN uint32 Lba,
-    IN uint32 BCount,
-    IN BOOLEAN Direct,
-    OUT int8* Buffer
-    )
+UDFReadSectors(PIRP_CONTEXT IrpContext, PVCB Vcb, BOOLEAN Translate,
+                 uint32 Lba, uint32 BCount, BOOLEAN Direct, int8* Buffer)
 {
-    return UDFReadWriteSectors(IrpContext, Vcb,
-               ((LONGLONG)Lba) << Vcb->SectorShift,
-               BCount * Vcb->SectorSize,
-               TRUE, Buffer, FALSE);
+    NTSTATUS Status;
+    uint32 Bytes;
+    UNREFERENCED_PARAMETER(Translate); /* partition translation is already complete */
+    UNREFERENCED_PARAMETER(Direct);
+    if (!BCount)
+        return STATUS_SUCCESS;
+    if (!Buffer || !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift) ||
+        BCount > (MAXULONG >> Vcb->SectorShift))
+        return STATUS_INVALID_PARAMETER;
+    Bytes = BCount << Vcb->SectorShift;
+    Status = UDFCheckVolumeByteSpan(Vcb, (int64)Lba << Vcb->SectorShift, Bytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    return UDFReadWriteSectors(IrpContext, Vcb, (int64)Lba << Vcb->SectorShift,
+                               Bytes, TRUE, Buffer, FALSE);
 } // end UDFReadSectors()
 
 /*
@@ -1017,6 +1125,8 @@ UDFReadInSector(
     int8* tmp_buff;
     NTSTATUS status;
 
+    if (!Buffer || Offset >= Vcb->SectorSize || Length > Vcb->SectorSize - Offset)
+        return STATUS_INVALID_PARAMETER;
     tmp_buff = (int8*)MyAllocatePool__(NonPagedPool, Vcb->SectorSize);
     if (!tmp_buff) return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -1050,9 +1160,11 @@ UDFReadData(
     uint32 BSh = Vcb->SectorShift;
     NTSTATUS status;
 
+    UNREFERENCED_PARAMETER(Translate); /* Offset is a physical volume byte offset */
     if (!Length) return STATUS_SUCCESS;
-    if (Vcb->VcbState & UDF_VCB_FLAGS_DEAD)
-        return STATUS_NO_SUCH_DEVICE;
+    if (!Buffer) return STATUS_INVALID_PARAMETER;
+    status = UDFCheckVolumeByteSpan(Vcb, Offset, Length);
+    if (!NT_SUCCESS(status)) return status;
 
     // Read tail of the 1st sector if Offset is not sector-aligned.
     Lba = (uint32)(Offset >> BSh);
@@ -1107,6 +1219,9 @@ UDFBarrierFlushDevice(IN PDEVICE_OBJECT TargetDeviceObject)
     } else if (NT_SUCCESS(status)) {
         status = iosb.Status;
     }
+    if (status == STATUS_PENDING)
+        status = STATUS_IO_DEVICE_ERROR;
+    UDFRecordLowerIoError(NULL, status);
     return status;
 }
 
@@ -1114,8 +1229,13 @@ NTSTATUS
 UDFOpenIntegrityForWrite(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
                          IN BOOLEAN Direct)
 {
-    NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status = UDFAllocationFailureStatus(Vcb);
+    BOOLEAN Opening = FALSE;
 
+    if (!NT_SUCCESS(status))
+        return status;
+    if (Vcb->CDR_Mode || FlagOn(Vcb->VcbState, VCB_STATE_PACKET_RUNOUT_FIXUP))
+        return STATUS_NOT_SUPPORTED;
     if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY)
         return STATUS_MEDIA_WRITE_PROTECTED;
     if (Vcb->Modified && Vcb->IntegrityType != INTEGRITY_TYPE_CLOSE &&
@@ -1123,34 +1243,32 @@ UDFOpenIntegrityForWrite(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
          !InterlockedCompareExchange(&Vcb->IntegrityOpenPending, 0, 0)))
         return (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY) ?
                STATUS_MEDIA_WRITE_PROTECTED : STATUS_SUCCESS;
-    if (Vcb->CDR_Mode) {
-        UDFSetModified(Vcb);
-        return STATUS_SUCCESS;
-    }
-
-    /* A bitmap paging write can be invoked by CcFlushCache while the caller
-     * owns this resource. Avoid taking it on the already-OPEN fast path. */
-    UDFAcquireResourceExclusive(&(Vcb->BitMapResource1), TRUE);
-    /* The first caller may have failed its barrier while this thread waited.
-     * Never turn that failed checkpoint into an apparently successful write. */
-    if (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY) {
-        status = STATUS_MEDIA_WRITE_PROTECTED;
-    } else if (!Vcb->Modified || Vcb->IntegrityType == INTEGRITY_TYPE_CLOSE) {
-        /* UDFUpdateLogicalVolInt sets IntegrityType=OPEN before the lower
-         * barrier. Its recursive sector write is allowed on this thread;
-         * unrelated writers block on BitMapResource1 until the barrier ends. */
-        InterlockedExchange(&Vcb->IntegrityOpenPending, 1);
-        UDFSetModified(Vcb);
-        if (Vcb->LVid && !Direct) {
-            status = UDFUpdateLogicalVolInt(IrpContext, Vcb, FALSE);
-            if (NT_SUCCESS(status))
-                status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
-            if (!NT_SUCCESS(status))
-                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+    /* A bitmap paging write may already own this resource. The fast path
+     * above remains recursive; a first OPEN/barrier owns Pending until its
+     * finally, including raised lower I/O errors. */
+    UDFAcquireResourceExclusive(&Vcb->BitMapResource1, TRUE);
+    _SEH2_TRY {
+        status = UDFAllocationFailureStatus(Vcb);
+        if (NT_SUCCESS(status) && (Vcb->VcbState & VCB_STATE_VOLUME_READ_ONLY))
+            status = STATUS_MEDIA_WRITE_PROTECTED;
+        if (NT_SUCCESS(status) && (!Vcb->Modified || Vcb->IntegrityType == INTEGRITY_TYPE_CLOSE)) {
+            Opening = TRUE;
+            InterlockedExchange(&Vcb->IntegrityOpenPending, 1);
+            UDFSetModified(Vcb);
+            if (Vcb->LVid && !Direct) {
+                status = UDFUpdateLogicalVolInt(IrpContext, Vcb, FALSE);
+                if (NT_SUCCESS(status))
+                    status = UDFBarrierFlushDevice(Vcb->TargetDeviceObject);
+            }
         }
-        InterlockedExchange(&Vcb->IntegrityOpenPending, 0);
-    }
-    UDFReleaseResource(&(Vcb->BitMapResource1));
+    } _SEH2_FINALLY {
+        if (Opening) {
+            if (_SEH2_AbnormalTermination() || !NT_SUCCESS(status))
+                Vcb->VcbState |= VCB_STATE_VOLUME_READ_ONLY;
+            InterlockedExchange(&Vcb->IntegrityOpenPending, 0);
+        }
+        UDFReleaseResource(&Vcb->BitMapResource1);
+    } _SEH2_END;
     return status;
 }
 
@@ -1159,39 +1277,34 @@ UDFOpenIntegrityForWrite(IN PIRP_CONTEXT IrpContext, IN PVCB Vcb,
     Marks volume as modified and updates LVID if needed.
  */
 NTSTATUS
-UDFWriteSectors(
-    IN PIRP_CONTEXT IrpContext,
-    IN PVCB Vcb,
-    IN BOOLEAN Translate,
-    IN uint32 Lba,
-    IN uint32 BCount,
-    IN BOOLEAN Direct,
-    IN int8* Buffer,
-    OUT PSIZE_T WrittenBytes
-    )
+UDFWriteSectors(PIRP_CONTEXT IrpContext, PVCB Vcb, BOOLEAN Translate,
+                 uint32 Lba, uint32 BCount, BOOLEAN Direct, int8* Buffer,
+                 PSIZE_T WrittenBytes)
 {
-    NTSTATUS status;
-
-    status = UDFOpenIntegrityForWrite(IrpContext, Vcb, Direct);
-    if (!NT_SUCCESS(status)) {
-        *WrittenBytes = 0;
-        return status;
-    }
-
-    if (Vcb->CDR_Mode) {
-        if (Vcb->SessionEndLba < Lba + BCount - 1)
-            Vcb->SessionEndLba = Lba + BCount - 1;
-    }
-
-    ULONG ByteCount = BCount << Vcb->SectorShift;
-    status = UDFReadWriteSectors(IrpContext, Vcb,
-                 ((LONGLONG)Lba) << Vcb->SectorShift,
-                 ByteCount,
-                 TRUE, Buffer, TRUE);
-
-    *WrittenBytes = NT_SUCCESS(status) ? ByteCount : 0;
-
-    return status;
+    NTSTATUS Status;
+    uint32 Bytes;
+    UNREFERENCED_PARAMETER(Translate);
+    if (!WrittenBytes)
+        return STATUS_INVALID_PARAMETER;
+    *WrittenBytes = 0;
+    if (!BCount)
+        return STATUS_SUCCESS;
+    if (!Buffer || !Vcb->SectorSize || Vcb->SectorShift >= 30 ||
+        Vcb->SectorSize != (1UL << Vcb->SectorShift) ||
+        BCount > (MAXULONG >> Vcb->SectorShift))
+        return STATUS_INVALID_PARAMETER;
+    Bytes = BCount << Vcb->SectorShift;
+    Status = UDFCheckVolumeByteSpan(Vcb, (int64)Lba << Vcb->SectorShift, Bytes);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = UDFOpenIntegrityForWrite(IrpContext, Vcb, Direct);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = UDFReadWriteSectors(IrpContext, Vcb, (int64)Lba << Vcb->SectorShift,
+                                Bytes, TRUE, Buffer, TRUE);
+    if (Status == STATUS_SUCCESS)
+        *WrittenBytes = Bytes;
+    return Status;
 } // end UDFWriteSectors()
 
 /*
@@ -1291,21 +1404,18 @@ UDFWriteData(
     NTSTATUS status;
     SIZE_T _WrittenBytes;
 
+    UNREFERENCED_PARAMETER(Translate);
+    if (!WrittenBytes) return STATUS_INVALID_PARAMETER;
     *WrittenBytes = 0;
     if (!Length) return STATUS_SUCCESS;
-    if (Vcb->VcbState & UDF_VCB_FLAGS_DEAD)
-        return STATUS_NO_SUCH_DEVICE;
+    if (!Buffer) return STATUS_INVALID_PARAMETER;
+    status = UDFCheckVolumeByteSpan(Vcb, Offset, Length);
+    if (!NT_SUCCESS(status)) return status;
 
     status = UDFOpenIntegrityForWrite(IrpContext, Vcb, Direct);
     if (!NT_SUCCESS(status))
         return status;
 
-    if (Vcb->CDR_Mode) {
-        Lba = (uint32)(Offset >> BSh);
-        uint32 EndLba = (uint32)((Offset + Length - 1) >> BSh);
-        if (Vcb->SessionEndLba < EndLba)
-            Vcb->SessionEndLba = EndLba;
-    }
 
     // Write tail of the 1st sector if Offset is not sector-aligned.
     Lba = (uint32)(Offset >> BSh);
