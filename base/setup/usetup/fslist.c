@@ -197,7 +197,10 @@ DrawFileSystemList(
             snprintf(Buffer, sizeof(Buffer),
                      MUIGetString(Item->QuickFormat ? STRING_FORMATDISK1
                                                     : STRING_FORMATDISK2),
-                     Item->FileSystem);
+                     /* Display the formatter's revision without changing the
+                        provider/driver key consumed by StartFormat. */
+                     _wcsicmp(Item->FileSystem, L"UDF") == 0 ?
+                         L"UDF 2.50" : Item->FileSystem);
         }
         else
         {
