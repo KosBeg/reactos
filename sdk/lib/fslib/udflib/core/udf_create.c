@@ -37,6 +37,7 @@ __RCSID("$NetBSD: udf_create.c,v 1.30 2021/08/20 20:25:26 andvar Exp $");
 
 #include "unicode.h"
 #include "udf_create.h"
+#include "udf_meta_bounds.h"
 
 
 #if 0
@@ -346,6 +347,20 @@ udf_calculate_disc_layout(int format_flags, int min_udf,
 		layout.meta_part_size_lba =
 			UDF_ROUNDDOWN(layout.meta_part_size_lba, layout.meta_blockingnr);
 
+		/* The metadata file and its mirror each have one sector for their
+		 * EFE. Every extent needs a short AD in that sector. Reject a
+		 * layout that would need an allocation extent descriptor, which
+		 * this formatter does not create for metadata files. */
+		if (!udf_meta_efe_mapping_fits(
+		        (uint64_t)layout.meta_part_size_lba * sector_size,
+		        sector_size, layout.meta_blockingnr, UDF_EXTFENTRY_SIZE,
+		        sizeof(struct short_ad), UDF_EXT_MAXLEN) ||
+		    !udf_meta_efe_mapping_fits(
+		        udf_space_bitmap_len(layout.meta_part_size_lba),
+		        sector_size, layout.meta_blockingnr, UDF_EXTFENTRY_SIZE,
+		        sizeof(struct short_ad), UDF_EXT_MAXLEN))
+			return EFBIG;
+
 		/* calculate positions */
 		bytes = udf_space_bitmap_len(layout.meta_part_size_lba);
 		layout.meta_bitmap_dscr_size = udf_bytes_to_sectors(bytes);
@@ -574,16 +589,16 @@ udf_add_udf_regid(struct regid *regid)
 	ver  = (uint16_t *) regid->id_suffix;
 	*ver = udf_rw16(context.min_udf);
 
-	regid->id_suffix[2] = 4;	/* unix */
-	regid->id_suffix[3] = 8;	/* NetBSD */
+	regid->id_suffix[2] = 6;	/* Windows NT OS class */
+	regid->id_suffix[3] = 0;	/* generic NT identifier; no invented ReactOS ID */
 }
 
 
 void
 udf_add_impl_regid(struct regid *regid)
 {
-	regid->id_suffix[0] = 4;	/* unix */
-	regid->id_suffix[1] = 8;	/* NetBSD */
+	regid->id_suffix[0] = 6;	/* Windows NT OS class */
+	regid->id_suffix[1] = 0;	/* generic NT identifier */
 }
 
 
@@ -2017,7 +2032,7 @@ udf_create_new_efe(struct extfile_entry **efep, int file_type, struct stat *st)
 /* --------------------------------------------------------------------- */
 
 /* for METADATA file appending only */
-static void
+static int
 udf_append_meta_mapping_part_to_efe(struct extfile_entry *efe,
 		struct short_ad *mapping)
 {
@@ -2034,6 +2049,10 @@ udf_append_meta_mapping_part_to_efe(struct extfile_entry *efe,
 	l_ea   = udf_rw32(efe->l_ea);
 	crclen = udf_rw16(efe->tag.desc_crc_len);
 	icb    = &efe->icbtag;
+	if (!udf_meta_efe_has_room(context.sector_size, UDF_EXTFENTRY_SIZE,
+	        l_ea, l_ad, sizeof(struct short_ad)) ||
+	    crclen > UINT16_MAX - sizeof(struct short_ad))
+		return EFBIG;
 
 	/* set our allocation to shorts if not already done */
 	icb->flags = udf_rw16(UDF_ICB_SHORT_ALLOC);
@@ -2054,22 +2073,28 @@ udf_append_meta_mapping_part_to_efe(struct extfile_entry *efe,
 	efe->obj_size    = udf_rw64(obj_size);
 	efe->logblks_rec = udf_rw64(logblks_rec);
 	efe->tag.desc_crc_len = udf_rw16(crclen);
+	return 0;
 }
 
 
 /* for METADATA file appending only */
-static void
+static int
 udf_append_meta_mapping_to_efe(struct extfile_entry *efe,
 		uint16_t partnr, uint32_t lb_num,
 	uint64_t len)
 {
 	struct short_ad mapping;
 	uint64_t max_len, part_len;
+	int error;
 
 	/* calculate max length meta allocation sizes */
+	if (!context.sector_size || !layout.meta_blockingnr)
+		return EINVAL;
 	max_len = UDF_EXT_MAXLEN / context.sector_size; /* in sectors */
 	max_len = (max_len / layout.meta_blockingnr) * layout.meta_blockingnr;
 	max_len = max_len * context.sector_size;
+	if (!max_len)
+		return EINVAL;
 
 	memset(&mapping, 0, sizeof(mapping));
 	while (len) {
@@ -2077,11 +2102,14 @@ udf_append_meta_mapping_to_efe(struct extfile_entry *efe,
 		mapping.lb_num   = udf_rw32(lb_num);
 		mapping.len      = udf_rw32(part_len);
 
-		udf_append_meta_mapping_part_to_efe(efe, &mapping);
+		error = udf_append_meta_mapping_part_to_efe(efe, &mapping);
+		if (error)
+			return error;
 
 		lb_num += part_len / context.sector_size;
 		len    -= part_len;
 	}
+	return 0;
 }
 
 
@@ -2134,19 +2162,25 @@ udf_create_meta_files(void)
 
 	/* Map separate, equally sized extents for the primary and recovery copy. */
 	efe = context.meta_file;
-	udf_append_meta_mapping_to_efe(efe, context.data_part,
+	error = udf_append_meta_mapping_to_efe(efe, context.data_part,
 		layout.meta_part_start_lba,
 		(uint64_t) layout.meta_part_size_lba * sector_size);
+	if (error)
+		return error;
 
 	efe = context.meta_mirror;
-	udf_append_meta_mapping_to_efe(efe, context.data_part,
+	error = udf_append_meta_mapping_to_efe(efe, context.data_part,
 		layout.meta_mirror_start_lba,
 		(uint64_t) layout.meta_part_size_lba * sector_size);
+	if (error)
+		return error;
 
 	efe = context.meta_bitmap;
 	bytes = udf_space_bitmap_len(layout.meta_part_size_lba);
-	udf_append_meta_mapping_to_efe(efe, context.data_part,
+	error = udf_append_meta_mapping_to_efe(efe, context.data_part,
 		layout.meta_bitmap_space, bytes);
+	if (error)
+		return error;
 
 	return 0;
 }

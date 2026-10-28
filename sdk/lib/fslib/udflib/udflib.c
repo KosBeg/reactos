@@ -109,9 +109,42 @@ char *udf_strdup(const char *Text)
     memcpy(Copy, Text, Length);
     return Copy;
 }
-int udf_printf(const char *Format, ...) { return 0; }
-int udf_fprintf(void *Stream, const char *Format, ...) { return 0; }
-void udf_errx(int Error, const char *Format, ...) { RtlRaiseStatus(STATUS_FILE_CORRUPT_ERROR); }
+static int udf_logv(const char *Format, va_list Arguments)
+{
+    char Message[384];
+    int Length = _vsnprintf(Message, sizeof(Message), Format, Arguments);
+    Message[sizeof(Message) - 1] = 0;
+    DbgPrint("UdfFormat: %s", Message);
+    return Length < 0 ? (int)sizeof(Message) - 1 : Length;
+}
+int udf_printf(const char *Format, ...)
+{
+    va_list Arguments;
+    int Length;
+    va_start(Arguments, Format);
+    Length = udf_logv(Format, Arguments);
+    va_end(Arguments);
+    return Length;
+}
+int udf_fprintf(void *Stream, const char *Format, ...)
+{
+    va_list Arguments;
+    int Length;
+    (void)Stream;
+    va_start(Arguments, Format);
+    Length = udf_logv(Format, Arguments);
+    va_end(Arguments);
+    return Length;
+}
+void udf_errx(int Error, const char *Format, ...)
+{
+    va_list Arguments;
+    (void)Error;
+    va_start(Arguments, Format);
+    udf_logv(Format, Arguments);
+    va_end(Arguments);
+    RtlRaiseStatus(STATUS_FILE_CORRUPT_ERROR);
+}
 void udf_assert(const char *Expression, const char *File, unsigned Line)
 {
     DbgPrint("UdfFormat: engine assertion %s (%s:%u)\n", Expression, File, Line);
@@ -192,8 +225,19 @@ BOOLEAN NTAPI UdfFormat(PUNICODE_STRING DriveRoot, PFMIFSCALLBACK Callback,
     BOOLEAN Success = FALSE, Locked = FALSE;
     WCHAR LabelBuffer[64];
     char Utf8Label[128];
+    struct mmc_trackinfo Track;
     ULONG Written;
     int Error = 0;
+
+    /* The native engine integration implements the metadata-partition
+     * 2.50 profile only. Never silently satisfy a requested older format
+     * by erasing a disk and writing a different revision. */
+    if (BackwardCompatible)
+    {
+        if (Callback) Callback(DONE, 0, &Success);
+        DbgPrint("UdfFormat: backward-compatible formatting is unsupported\n");
+        return FALSE;
+    }
 
     if (ClusterSize && ClusterSize != 512) return FALSE;
     if (MediaType != FixedMedia && MediaType != RemovableMedia) return FALSE;
@@ -225,23 +269,6 @@ BOOLEAN NTAPI UdfFormat(PUNICODE_STRING DriveRoot, PFMIFSCALLBACK Callback,
     _SEH2_TRY
     {
         Progress(Callback, 0);
-        if (!QuickFormat)
-        {
-            const ULONG Chunk = 1024 * 1024;
-            void *Zero = udf_calloc(1, Chunk);
-            ULONGLONG Position;
-            LARGE_INTEGER Offset;
-            for (Position = 0; Position < (ULONGLONG)Length.Length.QuadPart; Position += Chunk)
-            {
-                ULONG Count = min((ULONGLONG)Chunk, (ULONGLONG)Length.Length.QuadPart - Position);
-                Offset.QuadPart = Position;
-                Status = NtWriteFile(Volume, NULL, NULL, NULL, &IoStatus, Zero, Count, &Offset, NULL);
-                if (!NT_SUCCESS(Status)) RtlRaiseStatus(Status);
-                if (IoStatus.Information != Count) RtlRaiseStatus(STATUS_DEVICE_DATA_ERROR);
-                Progress(Callback, (ULONG)(Position * 80 / Length.Length.QuadPart));
-            }
-            udf_free(Zero);
-        }
         udf_init_create_context();
         memset(&layout, 0, sizeof(layout));
         memset(&mmc_discinfo, 0, sizeof(mmc_discinfo));
@@ -286,6 +313,41 @@ BOOLEAN NTAPI UdfFormat(PUNICODE_STRING DriveRoot, PFMIFSCALLBACK Callback,
         FormatStage = "volume identifiers";
         Error = udf_proces_names();
         if (!Error) { FormatStage = "format profile"; Error = udf_derive_format(0, 0, 1); }
+        if (Error) RtlRaiseStatus(NT_SUCCESS(IoError) ? STATUS_UNSUCCESSFUL : IoError);
+
+        /* Check the engine layout before full-format zeroing can change
+         * any sector. The prefix calculates it again with the same track
+         * parameters and retains the capacity guard. */
+        FormatStage = "metadata layout preflight";
+        Error = udf_update_trackinfo(&mmc_discinfo, &Track);
+        if (!Error && !Track.packet_size) Error = EINVAL;
+        if (!Error)
+            Error = udf_calculate_disc_layout(format_flags, context.min_udf,
+                                              Track.track_start % Track.packet_size,
+                                              Track.track_start, mmc_discinfo.last_possible_lba,
+                                              context.sector_size, Track.packet_size,
+                                              mmc_discinfo.mmc_class == MMC_CLASS_CD ? 32 : 512,
+                                              meta_fract);
+        if (Error) RtlRaiseStatus(Error == ENOSPC ? STATUS_DISK_FULL : STATUS_NOT_SUPPORTED);
+
+        if (!QuickFormat)
+        {
+            const ULONG Chunk = 1024 * 1024;
+            void *Zero = udf_calloc(1, Chunk);
+            ULONGLONG Position;
+            LARGE_INTEGER Offset;
+            FormatStage = "full-format zeroing";
+            for (Position = 0; Position < (ULONGLONG)Length.Length.QuadPart; Position += Chunk)
+            {
+                ULONG Count = min((ULONGLONG)Chunk, (ULONGLONG)Length.Length.QuadPart - Position);
+                Offset.QuadPart = Position;
+                Status = NtWriteFile(Volume, NULL, NULL, NULL, &IoStatus, Zero, Count, &Offset, NULL);
+                if (!NT_SUCCESS(Status)) RtlRaiseStatus(Status);
+                if (IoStatus.Information != Count) RtlRaiseStatus(STATUS_DEVICE_DATA_ERROR);
+                Progress(Callback, (ULONG)(Position * 80 / Length.Length.QuadPart));
+            }
+            udf_free(Zero);
+        }
         if (!Error) { FormatStage = "descriptor prefix"; Error = udf_do_newfs_prefix(); }
         Progress(Callback, 85);
         if (!Error) { FormatStage = "root directory"; Error = udf_do_rootdir(); }
